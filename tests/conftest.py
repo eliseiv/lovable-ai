@@ -11,6 +11,7 @@ Claude / Docker / vite — мокаются на границе (детерми�
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import AsyncIterator
 from decimal import Decimal
 
@@ -28,6 +29,18 @@ os.environ.setdefault(
 )
 os.environ.setdefault("REDIS_URL", os.environ.get("TEST_REDIS_URL", "redis://127.0.0.1:56380/0"))
 os.environ.setdefault("ENVIRONMENT", "dev")
+# Изоляция файловых корней деплоя на writable tmp (правило qa.md: самодостаточность
+# тест-окружения). Дефолты Settings — /var/builds и /srv/sites (docs/07-deployment.md);
+# на CI non-root раннере они НЕ writable → PermissionError при safe_extract_tgz/publish.
+# Deploy-тесты мокают docker/health/publish_dist, но _deploy/_build_request распаковывают
+# source/dist в settings.builds_root ДО моков (app/workers/tasks.py:278,374). Без изоляции
+# прогон ложно-зелёный только там, где /var/builds оказался writable (env-зависимость).
+# setdefault: если хост/CI явно задал BUILDS_ROOT/SITES_HOST_ROOT — не перетираем.
+_TEST_FS_ROOT = tempfile.mkdtemp(prefix="lovable-test-fs-")
+os.environ.setdefault("BUILDS_ROOT", os.path.join(_TEST_FS_ROOT, "builds"))
+os.environ.setdefault("SITES_HOST_ROOT", os.path.join(_TEST_FS_ROOT, "sites"))
+os.makedirs(os.environ["BUILDS_ROOT"], exist_ok=True)
+os.makedirs(os.environ["SITES_HOST_ROOT"], exist_ok=True)
 os.environ.setdefault("SEED_API_KEY", "test-seed-key")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")
 # Прикладные секреты, от которых зависят тесты, выставляются детерминированно здесь —

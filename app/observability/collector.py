@@ -77,7 +77,7 @@ def refresh_worker_busy() -> None:
     """
     from app.workers.celery_app import celery_app
 
-    busy: dict[str, int] = {q: 0 for q in _QUEUES}
+    busy: dict[str, int] = dict.fromkeys(_QUEUES, 0)
     try:
         inspector = celery_app.control.inspect(timeout=2.0)
         active = inspector.active() or {}
