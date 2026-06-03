@@ -28,8 +28,9 @@ from decimal import Decimal
 import httpx
 import pytest
 from anthropic import AuthenticationError
+from pydantic import SecretStr
 
-from app.auth.concurrency import count_active_jobs
+from app.auth.concurrency import count_active_jobs, is_within_concurrency_cap
 from app.core.config import get_settings
 from app.core.ids import new_job_id, new_project_id
 from app.core.security import hash_api_key
@@ -308,3 +309,118 @@ def test_reconcile_stuck_idempotent_second_run_noop(_env):
     state, reason, _ = _run_sync(lambda: _state_and_slot(jid))
     assert state == JobState.FAILED
     assert reason == "stuck_timeout"
+
+
+# ---------------------------------------------------------------------------
+# 3. Fail-fast preflight ПУСТОГО ANTHROPIC_API_KEY (round 3, основной кейс) — pipeline §G.
+#    Источник истины: docs/modules/pipeline/03-architecture.md §G «Критерий приёмки
+#    (integration, пустой ключ, основной кейс)», docs/06-testing-strategy.md (round 3 §1).
+#    Существующие кейсы выше моделировали AuthenticationError/401 (невалидный ключ через SDK);
+#    эти — ПУСТОЙ ключ, отсекаемый preflight'ом ДО SDK-вызова (fail-fast, version-agnostic).
+# ---------------------------------------------------------------------------
+
+
+def _set_empty_key(monkeypatch, value: str = "") -> None:
+    """Подменяет anthropic_api_key на cached Settings (preflight читает get_settings())."""
+    monkeypatch.setattr(get_settings(), "anthropic_api_key", SecretStr(value), raising=False)
+
+
+async def _last_transition_at(jid: str) -> datetime:
+    async with worker_engine_scope(), session_scope() as s:
+        job = await s.get(GenerationJob, jid)
+        return job.last_transition_at
+
+
+@pytest.mark.parametrize("empty", ["", "   ", "\t\n"])
+def test_empty_key_preflight_terminalizes_agent_unavailable_fast(_env, monkeypatch, empty):
+    """Пустой/whitespace ANTHROPIC_API_KEY → task_interview за секунды → FAILED(agent_unavailable).
+
+    Основной round-3 кейс (pipeline §G): preflight отсекает пустой ключ ДО Anthropic SDK.
+    reason ИМЕННО agent_unavailable (НЕ wall_clock_exceeded/stuck_timeout); слот освобождён;
+    run_agent1 (SDK) НЕ вызван; без проброса RuntimeError/TypeError (таска не в «unexpected»).
+    """
+    _set_empty_key(monkeypatch, empty)
+
+    agent1_calls: list[int] = []
+
+    async def _spy_agent1(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        agent1_calls.append(1)  # preflight fail-fast ДО тела → Agent 1 не должен вызваться
+        raise AssertionError("run_agent1 must not be called when key is empty (preflight)")
+
+    monkeypatch.setattr("app.workers.tasks.run_agent1", _spy_agent1)
+
+    from app.workers.tasks import task_interview
+
+    jid = _run_sync(lambda: _make_job(JobState.CREATED))
+    # Без проброса RuntimeError/TypeError — taska не падает в «unexpected» (preflight поглощает).
+    _run_task_in_thread(task_interview.run, jid)
+
+    assert agent1_calls == []  # SDK не вызван — fail-fast ДО тела
+    state, reason, active = _run_sync(lambda: _state_and_slot(jid))
+    assert state == JobState.FAILED
+    assert reason == "agent_unavailable"  # НЕ wall_clock_exceeded / stuck_timeout
+    assert active == 0  # concurrency-слот освобождён
+
+
+def test_empty_key_preflight_frees_slot_next_job_not_blocked(_env, monkeypatch):
+    """После preflight-фейла слот свободен → следующая джоба того же юзера НЕ упирается в cap.
+
+    Освобождённый слот (джоба #1 терминальна) означает: следующий POST /projects не получит
+    402 concurrency_limit. Проверяем DB-уровень cap (is_within_concurrency_cap) — после фейла
+    #1 active=0 < max → второй старт разрешён (free cap=1).
+    """
+    _set_empty_key(monkeypatch)
+
+    async def _spy_agent1(*_a, **_k):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("run_agent1 must not be called (preflight)")
+
+    monkeypatch.setattr("app.workers.tasks.run_agent1", _spy_agent1)
+
+    from app.workers.tasks import task_interview
+
+    jid1 = _run_sync(lambda: _make_job(JobState.CREATED))
+    _run_task_in_thread(task_interview.run, jid1)
+
+    async def _cap_ok() -> bool:
+        async with worker_engine_scope(), session_scope() as s:
+            return await is_within_concurrency_cap(s, UID)
+
+    # Слот #1 освобождён → cap позволяет ещё одну джобу (иначе POST /projects → 402).
+    assert _run_sync(_cap_ok) is True
+
+
+def test_empty_key_preflight_reconciler_not_involved(_env, monkeypatch):
+    """Терминализация пустого ключа — preflight (за секунды), reconciler НЕ участвует.
+
+    Переход в FAILED произошёл ДО STUCK_THRESHOLD_S: last_transition_at свежий (не stale).
+    Прогон reconcile_stuck НЕ находит stuck-джоб (джоба уже терминальна / не stale) → 0 обработано.
+    Это доказывает, что кейс закрыт fail-fast preflight'ом, а не reconciler-backstop'ом по TTL.
+    """
+    _set_empty_key(monkeypatch)
+    monkeypatch.setattr(
+        "app.workers.tasks.run_agent1",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("agent1 must not run")),
+    )
+
+    from app.workers.beat_tasks import reconcile_stuck
+    from app.workers.tasks import task_interview
+
+    jid = _run_sync(lambda: _make_job(JobState.CREATED))
+    before = datetime.now(UTC)
+    _run_task_in_thread(task_interview.run, jid)
+
+    # Переход случился сразу (за секунды), не через STUCK_THRESHOLD_S (900 s).
+    transition_at = _run_sync(lambda: _last_transition_at(jid))
+    if transition_at.tzinfo is None:
+        transition_at = transition_at.replace(tzinfo=UTC)
+    threshold = get_settings().stuck_threshold_s
+    assert (transition_at - before) < timedelta(seconds=threshold)
+
+    state, reason, _ = _run_sync(lambda: _state_and_slot(jid))
+    assert state == JobState.FAILED
+    assert reason == "agent_unavailable"
+
+    # reconciler не участвует: джоба уже терминальна → 0 обработано (не stuck_timeout).
+    assert _run_task_in_thread(reconcile_stuck.run) == 0
+    _, reason_after, _ = _run_sync(lambda: _state_and_slot(jid))
+    assert reason_after == "agent_unavailable"  # reason НЕ перетёрт на stuck_timeout

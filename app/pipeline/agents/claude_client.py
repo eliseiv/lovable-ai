@@ -16,6 +16,7 @@ from anthropic import AsyncAnthropic
 from anthropic.types import OutputConfigParam
 
 from app.core.config import Settings
+from app.workers.retry_policy import LLMCredentialError
 
 # Себестоимость per-1M токенов (USD), по модели (skill claude-api → Current Models).
 # input / output / cache_read (~0.1x input) / cache_write (~1.25x input).
@@ -87,22 +88,36 @@ class ClaudeAgentClient:
 
         Стримим (длинный вывод Agent 3) и собираем финальное сообщение —
         защита от HTTP-таймаута при больших max_tokens (skill claude-api).
+
+        ADR-019 §Fix round 3 (подстраховка, §G): `run_agent` — единственная идентифицируемая
+        точка обращения к Anthropic SDK (фабрика вызова агента). При невалидном (но непустом —
+        пустой отсекается preflight'ом §G) credential SDK бросает ВСТРОЕННЫЙ stdlib-`TypeError`
+        на client-side auth-resolution (`_validate_headers`) ДО HTTP-запроса. Перехватываем
+        РОВНО здесь (узкий, version-agnostic матч по классу в точке SDK-вызова, а НЕ по подстроке
+        сообщения через весь стек таски) и поднимаем доменный LLMCredentialError → классификатор
+        §D трактует как не-транзиентный LLM-сбой → FAILED(agent_unavailable) без ретраев.
         """
-        async with self._client.messages.stream(
-            model=model,
-            max_tokens=self._settings.agent_max_tokens,
-            thinking={"type": "adaptive"},
-            output_config=cast(OutputConfigParam, {"effort": self._settings.agent_effort}),
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": user_content}],
-        ) as stream:
-            message = await stream.get_final_message()
+        try:
+            stream_ctx = self._client.messages.stream(
+                model=model,
+                max_tokens=self._settings.agent_max_tokens,
+                thinking={"type": "adaptive"},
+                output_config=cast(OutputConfigParam, {"effort": self._settings.agent_effort}),
+                system=[
+                    {
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[{"role": "user", "content": user_content}],
+            )
+            async with stream_ctx as stream:
+                message = await stream.get_final_message()
+        except TypeError as exc:
+            raise LLMCredentialError(
+                "Anthropic SDK auth-resolution failed (invalid LLM credential)"
+            ) from exc
 
         text = "".join(block.text for block in message.content if block.type == "text")
         usage = message.usage

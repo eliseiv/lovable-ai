@@ -25,6 +25,7 @@ from typing import Any
 
 from celery import Task
 
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.enums import JobState
 from app.db.session import session_scope, worker_engine_scope
@@ -35,6 +36,7 @@ from app.workers.retry_policy import (
     is_llm_failure,
     is_non_retryable_llm_failure,
     is_transient,
+    llm_credential_present,
 )
 
 logger = get_logger(__name__)
@@ -72,12 +74,28 @@ async def _graceful_fail_job(job_id: str, failure_reason: str) -> None:
 
 
 def run_agent_task(
-    task: Task, coro_factory: Callable[[], Coroutine[Any, Any, Any]], job_id: str
+    task: Task,
+    coro_factory: Callable[[], Coroutine[Any, Any, Any]],
+    job_id: str,
+    *,
+    requires_llm: bool = False,
 ) -> None:
     """Запускает async-тело агент-таски с graceful-fail при недоступности LLM (ADR-019 §G).
 
     `task` — bound Celery-таска (bind=True) для доступа к task.request.retries. `coro_factory`
     создаёт корутину тела таски (новая корутина на каждый вызов — для повторного asyncio.run).
+    `requires_llm` — таска обращается к Anthropic SDK (interview/spec/fix/edit): для неё
+    включается per-job fail-fast preflight LLM-credential (§Fix round 3, п.1). Build/deploy-таски
+    Claude не зовут → `requires_llm=False`, preflight не применяется.
+
+    **Per-job fail-fast preflight LLM-credential (основной путь, §Fix round 3 п.1).** Для
+    LLM-тасок ПЕРЕД запуском тела (до первого обращения к Anthropic SDK) проверяется непустой
+    `Settings.anthropic_api_key`. Если пусто/whitespace-only → немедленный graceful-переход
+    FAILED(agent_unavailable) ТЕМ ЖЕ транзакционным путём, что graceful-fail ниже, БЕЗ вызова
+    тела/SDK и БЕЗ ретраев. Это единая точка (общая обёртка) — классификация не дублируется в
+    коде агентов. Version-agnostic: не зависит от типа/текста встроенного `TypeError` SDK,
+    детерминированно ловит самый частый прод-кейс (сервис намеренно запущен без ключа). Уровень —
+    per-job (НЕ отказ старта сервиса: app/worker обязаны подниматься без ключа, §Fix round 3).
 
     Логика классификации исключения — единственная точка решения retry_policy (docs §D/§G):
     - не-транзиентный LLM-сбой (401/403/400) → немедленный FAILED(agent_unavailable), без
@@ -97,6 +115,18 @@ def run_agent_task(
     (прод-инцидент ADR-019 §Fix п.1). graceful-fail ниже идёт отдельным `asyncio.run` и сам
     оборачивается в worker_engine_scope + worker_redis_scope (см. _graceful_fail_job).
     """
+
+    # Per-job fail-fast preflight LLM-credential (§Fix round 3 п.1, основной путь): для
+    # LLM-тасок отсекаем пустой/whitespace-only ANTHROPIC_API_KEY ДО вызова тела/SDK —
+    # немедленный graceful FAILED(agent_unavailable) без ретраев, освобождая слот за секунды
+    # (а не через reconciler-TTL). Read-only Settings (без секретов в логе) — get_settings()
+    # вне worker_engine_scope: _graceful_fail_job сам открывает per-task engine/redis-scope.
+    if requires_llm and not llm_credential_present(
+        get_settings().anthropic_api_key.get_secret_value()
+    ):
+        logger.warning("agent_preflight_no_credential", extra={"job_id": job_id})
+        asyncio.run(_graceful_fail_job(job_id, "agent_unavailable"))
+        return
 
     async def _run_in_engine_scope() -> None:
         async with worker_engine_scope(), worker_redis_scope():

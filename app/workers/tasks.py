@@ -155,7 +155,8 @@ def task_interview(self: Task, job_id: str) -> None:
     # ADR-019 §G: graceful-fail при недоступности LLM (исчерпание ретраев на 429/5xx/timeout
     # ИЛИ немедленно на 401/403/400) → FAILED(agent_unavailable), джоба не висит в активном
     # state, слот освобождается. Транзиентные сбои до исчерпания — обычный Celery autoretry.
-    run_agent_task(self, lambda: _interview(job_id), job_id)
+    # requires_llm=True: per-job fail-fast preflight пустого ANTHROPIC_API_KEY (§Fix round 3 п.1).
+    run_agent_task(self, lambda: _interview(job_id), job_id, requires_llm=True)
 
 
 # --- task_spec (SPECCING → BUILDING): Agent2 → Agent3 → source.tgz в S3 ---
@@ -249,7 +250,8 @@ async def _spec(job_id: str) -> None:
 @celery_app.task(name="pipeline.task_spec", queue="llm", bind=True, **_RETRY_KWARGS)
 def task_spec(self: Task, job_id: str) -> None:
     # ADR-019 §G: graceful-fail при недоступности LLM (Agent 2/3) → FAILED(agent_unavailable).
-    run_agent_task(self, lambda: _spec(job_id), job_id)
+    # requires_llm=True: per-job fail-fast preflight пустого ANTHROPIC_API_KEY (§Fix round 3 п.1).
+    run_agent_task(self, lambda: _spec(job_id), job_id, requires_llm=True)
 
 
 # --- task_build_request (BUILDING → DEPLOYING): vite build в песочнице ---
@@ -659,7 +661,8 @@ async def _fix(job_id: str) -> None:
 @celery_app.task(name="pipeline.task_fix", queue="llm", bind=True, **_RETRY_KWARGS)
 def task_fix(self: Task, job_id: str) -> None:
     # ADR-019 §G: graceful-fail при недоступности LLM (Agent 4) → FAILED(agent_unavailable).
-    run_agent_task(self, lambda: _fix(job_id), job_id)
+    # requires_llm=True: per-job fail-fast preflight пустого ANTHROPIC_API_KEY (§Fix round 3 п.1).
+    run_agent_task(self, lambda: _fix(job_id), job_id, requires_llm=True)
 
 
 # --- task_edit (CREATED → BUILDING): Agent 4 editor (Sprint 5, ADR-014 §A) ---
@@ -748,7 +751,8 @@ async def _edit(job_id: str) -> None:
 @celery_app.task(name="pipeline.task_edit", queue="llm", bind=True, **_RETRY_KWARGS)
 def task_edit(self: Task, job_id: str) -> None:
     # ADR-019 §G: graceful-fail при недоступности LLM (Agent 4 editor) → FAILED(agent_unavailable).
-    run_agent_task(self, lambda: _edit(job_id), job_id)
+    # requires_llm=True: per-job fail-fast preflight пустого ANTHROPIC_API_KEY (§Fix round 3 п.1).
+    run_agent_task(self, lambda: _edit(job_id), job_id, requires_llm=True)
 
 
 # --- helpers ---

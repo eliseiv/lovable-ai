@@ -50,6 +50,25 @@ class TransientInfraError(RuntimeError):
     """
 
 
+class LLMCredentialError(RuntimeError):
+    """Client-side auth-resolution сбой Anthropic SDK ДО HTTP (ADR-019 §Fix round 3, §G).
+
+    При пустом/невалидном ANTHROPIC_API_KEY Anthropic SDK бросает ВСТРОЕННЫЙ stdlib-`TypeError`
+    («Could not resolve authentication method...») на этапе сборки заголовков
+    (`_validate_headers`) — ДО HTTP-запроса. Это НЕ подкласс `anthropic.APIError`, поэтому
+    классификатор LLM-сбоев его бы не распознал → джоба ушла бы в ветку «unexpected»
+    (autoretry/re-raise) и зависла бы до reconciler-TTL.
+
+    Чтобы матч был узким и version-agnostic (а НЕ по подстроке сообщения через весь стек),
+    `ClaudeAgentClient.run_agent` перехватывает `TypeError` вокруг первого вызова SDK
+    (`messages.stream` / `get_final_message`) и поднимает это исключение. SDK валидирует
+    auth ЛЕНИВО — на первом запросе, а НЕ в конструкторе клиента, поэтому точка перехвата —
+    `run_agent` (первый вызов SDK), не `__init__`. Классификатор трактует его как
+    не-транзиентный LLM-сбой → немедленный FAILED(agent_unavailable) без ретраев (§G,
+    подстраховка-слой; основной путь для ПУСТОГО ключа — preflight в run_agent_task).
+    """
+
+
 # Множество ретраябельных (транзиентных инфра) исключений — единственный источник
 # истины (ADR-006). Доменные исключения сюда НЕ входят сознательно.
 TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
@@ -96,6 +115,10 @@ NON_RETRYABLE_LLM_EXCEPTIONS: tuple[type[BaseException], ...] = (
     AuthenticationError,  # 401 — ANTHROPIC_API_KEY отсутствует/невалиден
     PermissionDeniedError,  # 403
     BadRequestError,  # 400, не зависящий от входных данных
+    # ADR-019 §Fix round 3 (подстраховка): client-side auth-resolution TypeError SDK
+    # (поднят фабрикой клиента агента как LLMCredentialError) — невалидный credential,
+    # детерминированно-падающий ДО HTTP. Не ретраить → немедленный agent_unavailable.
+    LLMCredentialError,
 )
 
 
@@ -118,5 +141,23 @@ def is_llm_failure(exc: BaseException) -> bool:
     FAILED(agent_unavailable); исчерпание на не-LLM инфра (Docker/S3/БД/Redis) →
     FAILED(infra_error). Anthropic SDK поднимает подклассы APIError на все сбои Claude
     (включая APIConnectionError/APITimeoutError/RateLimitError/APIStatusError).
+    `LLMCredentialError` (client-side auth-resolution TypeError SDK, ADR-019 §Fix round 3) —
+    тоже LLM-недоступность, хотя и вне иерархии APIError.
     """
-    return isinstance(exc, APIError)
+    return isinstance(exc, (APIError, LLMCredentialError))
+
+
+# --- ADR-019 §Fix round 3: per-job fail-fast preflight LLM-credential (основной путь) ---
+
+
+def llm_credential_present(api_key: str | None) -> bool:
+    """True, если LLM-credential (ANTHROPIC_API_KEY) пригоден для SDK-вызова (ADR-019 §G).
+
+    Непустой = не `None` и не whitespace-only строка. Принимает уже-распакованное значение
+    `Settings.anthropic_api_key.get_secret_value()` (не `SecretStr`), чтобы не логировать секрет
+    и не тащить зависимость от типа конфига в классификатор. При `False` агент-таска делает
+    fail-fast graceful-переход FAILED(agent_unavailable) ДО первого обращения к Anthropic SDK —
+    version-agnostic, детерминированно ловит самый частый прод-кейс (пустой ключ), не завися от
+    типа/текста встроенного `TypeError` SDK (§Fix round 3, п.1).
+    """
+    return bool(api_key and api_key.strip())
