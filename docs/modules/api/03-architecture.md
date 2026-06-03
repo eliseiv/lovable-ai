@@ -26,3 +26,12 @@
 - Ошибки — RFC-7807 (`application/problem+json`).
 - Версионирование пути: `/v1`.
 - Авторизация владения на каждом `/{pid}`/`/{jid}` (cross-tenant защита).
+
+## Обработчики ошибок → RFC-7807 (нормативно, ВСЕ ошибки включая 422)
+
+> **Прод-фикс (2026-06-04).** Валидационный `422` на `POST /auth/apple` отдавался **дефолтным FastAPI** `{detail:[...]}` (`application/json`) вместо `application/problem+json`. Контракт [api/02 → Конвенции ошибок](02-api-contracts.md#конвенции-ошибок-rfc-7807) и [B.3](02-api-contracts.md#b3-состав-описания-каждого-endpointа-обязательный-минимум) требуют RFC-7807 для **ВСЕХ** ошибок, **включая 422**. Прочие 422 (`/devices`, отсутствие `Idempotency-Key`) уже нормализованы — `/auth/apple` выпадал.
+
+**Нормативный контракт (единая точка нормализации, для всех роутеров включая `/auth/apple`):**
+- Регистрируется **глобальный** `exception_handler(RequestValidationError, ...)` (Starlette/FastAPI app-level), который сериализует ошибку валидации в `application/problem+json` (RFC-7807: `type`/`title`/`status=422`/`detail`; для валидации — `detail` агрегирует поля или ссылается на `errors[]`). Тот же app-level хэндлер покрывает `HTTPException`/доменные ошибки (`401`/`402`/`404`/`409`/`429`) → `problem+json`.
+- Хэндлер **app-level** (на `FastAPI(...)`-инстансе), поэтому распространяется на **ВСЕ** эндпоинты, включая публичный-без-Bearer `POST /auth/apple` ([auth/02 §Ошибки](../auth/02-api-contracts.md#post-authapple): `422` при отсутствии `identity_token`). Отдельный per-router обработчик не нужен — единая точка исключает «забытые» эндпоинты.
+- **Критерий приёмки (qa):** `POST /auth/apple` без `identity_token` → `422` с `Content-Type: application/problem+json` и телом RFC-7807 (не дефолтный `{detail:[...]}`); grep-проверка, что **все** 422 в API несут `application/problem+json` ([06-testing-strategy.md](../../06-testing-strategy.md)).

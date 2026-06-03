@@ -69,3 +69,4 @@ Base: `https://api.domain/v1` · Ошибки: RFC-7807 (`application/problem+js
 ```
 - Auth-провалы (`/auth/apple` и Bearer) → `401` без раскрытия конкретной непрошедшей проверки.
 - Превышение rate-limit (60/min на ключ) → `429` (RFC-7807, заголовок `Retry-After`). Контракт rate-limit — [03-architecture.md](03-architecture.md).
+- **Валидационный `422`** (`POST /auth/apple` без `identity_token`) — тоже **`application/problem+json`** (RFC-7807, `status=422`), **не** дефолтный FastAPI `{detail:[...]}`. Покрывается **глобальным** app-level `RequestValidationError`-обработчиком ([modules/api/03-architecture.md → Обработчики ошибок](../api/03-architecture.md#обработчики-ошибок--rfc-7807-нормативно-все-ошибки-включая-422)) — единая точка для всех эндпоинтов, включая публичный-без-Bearer `/auth/apple` (прод-фикс 2026-06-04).

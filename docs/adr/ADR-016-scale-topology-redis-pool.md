@@ -35,6 +35,8 @@
 - **(−)** Ручной scale требует оператора (наблюдение дашборда Build-ферма/queue depth + ручное добавление хоста). Принято для S6; авто — поздний этап.
 - **(−)** `ConnectionPool` per-process — нужно следить за размером пула vs `max_clients` Redis при росте реплик (env `REDIS_POOL_MAX_CONNECTIONS`); метрика `lovable_redis_pool_in_use` страхует.
 
+> **Уточнение области применения (2026-06-04, [ADR-019 §Fix](ADR-019-reconciler-all-active-states-agent-graceful-fail.md#fix-2026-06-04--loop-affinity-redis-клиента-в-celery-прод-инцидент)):** глобальный переиспользуемый `ConnectionPool`/клиент-синглтон (п.4 выше) — это **путь ASGI-приложения FastAPI** (rate-limit/SSE/budget hot-path, привязан к долгоживущему ASGI event loop). Он **НЕ** используется из тела Celery-задач: там асинхронный Redis (`publish_event`, SSE-publish, budget) создаётся **per-task внутри `asyncio.run`-loop** с ContextVar-биндингом и `aclose()` в `finally` ([observability §7.0–7.2](../modules/observability/03-architecture.md#70-принцип-обобщён-на-все-loop-bound-async-ресурсы--нормативно)). Прод-инцидент: глобальный async-Redis-синглтон, использованный из чужого `asyncio.run`-loop Celery-таски, давал `RuntimeError: Event loop is closed`. Решение этого ADR (ConnectionPool для ASGI) **не отменяется** — лишь явно сужается до ASGI-пути; воркерный путь — per-task.
+
 ## Alternatives
 
 - **Авто-scaling (HPA/KEDA по queue depth) в S6.** Отвергнут продуктово ([08 §6-4](../08-product-decisions.md#sprint-6--observability-cost-scale)) — ручной scale в S6, авто позже. Метрики уже готовят почву (queue depth → будущий KEDA-trigger).

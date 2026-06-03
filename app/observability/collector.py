@@ -120,8 +120,10 @@ async def refresh_all() -> None:
     async-engine/asyncpg-пул для БД-коллекторов создаётся и dispose()-ится ВНУТРИ этого
     asyncio.run-loop через task_engine_scope (НЕ глобальный engine FastAPI/session.py,
     привязанный к чужому loop). Так asyncpg-соединения не переживают loop между запусками
-    задачи. Redis-коллектор (queue_depth) использует пул процесса (TD-007) — loop-агностичен
-    через redis.asyncio; worker_busy — sync Celery inspect, БД/loop не трогает.
+    задачи. Redis-коллектор (queue_depth) берёт per-task Redis-клиент текущего asyncio.run-loop
+    через worker_redis_scope (его открывает beat-таска metrics.refresh) — НЕ глобальный async-Redis
+    пул процесса, который LOOP-BOUND и дал бы `Future attached to a different loop` между beat-
+    тиками (observability §7.0/§7.2). worker_busy — sync Celery inspect, БД/loop не трогает.
     """
     async with task_engine_scope() as sessionmaker:
         await refresh_jobs_in_state(sessionmaker)

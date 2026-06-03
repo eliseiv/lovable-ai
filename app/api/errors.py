@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.schemas.api import Problem
@@ -82,6 +83,49 @@ async def problem_exception_handler(_request: Request, exc: Exception) -> JSONRe
     # Зарегистрирован только для ProblemException; сигнатура совместима со Starlette.
     assert isinstance(exc, ProblemException)
     return problem_response(exc)
+
+
+def _validation_error_items(exc: RequestValidationError) -> list[dict[str, Any]]:
+    """Поля-ошибки из RequestValidationError в JSON-сериализуемом виде (RFC-7807 errors[]).
+
+    `loc` приводим к строке (точечный путь поля); `ctx` отбрасываем — он может содержать
+    несериализуемые объекты (исключения Pydantic) и не нужен клиенту iOS.
+    """
+    items: list[dict[str, Any]] = []
+    for err in exc.errors():
+        loc = ".".join(str(part) for part in err.get("loc", ()))
+        items.append({"loc": loc, "msg": str(err.get("msg", "")), "type": str(err.get("type", ""))})
+    return items
+
+
+async def validation_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
+    """App-level обработчик RequestValidationError → application/problem+json (RFC-7807, 422).
+
+    Нормативный контракт (docs/modules/api/03 → Обработчики ошибок; auth/02 §Ошибки): ВСЕ 422,
+    включая публичный `POST /auth/apple` без `identity_token`, обязаны нести
+    `application/problem+json`, а не дефолтный FastAPI `{detail:[...]}` (application/json).
+    Регистрируется на `FastAPI(...)`-инстансе (app-level) — единая точка для всех роутеров,
+    исключает «забытые» эндпоинты. Прочие 422 (например `unprocessable()` → ProblemException)
+    идут своим путём и не затрагиваются.
+
+    `detail` агрегирует поля-ошибки в человекочитаемую строку (RFC-7807 detail); полный список —
+    в доменном поле `errors[]` (точечный `loc` + `msg` + `type`).
+    """
+    assert isinstance(exc, RequestValidationError)
+    errors = _validation_error_items(exc)
+    detail = "; ".join(f"{e['loc']}: {e['msg']}" for e in errors) or "Некорректные данные запроса."
+    body: dict[str, Any] = {
+        "type": f"{_BASE}/unprocessable-entity",
+        "title": "Unprocessable Entity",
+        "status": 422,
+        "detail": detail,
+        "errors": errors,
+    }
+    return JSONResponse(
+        status_code=422,
+        content=body,
+        media_type="application/problem+json",
+    )
 
 
 def unauthorized(detail: str = "Invalid or missing API key.") -> ProblemException:

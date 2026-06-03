@@ -3,7 +3,8 @@
 Реальный Postgres + Redis (conftest). Внешние границы (Adapty/Docker/S3/APNs) мокаются.
 
 Покрывает:
-  - GET /metrics (app ASGI mount) → 200 + prometheus content-type + lovable_* + НЕ под /v1;
+  - GET /metrics (точный bare-Route, observability §1) → 200 prometheus-text напрямую БЕЗ
+    307/308 + prometheus content-type + lovable_* + НЕ под /v1;
   - /metrics не требует Bearer (internal scrape), но не публичен под /v1;
   - SSE heartbeat-catchup (TD-011): терминальное событие записано в job_events, но pub/sub
     wake-сигнал «потерян» (в Redis не публикуем) → heartbeat-таймаут дочитывает job_events +
@@ -39,15 +40,16 @@ pytestmark = pytest.mark.asyncio
 
 
 async def test_metrics_endpoint_returns_prometheus_text(client):  # noqa: ANN001
-    """GET /metrics (app mount) → 200, prometheus content-type, содержит lovable_*-метрики.
+    """GET /metrics (точный bare-Route) → 200 напрямую БЕЗ 307/308, prometheus content-type.
 
-    Starlette mount канонизирует путь к /metrics/ (307 на bare /metrics); follow_redirects
-    повторяет реальное поведение scrape-клиента (Prometheus следует редиректу).
+    observability §1 инвариант I1: bare `/metrics` обязан отдавать 200 без редиректа (scrape-
+    совместимость) — точный Route матчит ровно `/metrics` без trailing-slash-канонизации.
+    follow_redirects=False фиксирует отсутствие промежуточного 307/308 (прод-фикс раунд 2).
     """
     from prometheus_client import CONTENT_TYPE_LATEST
 
-    resp = await client.get("/metrics", follow_redirects=True)
-    assert resp.status_code == 200
+    resp = await client.get("/metrics", follow_redirects=False)
+    assert resp.status_code == 200, "bare /metrics → 200 напрямую (без 307/308)"
     # prometheus text exposition content-type (символ-в-символ с CONTENT_TYPE_LATEST клиента).
     assert resp.headers["content-type"] == CONTENT_TYPE_LATEST
     assert "text/plain" in resp.headers["content-type"]
@@ -62,15 +64,24 @@ async def test_metrics_not_under_v1(client):  # noqa: ANN001
     assert resp.status_code == 404
 
 
+async def test_metrics_absent_from_public_openapi(client):  # noqa: ANN001
+    """observability §1 I3: /metrics include_in_schema=False → отсутствует в публичной OpenAPI."""
+    resp = await client.get("/openapi.json")
+    assert resp.status_code == 200
+    paths = resp.json().get("paths", {})
+    assert "/metrics" not in paths
+    assert "/v1/metrics" not in paths
+
+
 async def test_metrics_no_bearer_required(client):  # noqa: ANN001
     """/metrics доступен без Bearer (internal scrape-target, не доменный /v1-эндпоинт)."""
-    resp = await client.get("/metrics", follow_redirects=True)  # без auth_headers
+    resp = await client.get("/metrics", follow_redirects=False)  # без auth_headers
     assert resp.status_code == 200
 
 
 async def test_metrics_only_get(client):  # noqa: ANN001
-    """ASGI /metrics — только GET; POST → 405."""
-    resp = await client.post("/metrics/")
+    """Bare-Route /metrics — только GET (methods=["GET"]); POST → 405."""
+    resp = await client.post("/metrics", follow_redirects=False)
     assert resp.status_code == 405
 
 

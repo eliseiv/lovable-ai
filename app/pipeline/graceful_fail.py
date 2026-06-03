@@ -28,6 +28,7 @@ from celery import Task
 from app.core.logging import get_logger
 from app.db.enums import JobState
 from app.db.session import session_scope, worker_engine_scope
+from app.observability.redis_pool import worker_redis_scope
 from app.pipeline.events import fail_job, load_job
 from app.workers.retry_policy import (
     MAX_RETRIES,
@@ -48,9 +49,11 @@ async def _graceful_fail_job(job_id: str, failure_reason: str) -> None:
     observability §7: вызывается из отдельного `asyncio.run` (в run_agent_task), поэтому
     обёрнута в `worker_engine_scope()` — per-task engine внутри ЭТОГО loop'а, а не глобальный
     (asyncpg `Future attached to a different loop`). `session_scope()` подхватывает per-task
-    sessionmaker из ContextVar.
+    sessionmaker из ContextVar. Аналогично `worker_redis_scope()` (ADR-019 §Fix): per-task
+    async-Redis клиент внутри ЭТОГО loop'а — `fail_job→transition→publish_event` дёргает Redis,
+    глобальный ASGI-пул дал бы `RuntimeError: Event loop is closed`.
     """
-    async with worker_engine_scope(), session_scope() as session:
+    async with worker_engine_scope(), worker_redis_scope(), session_scope() as session:
         job = await load_job(session, job_id)
         if job is None:
             logger.info("graceful_fail_job_missing", extra={"job_id": job_id})
@@ -86,14 +89,17 @@ def run_agent_task(
     - не-транзиентное НЕ-LLM исключение (баг/доменное) → пробрасываем как есть (не маскируем).
 
     observability §7 (ADR-019): тело задачи исполняется через `asyncio.run` под
-    `worker_engine_scope()` — per-task async-engine внутри этого loop'а (НЕ глобальный
-    FastAPI-engine, привязанный к чужому loop). `session_scope()` в теле подхватывает
-    per-task sessionmaker из ContextVar. graceful-fail ниже идёт отдельным `asyncio.run`
-    и сам оборачивается в worker_engine_scope (см. _graceful_fail_job).
+    `worker_engine_scope()` + `worker_redis_scope()` — per-task async-engine И per-task async-Redis
+    клиент внутри этого loop'а (НЕ глобальные FastAPI-engine/ASGI-Redis-пул, привязанные к чужому
+    loop). `session_scope()`/`get_redis()` в теле подхватывают per-task ресурсы из ContextVar.
+    Без per-task Redis `publish_event()` из `transition()` падал бы `RuntimeError: Event loop is
+    closed` на втором таске того же воркера → джоба зависала в активном state, лочила слот
+    (прод-инцидент ADR-019 §Fix п.1). graceful-fail ниже идёт отдельным `asyncio.run` и сам
+    оборачивается в worker_engine_scope + worker_redis_scope (см. _graceful_fail_job).
     """
 
     async def _run_in_engine_scope() -> None:
-        async with worker_engine_scope():
+        async with worker_engine_scope(), worker_redis_scope():
             await coro_factory()
 
     try:

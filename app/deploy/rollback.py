@@ -31,6 +31,7 @@ from app.db.session import session_scope, worker_engine_scope
 from app.deploy import docker_deploy, health, routing, sandbox, workspace
 from app.deploy.traefik import live_url
 from app.observability import metrics
+from app.observability.redis_pool import worker_redis_scope
 from app.storage import s3
 from app.storage.s3 import S3Storage, get_storage
 from app.workers.celery_app import celery_app
@@ -242,9 +243,11 @@ def rollback_revision(job_id: str, project_id: str, revision_id: str) -> None:
     """
 
     async def _run() -> None:
-        # observability §7 (ADR-019): per-task async-engine внутри asyncio.run-loop задачи;
-        # session_scope в _run_rollback_job/redeploy_revision подхватывает его из ContextVar.
-        async with worker_engine_scope():
+        # observability §7 (ADR-019): per-task async-engine + per-task async-Redis внутри
+        # asyncio.run-loop задачи; session_scope/get_redis в _run_rollback_job/redeploy_revision
+        # подхватывают их из ContextVar. worker_redis_scope обязателен: rollback-джоба зовёт
+        # transition→publish_event (Redis), глобальный ASGI-пул дал бы `Event loop is closed`.
+        async with worker_engine_scope(), worker_redis_scope():
             await _run_rollback_job(job_id, project_id, revision_id)
 
     asyncio.run(_run())

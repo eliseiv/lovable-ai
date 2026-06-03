@@ -10,13 +10,18 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 
-from app.api.errors import ProblemException, problem_exception_handler
+from app.api.errors import (
+    ProblemException,
+    problem_exception_handler,
+    validation_exception_handler,
+)
 from app.api.routers import auth, billing, devices, health, jobs, projects
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.observability import sentry
-from app.observability.exposition import metrics_asgi_app
+from app.observability.exposition import metrics_endpoint
 from app.observability.redis_pool import close_pool
 
 settings = get_settings()
@@ -98,7 +103,12 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
+# RFC-7807 для ВСЕХ ошибок (docs/modules/api/03 → Обработчики ошибок). ProblemException —
+# доменные 401/402/404/409/429/422. RequestValidationError — app-level handler нормализует
+# дефолтный FastAPI-422 ({detail:[...]}) в application/problem+json для ВСЕХ эндпоинтов,
+# включая публичный `POST /auth/apple` без `identity_token` (прод-фикс 2026-06-04, auth/02 §Ошибки).
 app.add_exception_handler(ProblemException, problem_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
 
 
 @app.middleware("http")
@@ -123,9 +133,16 @@ async def _sentry_correlation(
         return await call_next(request)
 
 
-# Prometheus /metrics — internal ASGI mount (Sprint 6, ADR-015 §1): не под /v1, не публичный
-# (только cluster/compose-scrape, наружу через Traefik не публикуется). Registry процесса.
-app.mount("/metrics", metrics_asgi_app)
+# Prometheus /metrics — точный bare-Route (Sprint 6, ADR-015 §1, прод-фикс 2026-06-04 раунд 2):
+# не под /v1, не публичный (только cluster/compose-scrape, наружу через Traefik не публикуется),
+# registry процесса. Объявлен ТОЧНЫМ путём `/metrics` (Starlette/FastAPI Route, GET,
+# include_in_schema=False), НЕ `app.mount`: Mount — префиксное под-приложение, обслуживает bare
+# `/metrics` только через trailing-slash-редирект (307 → scheme-downgrade за TLS-прокси при
+# redirect_slashes=True, либо 404 при redirect_slashes=False — обе регрессии нарушают
+# scrape-инвариант I1, observability §1). Точный Route матчит ровно `/metrics` без
+# slash-канонизации → 200 prometheus-text напрямую, без 307/308, независимо от глобального
+# redirect_slashes. `GET /v1/metrics` → 404 (роут вне /v1-префикса). docs/07 §Proxy-headers (1).
+app.add_route("/metrics", metrics_endpoint, methods=["GET"], include_in_schema=False)
 
 # Health — без префикса (liveness/readiness probes).
 app.include_router(health.router)

@@ -59,10 +59,23 @@ async def publish_event(
     to_state: str | None = None,
     payload: dict[str, Any] | None = None,
 ) -> None:
-    """Публикует событие в Redis pub/sub для SSE. Ошибка Redis не валит пайплайн.
+    """Публикует событие в Redis pub/sub для SSE — best-effort (ADR-019 §Fix, pipeline §H).
 
-    Sprint 6 (TD-007): соединение из переиспользуемого ConnectionPool (publish — hot-path
-    каждого перехода), не per-request from_url/aclose. Клиент не закрывается (пул процесса).
+    Вызывается из `transition()` ПОСЛЕ commit перехода state. publish — лишь at-most-once
+    wake-сигнал для SSE; источник истины статуса — БД (`generation_jobs.state` + `job_events`),
+    SSE имеет replay по Last-Event-ID (ADR-012). Поэтому сбой publish НЕ должен валить переход
+    state / graceful-fail (§G): иначе таска падала бы ДО терминализации и джоба зависала бы в
+    активном state, лоча concurrency-слот (прод-инцидент ADR-019).
+
+    Sprint 6 (TD-007): соединение из переиспользуемого пула (publish — hot-path каждого
+    перехода). В Celery-контексте `get_redis()` отдаёт per-task клиент (worker_redis_scope,
+    observability §7) — корневой фикс loop-affinity; на ASGI-пути — клиент пула процесса.
+
+    Расширенный catch — ВТОРОЙ слой (pipeline §H, ADR-019 §Fix п.3): ловим
+    `(RedisError, OSError, RuntimeError)` — `RuntimeError` добавлен как предохранитель от
+    остаточной loop-affinity-аномалии (`Event loop is closed` / `Future attached to a different
+    loop`), логируем WARN и НЕ пробрасываем. Это НЕ замена корневого loop-fix (per-task Redis),
+    а гарантия, что переход state и graceful-fail доходят до терминала даже при сбое нотификации.
     """
     message = {
         "event_type": event_type,
@@ -73,7 +86,7 @@ async def publish_event(
     client = get_redis()
     try:
         await client.publish(_redis_channel(job_id), json.dumps(message))
-    except (aioredis.RedisError, OSError) as exc:
+    except (aioredis.RedisError, OSError, RuntimeError) as exc:
         logger.warning("redis_publish_failed", extra={"job_id": job_id, "error": str(exc)})
 
 
