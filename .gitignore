@@ -43,3 +43,10 @@ Thumbs.db
 
 # --- Локальные builds-волюмы / эфемерные ---
 /var/builds/
+
+# one-off server deploy helpers (run via scp, not part of repo)
+infra/setup_prod_env.sh
+infra/setup_server_git.sh
+infra/check_swagger.sh
+infra/prod_probe.sh
+config_err.txt
