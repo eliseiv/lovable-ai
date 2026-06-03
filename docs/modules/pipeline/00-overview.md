@@ -8,7 +8,7 @@
 - Разграничение Celery-retry (транзиентный инфра-сбой) vs доменный FIXING (build-fail) — [ADR-006](../../adr/ADR-006-celery-retry-vs-domain-fixing.md).
 - Cost-control: cost-ledger `llm_usage` (агрегат `spend_usd` в Postgres — источник истины бюджета), prompt caching, tiering моделей. Быстрый Redis-счётчик бюджета — опциональная оптимизация латентности гейта, Sprint 6 ([TD-006](../../100-known-tech-debt.md#td-006)), не входит в S2.
 - Запись `job_events` (audit + SSE pub/sub в Redis).
-- Celery beat: sweeper (экспайр зависших `AWAITING_CLARIFICATION` по TTL) + reconciler (crash-resume застрявших `BUILDING/DEPLOYING/FIXING`).
+- Celery beat: sweeper (экспайр зависших `AWAITING_CLARIFICATION` по TTL) + reconciler (crash-resume + concurrency-leak guard для **всех** активных нетерминальных состояний `CREATED/INTERVIEWING/SPECCING/BUILDING/DEPLOYING/FIXING`, кроме `AWAITING_CLARIFICATION`; fail-stuck → `stuck_timeout`). Graceful-fail шага агента при недоступности LLM → `FAILED(agent_unavailable)` ([ADR-019](../../adr/ADR-019-reconciler-all-active-states-agent-graceful-fail.md)).
 
 ## Out-of-scope
 - HTTP-эндпоинты — модуль `api`.

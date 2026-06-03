@@ -13,7 +13,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Request, Response, status
 
 from app.api.dependencies import CurrentUser, SessionDep
-from app.api.errors import unauthorized
+from app.api.errors import problem_responses, unauthorized
 from app.billing import entitlements, usage
 from app.billing.adapty_client import verify_webhook_signature
 from app.billing.subscription_state import (
@@ -31,24 +31,32 @@ from app.schemas.api import BillingMeResponse, BillingQuota
 
 logger = get_logger(__name__)
 
-router = APIRouter(prefix="/billing", tags=["billing"])
+router = APIRouter(prefix="/billing", tags=["Биллинг"])
 
 # Заголовок подписи вебхука Adapty (HMAC-SHA256 raw_body). Имя — по конфигурации Adapty
 # webhook v2; берём канонический header. Невалидно/отсутствует → 401 без раскрытия.
 _SIGNATURE_HEADER = "adapty-signature"
 
 
-@router.post("/webhook/adapty", status_code=status.HTTP_200_OK)
+@router.post(
+    "/webhook/adapty",
+    status_code=status.HTTP_200_OK,
+    summary="Приём событий магазина подписок (server-to-server)",
+    description=(
+        "Служебный эндпоинт server-to-server: вызывается провайдером подписок, **не** "
+        "предназначен для клиента iOS. Авторизация — не Bearer, а проверка секрета/подписи "
+        "провайдера (некорректная подпись → `401`). Обработка идемпотентна (повтор события "
+        "→ `200` без повторного применения)."
+    ),
+    responses=problem_responses(401),
+)
 async def adapty_webhook(
     request: Request,
     session: SessionDep,
     signature: Annotated[str | None, Header(alias=_SIGNATURE_HEADER)] = None,
 ) -> Response:
-    """Вебхук Adapty (S2S, НЕ Bearer). Подпись валидна → обработка; иначе 401.
-
-    Идемпотентность по adapty_event_id (200 no-op на повтор). Неизвестный customer_user_id
-    → 200 (событие сохранено, не потеряно). Внутренняя ошибка после валидной подписи → 5xx
-    (Adapty повторит доставку).
+    """Приём событий магазина подписок (server-to-server, не Bearer). Подпись валидна →
+    обработка; иначе 401. Идемпотентно по идентификатору события.
     """
     settings = get_settings()
     raw_body = await request.body()
@@ -72,12 +80,20 @@ async def adapty_webhook(
     return Response(status_code=status.HTTP_200_OK)
 
 
-@router.get("/me", response_model=BillingMeResponse)
+@router.get(
+    "/me",
+    response_model=BillingMeResponse,
+    summary="Тариф и остаток квоты",
+    description=(
+        "Возвращает текущий тариф (`access_level`), статус подписки и остаток квот: "
+        "генерации, правки, число одновременных задач и проектов (поля `quota.*`). "
+        "Пустые значения лимитов (`null`) означают безлимит. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 429),
+)
 async def billing_me(user: CurrentUser, session: SessionDep) -> BillingMeResponse:
-    """Текущий entitlement + остаток квоты (docs §2). Lazy-ресинк при протухшем кэше.
-
-    Нет подписки → free/active с квотой free-тарифа. generations_remaining = max(0, ...).
-    """
+    """Возвращает текущий тариф и остаток квоты. Нет подписки → бесплатный тариф."""
     # resolve_entitlement выполняет lazy-ресинк при протухании (fail-open на кэш).
     ent = await entitlements.resolve_entitlement(session, user.id)
     quota = await entitlements.get_plan_quota(session, ent.access_level)

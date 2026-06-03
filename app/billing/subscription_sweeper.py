@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.billing import subscription_state
 from app.core.logging import get_logger
 from app.db.models import Project, SiteDeployment, Subscription
-from app.db.session import session_scope
+from app.db.session import session_scope, worker_engine_scope
 from app.deploy import docker_deploy
 from app.workers.celery_app import celery_app
 
@@ -91,4 +91,10 @@ async def _sweep_subscriptions() -> int:
 @celery_app.task(name="billing.subscription_sweep", queue="build")
 def subscription_sweep() -> int:
     """Celery-beat: grace-teardown сайтов. queue=build (docker-операции на build-воркере)."""
-    return asyncio.run(_sweep_subscriptions())
+
+    async def _run() -> int:
+        # observability §7 (ADR-019): per-task async-engine внутри asyncio.run-loop задачи.
+        async with worker_engine_scope():
+            return await _sweep_subscriptions()
+
+    return asyncio.run(_run())

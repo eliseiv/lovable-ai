@@ -49,9 +49,12 @@ def live_url(settings: Settings, site_id: str) -> str:
 def traefik_labels(settings: Settings, site_id: str) -> dict[str, str]:
     """Traefik-лейблы Docker-провайдера для nginx-контейнера сайта по режиму.
 
-    path (prod, §2A): PathPrefix(`/s/{site_id}`) + StripPrefix-middleware `/s/{site_id}` +
-    entrypoints=websecure. StripPrefix обязателен — nginx внутри получает `/`, а не
-    `/s/{site_id}` (контейнер остаётся generic nginx:alpine + mount, ADR-002).
+    path (prod, §2A): Host(`{apps_domain}`) && PathPrefix(`/s/{site_id}`) + явный priority +
+    StripPrefix-middleware `/s/{site_id}` + entrypoints=websecure. Host(...) и priority
+    ОБЯЗАТЕЛЬНЫ (prod-фикс ADR-017 §Fix): на общей сети web под чужим edge-Traefik правило
+    без Host матчило бы любой хост (перехват чужих запросов), а без priority конфликтовало бы
+    с catch-all API-роутером Host(apps_domain). StripPrefix обязателен — nginx внутри получает
+    `/`, а не `/s/{site_id}` (контейнер остаётся generic nginx:alpine + mount, ADR-002).
     subdomain (dev): Host(`{site_id}.{apps_domain}`), entrypoint/TLS из settings.sites_use_tls.
     """
     router = f"traefik.http.routers.{site_id}"
@@ -61,10 +64,13 @@ def traefik_labels(settings: Settings, site_id: str) -> dict[str, str]:
         f"{service}.loadbalancer.server.port": "80",
     }
     if settings.routing_is_path:
-        # Path-режим (ADR-017 §2A): PathPrefix + StripPrefix + websecure.
+        # Path-режим (ADR-017 §2A + §Fix): Host(apps_domain) && PathPrefix + явный priority +
+        # StripPrefix + websecure. Host(...) ограничивает правило доменом приложения (чужие
+        # Host не матчатся); priority выше catch-all API-роутера Host(apps_domain).
         prefix = site_path_prefix(site_id)
         middleware = f"{site_id}-strip"
-        labels[f"{router}.rule"] = f"PathPrefix(`{prefix}`)"
+        labels[f"{router}.rule"] = f"Host(`{settings.apps_domain}`) && PathPrefix(`{prefix}`)"
+        labels[f"{router}.priority"] = str(settings.site_router_priority)
         labels[f"{router}.entrypoints"] = "websecure"
         labels[f"traefik.http.middlewares.{middleware}.stripprefix.prefixes"] = prefix
         labels[f"{router}.middlewares"] = middleware

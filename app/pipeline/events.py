@@ -112,6 +112,11 @@ async def transition(
     """
     from_state = job.state.value
     job.state = to_state
+    # ADR-019: heartbeat прогресса — last_transition_at обновляется РОВНО при смене state
+    # (эта единственная транзакционная точка), не при cost-ledger/guard-state апдейтах. Так
+    # reconciler (docs §E2) детектит зависание по простою в одном state, не ложно сброшенному
+    # cost-ledger'ом. now() — серверное время БД (консистентно с server_default).
+    job.last_transition_at = datetime.now(UTC)
     await record_event(
         session,
         job.id,

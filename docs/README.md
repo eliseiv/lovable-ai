@@ -22,7 +22,7 @@ Backend-сервис для iOS-приложения: по промту поль
 | [100-known-tech-debt.md](100-known-tech-debt.md) | Реестр TD-NNN |
 | [adr/INDEX.md](adr/INDEX.md) | Реестр архитектурных решений |
 
-> **API-контракты — per-module** (раздел `04-api.md` намеренно НЕ создаётся): REST-контракты живут в [modules/api/02-api-contracts.md](modules/api/02-api-contracts.md) (вкл. SSE, `/edits`, rollback, `/devices` — Sprint 5), [modules/auth/02-api-contracts.md](modules/auth/02-api-contracts.md) и [modules/billing/02-api-contracts.md](modules/billing/02-api-contracts.md).
+> **API-контракты — per-module** (раздел `04-api.md` намеренно НЕ создаётся): REST-контракты живут в [modules/api/02-api-contracts.md](modules/api/02-api-contracts.md) (вкл. SSE, `/edits`, rollback, `/devices` — Sprint 5), [modules/auth/02-api-contracts.md](modules/auth/02-api-contracts.md) и [modules/billing/02-api-contracts.md](modules/billing/02-api-contracts.md). **Нормативный стандарт публичной Swagger/OpenAPI-документации** (русскоязычный справочник для iOS-разработчика, denylist внутренних маркеров, `tags`, `include_in_schema`, grep-чек-лист) — [modules/api/02-api-contracts.md → Публичная API-документация](modules/api/02-api-contracts.md#публичная-api-документация-swaggeropenapi--нормативный-стандарт).
 
 ## Модули
 
@@ -56,7 +56,7 @@ Backend-сервис для iOS-приложения: по промту поль
 - **Цикл самовосстановления** `FIXING→BUILDING→DEPLOYING→LIVE|FIXING` с инкрементом `retry_count` только на применённом патче (`FIXING→BUILDING`).
 - **4 гарда fix-loop** от runaway: max attempts (`MAX_FIX_ATTEMPTS`), budget (`spend_usd>=JOB_BUDGET_USD`, источник истины — Postgres), wall-clock (`JOB_WALL_CLOCK_BUDGET_S`), no-progress-by-signature ([ADR-005](adr/ADR-005-no-progress-failure-signature.md)) → `FAILED(reason)`.
 - **Разграничение Celery-retry (инфра) vs доменный FIXING (build-fail)** ([ADR-006](adr/ADR-006-celery-retry-vs-domain-fixing.md)).
-- **Beat sweeper** (`AWAITING_CLARIFICATION` TTL) + **reconciler** (crash-resume застрявших `BUILDING/DEPLOYING/FIXING`).
+- **Beat sweeper** (`AWAITING_CLARIFICATION` TTL) + **reconciler** (crash-resume + concurrency-leak guard для **всех** активных нетерминальных состояний `CREATED/INTERVIEWING/SPECCING/BUILDING/DEPLOYING/FIXING`, кроме `AWAITING_CLARIFICATION`; fail-stuck → `stuck_timeout`) + **graceful-fail агента** при недоступности LLM → `FAILED(agent_unavailable)` ([ADR-019](adr/ADR-019-reconciler-all-active-states-agent-graceful-fail.md)).
 - **`failure_log` в S3** (`logs/{job_id}/build.log`).
 
 **Приёмочный пункт, ещё НЕ прогнанный:** реальный E2E на **живом стеке** с `ANTHROPIC_API_KEY` + Docker + поднятым Celery-воркером, а также **real-stack execution** Celery `task.retry` через брокер — НЕ прогнаны из-за отсутствия окружения. Fix-loop проверен через **тела тасок с моками** (262 unit/integration зелёные, coverage 88.28%). Реализован и покрыт тестами **код Fixer loop + resilience**; живой E2E и real-stack retry через брокер остаются открытым приёмочным пунктом Sprint 2 — **не выдаётся за «протестировано на живом стеке»**.

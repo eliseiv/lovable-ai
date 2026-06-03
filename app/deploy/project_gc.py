@@ -45,7 +45,7 @@ from app.db.models import (
     Revision,
     SiteDeployment,
 )
-from app.db.session import session_scope
+from app.db.session import session_scope, worker_engine_scope
 from app.deploy import docker_deploy
 from app.observability import metrics
 from app.storage import s3
@@ -274,4 +274,11 @@ def project_gc(project_id: str) -> None:
 
     Идемпотентна (acks_late): повторный запуск на уже-удалённом проекте — no-op.
     """
-    asyncio.run(_run_gc(project_id))
+
+    async def _run() -> None:
+        # observability §7 (ADR-019): per-task async-engine внутри asyncio.run-loop задачи;
+        # session_scope в _run_gc/_refresh_gc_pending_gauge подхватывает его из ContextVar.
+        async with worker_engine_scope():
+            await _run_gc(project_id)
+
+    asyncio.run(_run())

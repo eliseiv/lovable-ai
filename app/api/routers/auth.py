@@ -9,7 +9,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Request, Response, status
 
 from app.api.dependencies import CurrentToken, CurrentUser, SessionDep
-from app.api.errors import not_found, too_many_requests, unauthorized
+from app.api.errors import (
+    not_found,
+    problem_responses,
+    too_many_requests,
+    unauthorized,
+)
 from app.auth import token_service
 from app.auth.rate_limit import check_login_rate_limit
 from app.schemas.api import (
@@ -20,19 +25,28 @@ from app.schemas.api import (
 )
 from app.services.auth_service import AppleTokenError, sign_in_with_apple
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix="/auth", tags=["Аутентификация"])
 
 
-@router.post("/apple", response_model=AppleSignInResponse, status_code=status.HTTP_200_OK)
+@router.post(
+    "/apple",
+    response_model=AppleSignInResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Вход через Apple",
+    description=(
+        "Принимает identity-токен Apple (Sign in with Apple) и возвращает Bearer-ключ "
+        "для последующих запросов (формат `lv_<key_id>_<secret>`). Авторизация не требуется "
+        "(это вход). При неуспешной проверке токена возвращается `401`. Частота входов "
+        "ограничена по IP-адресу — при превышении возвращается `429`."
+    ),
+    responses=problem_responses(401, 429),
+)
 async def apple_sign_in(
     body: AppleSignInRequest,
     request: Request,
     session: SessionDep,
 ) -> AppleSignInResponse:
-    """Sign in with Apple. НЕ Bearer (это логин). Любой провал верификации → 401.
-
-    Анонимный эндпоинт лимитируется по IP (rl:apple:{ip}) — защита от брутфорса логина.
-    """
+    """Возвращает Bearer-ключ по identity-токену Apple. Любой провал проверки → 401."""
     client_ip = request.client.host if request.client else "unknown"
     rl = await check_login_rate_limit(client_ip)
     if not rl.allowed:
@@ -56,13 +70,23 @@ async def apple_sign_in(
     )
 
 
-@router.get("/tokens", response_model=TokensListResponse)
+@router.get(
+    "/tokens",
+    response_model=TokensListResponse,
+    summary="Список токенов устройств",
+    description=(
+        "Возвращает список активных токенов (устройств) текущего пользователя. У токена "
+        "текущего запроса поле `current` равно `true`. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 429),
+)
 async def list_tokens(
     user: CurrentUser,
     current_token: CurrentToken,
     session: SessionDep,
 ) -> TokensListResponse:
-    """Список активных токенов (устройств) текущего пользователя. current — текущий запрос."""
+    """Возвращает активные токены (устройства) текущего пользователя."""
     tokens = await token_service.list_active_tokens(session, user.id)
     out = [
         TokenOut(
@@ -78,14 +102,24 @@ async def list_tokens(
     return TokensListResponse(tokens=out)
 
 
-@router.delete("/tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/tokens/{token_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Отозвать токен устройства",
+    description=(
+        "Отзывает токен устройства (выход с одного устройства). Чужой или несуществующий "
+        "токен → `404`. Операция идемпотентна. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def revoke_token(
     token_id: str,
     user: CurrentUser,
     _current_token: CurrentToken,
     session: SessionDep,
 ) -> Response:
-    """Отзыв токена (logout одного устройства). Чужой/несуществующий → 404. Идемпотентно."""
+    """Отзывает токен устройства. Чужой/несуществующий → 404. Идемпотентно."""
     ok = await token_service.revoke_token(session, user_id=user.id, token_id=token_id)
     if not ok:
         # Cross-tenant: не раскрываем существование чужого токена.

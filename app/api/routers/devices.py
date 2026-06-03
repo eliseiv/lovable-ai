@@ -10,21 +10,33 @@ from __future__ import annotations
 from fastapi import APIRouter, Response, status
 
 from app.api.dependencies import CurrentUser, SessionDep
-from app.api.errors import not_found, unprocessable
+from app.api.errors import not_found, problem_responses, unprocessable
 from app.notify import device_service
 from app.schemas.api import RegisterDeviceRequest, RegisterDeviceResponse
 
-router = APIRouter(prefix="/devices", tags=["devices"])
+router = APIRouter(prefix="/devices", tags=["Устройства"])
 
 
-@router.post("", status_code=status.HTTP_201_CREATED, response_model=RegisterDeviceResponse)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    response_model=RegisterDeviceResponse,
+    summary="Зарегистрировать устройство для push",
+    description=(
+        "Регистрирует устройство для получения push-уведомлений о статусе генерации. "
+        "Повторная регистрация того же токена идемпотентна (повторно активирует устройство). "
+        "Некорректные `platform` или `environment` → `422`. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 422, 429),
+)
 async def register_device(
     body: RegisterDeviceRequest,
     user: CurrentUser,
     session: SessionDep,
 ) -> RegisterDeviceResponse:
-    """Регистрация APNs device token. Upsert по (user_id, apns_token) — идемпотентно
-    (повтор сбрасывает invalidated_at). Невалидный platform/environment → 422.
+    """Регистрирует устройство для push. Повтор того же токена идемпотентен. Некорректные
+    значения → 422.
     """
     error = device_service.validate_registration(body.platform, body.environment)
     if error is not None:
@@ -39,15 +51,23 @@ async def register_device(
     return RegisterDeviceResponse(id=device_id)
 
 
-@router.delete("/{apns_token}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{apns_token}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Отписать устройство от push",
+    description=(
+        "Отписывает устройство от push-уведомлений (выход или смена устройства). Чужой или "
+        "несуществующий токен → `404`. Операция идемпотентна. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def unregister_device(
     apns_token: str,
     user: CurrentUser,
     session: SessionDep,
 ) -> Response:
-    """Отписка устройства (logout/смена). Чужой/несуществующий → 404 (cross-tenant).
-    Идемпотентно: повтор → 204/404.
-    """
+    """Отписывает устройство от push. Чужой/несуществующий токен → 404. Идемпотентно."""
     ok = await device_service.unregister_device(session, user_id=user.id, apns_token=apns_token)
     if not ok:
         raise not_found("Device not found.")

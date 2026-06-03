@@ -59,15 +59,25 @@ def _subdomain_prod_settings():  # noqa: ANN201
 
 
 def test_traefik_labels_path_pathprefix_stripprefix_websecure():
-    labels = routing.traefik_labels(_path_settings(), SITE)
+    settings = _path_settings()
+    labels = routing.traefik_labels(settings, SITE)
     router = f"traefik.http.routers.{SITE}"
     service = f"traefik.http.services.{SITE}"
     middleware = f"{SITE}-strip"
     prefix = f"/s/{SITE}"
 
-    # PathPrefix-роутер (не Host).
-    assert labels[f"{router}.rule"] == f"PathPrefix(`{prefix}`)"
-    assert "Host(" not in labels[f"{router}.rule"]
+    # ADR-017 §Fix: правило теперь Host(apps_domain) && PathPrefix(/s/{site_id}). Host(...)
+    # обязателен (на общей сети web под чужим edge-Traefik правило без Host матчило бы любой
+    # хост — перехват чужих запросов).
+    assert (
+        labels[f"{router}.rule"]
+        == f"Host(`{settings.apps_domain}`) && PathPrefix(`{prefix}`)"
+    )
+    assert "Host(" in labels[f"{router}.rule"]
+    assert f"PathPrefix(`{prefix}`)" in labels[f"{router}.rule"]
+    # Явный priority выше catch-all API-роутера Host(apps_domain) (ADR-017 §Fix), из
+    # settings.site_router_priority (env SITE_ROUTER_PRIORITY).
+    assert labels[f"{router}.priority"] == str(settings.site_router_priority)
     # websecure-entrypoint (общий edge-Traefik терминирует TLS, ADR-018).
     assert labels[f"{router}.entrypoints"] == "websecure"
     # StripPrefix-middleware: nginx внутри получает / (а не /s/{site_id}).
@@ -172,7 +182,11 @@ def test_path_three_planes_consistent():
     s = _path_settings()
     labels = routing.traefik_labels(s, SITE)
     prefix = f"/s/{SITE}"
-    assert labels[f"traefik.http.routers.{SITE}.rule"] == f"PathPrefix(`{prefix}`)"
+    # ADR-017 §Fix: router-rule = Host(apps_domain) && PathPrefix(/s/{site_id}).
+    assert (
+        labels[f"traefik.http.routers.{SITE}.rule"]
+        == f"Host(`{s.apps_domain}`) && PathPrefix(`{prefix}`)"
+    )
     assert routing.live_url(s, SITE) == f"https://apps.domain{prefix}/"
     url, verify = routing.health_check_target(s, SITE, "c")
     assert url == f"https://apps.domain{prefix}/"

@@ -14,7 +14,9 @@ from app.api.dependencies import SessionDep
 from app.core.config import get_settings
 from app.schemas.api import HealthResponse
 
-router = APIRouter(tags=["health"])
+# Служебные эндпоинты инфраструктуры (liveness/readiness) — НЕ для клиента: скрыты из
+# публичной OpenAPI-схемы и Swagger UI (include_in_schema=False, api-contracts §B.5).
+router = APIRouter(include_in_schema=False)
 
 
 @router.get("/healthz", response_model=HealthResponse)

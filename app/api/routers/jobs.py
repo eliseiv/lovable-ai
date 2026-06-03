@@ -16,7 +16,13 @@ from sqlalchemy import select
 
 from app.api import sse
 from app.api.dependencies import CurrentUser, SessionDep
-from app.api.errors import conflict, not_found, too_many_requests, unprocessable
+from app.api.errors import (
+    conflict,
+    not_found,
+    problem_responses,
+    too_many_requests,
+    unprocessable,
+)
 from app.db.enums import JobState
 from app.db.models import GenerationJob, Question
 from app.schemas.api import (
@@ -29,7 +35,7 @@ from app.schemas.api import (
 from app.services import project_service
 from app.services.answers_service import AnswersOutcome, submit_answers
 
-router = APIRouter(prefix="/jobs", tags=["jobs"])
+router = APIRouter(prefix="/jobs", tags=["Джобы генерации"])
 
 
 async def _load_owned_job(session: SessionDep, user_id: str, job_id: str) -> GenerationJob:
@@ -42,7 +48,19 @@ async def _load_owned_job(session: SessionDep, user_id: str, job_id: str) -> Gen
     return job
 
 
-@router.get("/{job_id}", response_model=JobStatusResponse)
+@router.get(
+    "/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Статус задачи",
+    description=(
+        "Возвращает текущий статус задачи генерации или правки. Поле `state` отражает этап "
+        "(`CREATED`, `INTERVIEWING`, `AWAITING_CLARIFICATION`, `SPECCING`, `BUILDING`, "
+        "`DEPLOYING`, `LIVE`, `FIXING`, `FAILED`). По завершении (`LIVE`) заполняется "
+        "`live_url`; при неудаче (`FAILED`) — `failure_reason`. Чужая или несуществующая "
+        "задача → `404`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def get_job(job_id: str, user: CurrentUser, session: SessionDep) -> JobStatusResponse:
     job = await _load_owned_job(session, user.id, job_id)
     live_url = None
@@ -59,7 +77,19 @@ async def get_job(job_id: str, user: CurrentUser, session: SessionDep) -> JobSta
     )
 
 
-@router.get("/{job_id}/questions", response_model=QuestionsResponse)
+@router.get(
+    "/{job_id}/questions",
+    response_model=QuestionsResponse,
+    summary="Уточняющие вопросы",
+    description=(
+        "Возвращает список уточняющих вопросов, которые сервис задаёт для уточнения задачи. "
+        "Доступно, когда задача ожидает ответов пользователя (`state` = "
+        "`AWAITING_CLARIFICATION`). Ответы отправляются методом "
+        "`POST /jobs/{jid}/answers`. Чужая или несуществующая задача → `404`. "
+        "Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def get_questions(job_id: str, user: CurrentUser, session: SessionDep) -> QuestionsResponse:
     await _load_owned_job(session, user.id, job_id)
     result = await session.execute(
@@ -69,7 +99,20 @@ async def get_questions(job_id: str, user: CurrentUser, session: SessionDep) -> 
     return QuestionsResponse(questions=questions)
 
 
-@router.post("/{job_id}/answers")
+@router.post(
+    "/{job_id}/answers",
+    response_model=SubmitAnswersResponse,
+    summary="Отправить ответы на уточняющие вопросы",
+    description=(
+        "Отправляет ответы на уточняющие вопросы и продолжает генерацию. Нужно ответить на "
+        "все обязательные вопросы задачи. Успешная отправка возвращает `202`. Повторная "
+        "отправка тех же ответов идемпотентна и возвращает `200`. Если задача уже "
+        "продолжена с другими ответами или завершена — `409`. Неполный или некорректный "
+        "набор ответов → `422`. Чужая или несуществующая задача → `404`. Требуется "
+        "заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 409, 422, 429),
+)
 async def post_answers(
     job_id: str,
     body: SubmitAnswersRequest,
@@ -105,7 +148,21 @@ def _parse_last_event_id(header_value: str | None, query_value: int | None) -> i
     return query_value
 
 
-@router.get("/{job_id}/events")
+@router.get(
+    "/{job_id}/events",
+    summary="Поток событий задачи (SSE)",
+    description=(
+        "Поток событий задачи в реальном времени в формате Server-Sent Events "
+        "(`text/event-stream`). Каждое событие несёт идентификатор `id`; при "
+        "переподключении клиент передаёт заголовок `Last-Event-ID` (или query-параметр "
+        "`last_event_id`), чтобы получить пропущенные события. Поток завершается событием "
+        "`done` при достижении конечного статуса (`LIVE` или `FAILED`).\n\n"
+        "Количество одновременных потоков на ключ ограничено — при превышении `429`. Чужая "
+        "или несуществующая задача → `404`. Альтернатива потоку — опрос статуса "
+        "`GET /jobs/{jid}`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def job_events(
     job_id: str,
     user: CurrentUser,
@@ -114,12 +171,10 @@ async def job_events(
     last_event_id_header: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
     last_event_id: int | None = None,
 ) -> StreamingResponse:
-    """SSE live-статус джобы (Sprint 5, ADR-012, docs/modules/api/02-api-contracts.md).
+    """Поток событий задачи (SSE) с переподключением по Last-Event-ID и heartbeat.
 
-    Полная семантика: replay из job_events по Last-Event-ID (catch-up после подписки на
-    Redis), heartbeat SSE_HEARTBEAT_S, retry-hint, завершение event: done на терминале,
-    лимит SSE_MAX_STREAMS_PER_KEY на ключ → 429. Cross-tenant: чужая джоба → 404
-    (_load_owned_job). Polling GET /jobs/{jid} — равноправный fallback.
+    Завершение событием `done` на конечном статусе; лимит потоков на ключ → 429; чужая
+    задача → 404. Опрос `GET /jobs/{jid}` — равноправная альтернатива.
     """
     await _load_owned_job(session, user.id, job_id)
     resume_from = _parse_last_event_id(last_event_id_header, last_event_id)

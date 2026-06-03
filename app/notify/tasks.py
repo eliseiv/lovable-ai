@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.enums import JobState
 from app.db.models import GenerationJob
-from app.db.session import session_scope
+from app.db.session import session_scope, worker_engine_scope
 from app.notify import device_service
 from app.notify.apns_client import (
     ApnsClient,
@@ -126,4 +126,11 @@ def apns_push(job_id: str, to_state: str) -> None:
     инфра-сбой, ADR-006). Исчерпание retries → best-effort drop (не блокирует пайплайн —
     Celery поглощает финальный фейл, переход джобы уже закоммичен).
     """
-    asyncio.run(_apns_push(job_id, to_state))
+
+    async def _run() -> None:
+        # observability §7 (ADR-019): per-task async-engine внутри asyncio.run-loop задачи;
+        # session_scope в _apns_push подхватывает его из ContextVar (не глобальный engine).
+        async with worker_engine_scope():
+            await _apns_push(job_id, to_state)
+
+    asyncio.run(_run())

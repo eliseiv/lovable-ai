@@ -20,7 +20,16 @@ import asyncio
 import socket
 
 import httpx
-from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateLimitError
+from anthropic import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
@@ -76,3 +85,38 @@ def is_transient(exc: BaseException) -> bool:
         status = getattr(exc, "status_code", None)
         return status == 429 or (isinstance(status, int) and 500 <= status < 600)
     return isinstance(exc, TRANSIENT_EXCEPTIONS)
+
+
+# --- ADR-019 §G: классификация недоступности LLM (graceful-fail шага агента) ---
+
+# Не-транзиентные сбои Claude — детерминированно-падающие вызовы (ключ отсутствует/невалиден,
+# нет прав, bad request). НЕ ретраятся (ретрай бессмыслен): таска немедленно делает
+# graceful-переход FAILED(agent_unavailable) без сжигания max_retries (ADR-019 §G).
+NON_RETRYABLE_LLM_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    AuthenticationError,  # 401 — ANTHROPIC_API_KEY отсутствует/невалиден
+    PermissionDeniedError,  # 403
+    BadRequestError,  # 400, не зависящий от входных данных
+)
+
+
+def is_non_retryable_llm_failure(exc: BaseException) -> bool:
+    """True для не-транзиентного сбоя Claude (401/403/400) — graceful-fail без ретраев (§G).
+
+    Эти исключения детерминированно повторяются (ключ невалиден / нет прав / bad request) —
+    ретрай только сожжёт max_retries без терминализации. Таска обязана сразу перевести джобу
+    в FAILED(agent_unavailable), а не висеть в активном state (ADR-019 §G). Классификация —
+    та же единственная точка решения, что is_transient (docs §D/§G).
+    """
+    return isinstance(exc, NON_RETRYABLE_LLM_EXCEPTIONS)
+
+
+def is_llm_failure(exc: BaseException) -> bool:
+    """True, если исключение относится к недоступности LLM (Anthropic), иначе не-LLM инфра.
+
+    Разграничивает reason-код при исчерпании Celery max_retries (ADR-019 §G / docs §D):
+    исчерпание на сбое Claude (429/5xx/timeout/connection или auth/permission/bad-request) →
+    FAILED(agent_unavailable); исчерпание на не-LLM инфра (Docker/S3/БД/Redis) →
+    FAILED(infra_error). Anthropic SDK поднимает подклассы APIError на все сбои Claude
+    (включая APIConnectionError/APITimeoutError/RateLimitError/APIStatusError).
+    """
+    return isinstance(exc, APIError)

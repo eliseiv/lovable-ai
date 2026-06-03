@@ -7,7 +7,37 @@ from typing import Any
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
+from app.schemas.api import Problem
+
 _BASE = "https://api.domain/errors"
+
+# Описания HTTP-кодов ошибок для публичной OpenAPI-схемы (api-contracts §B.3). Русские,
+# в формате RFC 7807 (модель Problem). Применяются к эндпоинтам через `responses=`.
+_PROBLEM_CONTENT = {"application/problem+json": {"schema": Problem.model_json_schema()}}
+_ERROR_DETAIL: dict[int, str] = {
+    401: "Не пройдена авторизация (отсутствует или недействителен ключ).",
+    402: "Нет активной подписки или исчерпана квота.",
+    404: "Ресурс не найден.",
+    409: "Конфликт: операция невозможна в текущем состоянии.",
+    422: "Некорректные данные запроса.",
+    429: "Превышен лимит частоты запросов.",
+}
+
+
+def problem_responses(*codes: int) -> dict[int | str, dict[str, Any]]:
+    """Словарь OpenAPI-`responses` для перечисленных кодов ошибок (модель RFC 7807).
+
+    Используется в декораторах роутов (`responses=problem_responses(401, 404, ...)`), чтобы
+    публичная схема документировала ошибочные ответы с моделью Problem (media-type
+    `application/problem+json`) и русским описанием.
+    """
+    return {
+        code: {
+            "description": _ERROR_DETAIL.get(code, "Ошибка."),
+            "content": _PROBLEM_CONTENT,
+        }
+        for code in codes
+    }
 
 
 class ProblemException(Exception):

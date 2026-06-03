@@ -13,11 +13,25 @@
 **Path-based routing сайтов: `https://{APPS_DOMAIN}/s/{site_id}/`** вместо субдомена.
 
 - **Идентификатор `site_id`** — переиспользует существующий opaque `[a-z0-9]{16}`, хранящийся в `site_deployments.subdomain` (single normative source — колонка не переименовывается, чтобы не ломать миграции/код S1–S6; в routing-семантике значение называется `site_id`, [03-data-model.md → site_deployments](../03-data-model.md#site_deployments)). Уникальность и opaque-свойство (защита от takeover, не реюзается) — без изменений.
-- **Traefik-маршрут (path-mode):** `PathPrefix(/s/{site_id})` + **StripPrefix middleware** `/s/{site_id}` — nginx внутри контейнера сайта получает `/`, а не `/s/{site_id}` (контейнер остаётся generic `nginx:alpine` + mount, [ADR-002](ADR-002-nginx-mount-vs-baked.md) не меняется). entrypoints=`websecure`.
+- **Traefik-маршрут (path-mode):** `Host({APPS_DOMAIN}) && PathPrefix(/s/{site_id})` + **StripPrefix middleware** `/s/{site_id}` + явный **`priority`** (`SITE_ROUTER_PRIORITY`) — nginx внутри контейнера сайта получает `/`, а не `/s/{site_id}` (контейнер остаётся generic `nginx:alpine` + mount, [ADR-002](ADR-002-nginx-mount-vs-baked.md) не меняется). entrypoints=`websecure`. **`Host(...)` обязателен** — см. §Fix ниже (без него на общей сети `web` правило матчит чужие запросы).
 - **Site build base-path (нормативно, критично):** сгенерированный Vite-сайт **ОБЯЗАН** собираться с `base=/s/{site_id}/`, иначе ассеты (`/assets/*.js|css`, картинки) резолвятся в корень и за StripPrefix отдают 404. `site_id` известен **до** сборки (генерируется при создании строки деплоя до фазы build), поэтому base передаётся в `vite build` через CLI-флаг `--base=/s/{site_id}/` (механизм — [modules/deploy/03-architecture.md §2A](../modules/deploy/03-architecture.md#2a-path-based-routing-s-site_id-sprint-prod-adr-017)). Нормативный источник требования к build — deploy §2A.
 - **`live_url`:** `https://{APPS_DOMAIN}/s/{site_id}/` (со слешем — чтобы относительные ассеты резолвились корректно).
 - **Health-check:** по `https://{APPS_DOMAIN}/s/{site_id}/` (prod, через общий Traefik) либо по внутреннему http к контейнеру (dev / TLS-verify off) — фаза `health.wait_until_live` без изменений семантики, меняется только целевой URL.
 - **Dev/prod-свитч:** вводится `SITE_ROUTING_MODE` (`subdomain` | `path`, [07-deployment.md env](../07-deployment.md#канонический-список-ключей)). **prod = `path`** (всегда). dev может оставаться `subdomain` (`apps.localhost`, не ломает S1–S6 dev-инфру/тесты) или перейти на `path` (`corelysite.localhost/s/{id}` для dev≈prod). Рекомендация — `path` и в dev (dev≈prod), но это не форсируется; единый нормативный источник режима — env-ключ.
+
+## Fix (2026-06-03) — `Host(...)` обязателен в path-правиле (прод-инцидент)
+
+**Инцидент (`corelysite.shop`):** `app/deploy/routing.py` в режиме `SITE_ROUTING_MODE=path` формировал Traefik-правило как `PathPrefix("/s/{site_id}")` **без** `Host(...)` и **без** `priority`. Прод-сайты живут во **внешней общей сети `web`** под чужим edge-Traefik рядом с посторонними сервисами ([ADR-018](ADR-018-prod-deployment-shared-traefik-cicd.md)). Правило `PathPrefix` в одиночку матчит **любой** `Host`, поэтому:
+- перехватывало запросы к чужим доменам, попадающие на тот же edge-Traefik;
+- конфликтовало с соседними роутерами и с собственным API-роутером (`Host("corelysite.shop")`) на пути `corelysite.shop/s/...`.
+
+**Решение (нормативно):** правило path-режима **обязано** быть
+`Host("{APPS_DOMAIN}") && PathPrefix("/s/{site_id}")`
+с явным `priority={SITE_ROUTER_PRIORITY}`, где:
+- `APPS_DOMAIN` — домен приложения (`apps_domain`, prod = `corelysite.shop`; [07-deployment.md env](../07-deployment.md#канонический-список-ключей)). Ограничивает правило своим доменом → чужие `Host` не матчатся.
+- `SITE_ROUTER_PRIORITY` — явный приоритет роутера сайта (новый env-ключ), выше catch-all API-роутера `Host("corelysite.shop")`, чтобы `corelysite.shop/s/{site_id}` детерминированно матчился сайтом, а не API (не полагаемся на эвристику длины правила при сосуществовании с чужими роутерами).
+
+Режим `subdomain` (dev) **не затронут** — там правило уже `Host("{subdomain}.apps.domain")` (Host присутствует). Нормативный источник правила — [modules/deploy/03-architecture.md §2A](../modules/deploy/03-architecture.md#2a-path-based-routing-s-site_id-prod--site_routing_modepath-adr-017).
 
 ## Consequences
 

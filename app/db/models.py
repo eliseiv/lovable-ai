@@ -165,6 +165,15 @@ class GenerationJob(Base):
     spec_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_log_ref: Mapped[str | None] = mapped_column(Text, nullable=True)
     failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ADR-019: heartbeat прогресса джобы. Момент последнего входа в текущий state.
+    # Обновляется транзакционно при КАЖДОЙ смене state (та же транзакция, что state+
+    # job_events+publish) и ТОЛЬКО при ней — прочие апдейты строки (spend_usd cost-ledger,
+    # failure_log_ref, guard-state) его НЕ трогают. Reconciler (docs §E2) использует именно
+    # его (а не updated_at, который дёргается cost-ledger'ом и ложно сбрасывал бы heartbeat)
+    # для stuck-критерия активных нетерминальных состояний (concurrency-leak guard).
+    last_transition_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

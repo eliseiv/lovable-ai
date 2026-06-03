@@ -20,5 +20,8 @@
 | [ADR-016](ADR-016-scale-topology-redis-pool.md) | Multi-host scale-топология (ручной scale, разнесение очередей) + Redis connection pool (TD-007) + batch resync (TD-009) | Accepted | 2026-06-02 |
 | [ADR-017](ADR-017-path-based-site-routing.md) | Path-based routing сайтов (`/s/{site_id}` + StripPrefix + Vite base-path) vs субдомены; закрывает Q-DEPLOY-2 (wildcard не нужен) | Accepted | 2026-06-03 |
 | [ADR-018](ADR-018-prod-deployment-shared-traefik-cicd.md) | Prod-deployment: встраивание в общий edge-Traefik (`corelysite.shop`, сеть `web`, без своего SSL) + CI/CD (GitHub Actions → SSH deploy) | Accepted | 2026-06-03 |
+| [ADR-019](ADR-019-reconciler-all-active-states-agent-graceful-fail.md) | Reconciler покрывает ВСЕ активные нетерминальные состояния + graceful-fail агента при недоступности LLM (`agent_unavailable`/`stuck_timeout`, прод-фикс concurrency-leak) | Accepted | 2026-06-03 |
+
+> **Прод-фикс ADR-017 (2026-06-03):** path-режимное Traefik-правило обязано быть `Host(APPS_DOMAIN) && PathPrefix(/s/{site_id})` + явный `priority` (`SITE_ROUTER_PRIORITY`) — без `Host(...)` на общей сети `web` правило матчит чужие запросы. Зафиксировано в [ADR-017 §Fix](ADR-017-path-based-site-routing.md#fix-2026-06-03--host-обязателен-в-path-правиле-прод-инцидент) (не отдельный ADR — уточнение существующего решения).
 
 Конвенция: `ADR-NNN-<slug>.md`, разделы Context / Decision / Consequences / Alternatives. Не противоречить действующему ADR без нового ADR.

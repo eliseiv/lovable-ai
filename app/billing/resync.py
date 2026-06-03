@@ -28,7 +28,7 @@ from app.billing.adapty_client import (
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import Subscription
-from app.db.session import session_scope
+from app.db.session import session_scope, worker_engine_scope
 from app.observability import metrics
 from app.workers.celery_app import celery_app
 
@@ -164,9 +164,13 @@ async def lazy_resync_if_stale(session: AsyncSession, user_id: str) -> Subscript
 
 
 async def _run_periodic_resync_scope() -> int:
-    client = get_adapty_client()
-    async with session_scope() as session:
-        return await run_periodic_resync(session, client)
+    # observability §7 (ADR-019): per-task async-engine внутри этого asyncio.run-loop
+    # (worker_engine_scope), session_scope подхватывает его из ContextVar — глобальный
+    # engine между asyncio.run-loop'ами дал бы asyncpg `Future attached to a different loop`.
+    async with worker_engine_scope():
+        client = get_adapty_client()
+        async with session_scope() as session:
+            return await run_periodic_resync(session, client)
 
 
 @celery_app.task(name="billing.resync", queue="llm")

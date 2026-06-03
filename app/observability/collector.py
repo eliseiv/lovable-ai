@@ -20,11 +20,12 @@ from typing import cast
 
 import redis.asyncio as aioredis
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.logging import get_logger
 from app.db.enums import JobState
 from app.db.models import GenerationJob, LlmUsage
-from app.db.session import session_scope
+from app.db.session import task_engine_scope
 from app.observability import metrics
 from app.observability.redis_pool import get_redis
 
@@ -34,9 +35,9 @@ logger = get_logger(__name__)
 _QUEUES: tuple[str, ...] = ("llm", "build")
 
 
-async def refresh_jobs_in_state() -> None:
+async def refresh_jobs_in_state(sessionmaker: async_sessionmaker[AsyncSession]) -> None:
     """lovable_jobs_in_state{state,kind} = COUNT generation_jobs по (state, kind)."""
-    async with session_scope() as session:
+    async with sessionmaker() as session:
         result = await session.execute(
             select(GenerationJob.state, GenerationJob.kind, func.count()).group_by(
                 GenerationJob.state, GenerationJob.kind
@@ -92,13 +93,13 @@ def refresh_worker_busy() -> None:
         metrics.worker_busy.labels(queue=queue).set(count)
 
 
-async def refresh_user_spend() -> None:
+async def refresh_user_spend(sessionmaker: async_sessionmaker[AsyncSession]) -> None:
     """lovable_user_spend_usd = суммарный Claude-spend всех юзеров (SUM llm_usage.cost_usd).
 
     Агрегат БЕЗ per-user label (кардинальность — §2.2): per-user $-панели строятся из
     Postgres-datasource в Grafana, не из Prometheus.
     """
-    async with session_scope() as session:
+    async with sessionmaker() as session:
         total = await session.scalar(select(func.coalesce(func.sum(LlmUsage.cost_usd), 0)))
     try:
         metrics.user_spend_usd.set(float(total or 0))
@@ -114,8 +115,16 @@ async def refresh_all() -> None:
     ошибки внутри (best-effort); БД-коллекторы (jobs_in_state/user_spend) при недоступности
     Postgres пробрасывают — beat-таска поглощает фейл тика (Celery логирует), следующий тик
     повторит. Метрика наблюдаемости не должна влиять на пайплайн.
+
+    Observability §7 (прод-фикс `RuntimeError: Future attached to a different loop`):
+    async-engine/asyncpg-пул для БД-коллекторов создаётся и dispose()-ится ВНУТРИ этого
+    asyncio.run-loop через task_engine_scope (НЕ глобальный engine FastAPI/session.py,
+    привязанный к чужому loop). Так asyncpg-соединения не переживают loop между запусками
+    задачи. Redis-коллектор (queue_depth) использует пул процесса (TD-007) — loop-агностичен
+    через redis.asyncio; worker_busy — sync Celery inspect, БД/loop не трогает.
     """
-    await refresh_jobs_in_state()
+    async with task_engine_scope() as sessionmaker:
+        await refresh_jobs_in_state(sessionmaker)
+        await refresh_user_spend(sessionmaker)
     await refresh_queue_depth()
-    await refresh_user_spend()
     refresh_worker_busy()

@@ -27,7 +27,7 @@ from app.core.config import Settings, get_settings
 from app.core.ids import new_deployment_id, new_subdomain
 from app.core.logging import get_logger
 from app.db.models import Project, Revision, SiteDeployment
-from app.db.session import session_scope
+from app.db.session import session_scope, worker_engine_scope
 from app.deploy import docker_deploy, health, routing, sandbox, workspace
 from app.deploy.traefik import live_url
 from app.observability import metrics
@@ -240,7 +240,14 @@ def rollback_revision(job_id: str, project_id: str, revision_id: str) -> None:
     Re-deploy good-ревизии; прогресс наблюдаем через GET /jobs/{job_id} (re-deploy-джоба
     kind=rollback). Idempotent (acks_late): cleanup-before-run делает передеплой повторяемым.
     """
-    asyncio.run(_run_rollback_job(job_id, project_id, revision_id))
+
+    async def _run() -> None:
+        # observability §7 (ADR-019): per-task async-engine внутри asyncio.run-loop задачи;
+        # session_scope в _run_rollback_job/redeploy_revision подхватывает его из ContextVar.
+        async with worker_engine_scope():
+            await _run_rollback_job(job_id, project_id, revision_id)
+
+    asyncio.run(_run())
 
 
 async def _run_rollback_job(job_id: str, project_id: str, revision_id: str) -> None:

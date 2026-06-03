@@ -11,7 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Header, status
 
 from app.api.dependencies import CurrentUser, SessionDep
-from app.api.errors import not_found, unprocessable
+from app.api.errors import not_found, problem_responses, unprocessable
 from app.schemas.api import (
     CreateEditRequest,
     CreateEditResponse,
@@ -26,19 +26,30 @@ from app.schemas.api import (
 )
 from app.services import edit_service, project_service
 
-router = APIRouter(prefix="/projects", tags=["projects"])
+router = APIRouter(prefix="/projects")
 
 
 @router.post(
     "",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=CreateProjectResponse,
-    # Sprint 3.5: quota-gate billing энфорсится в project_service.create_project_with_job
-    # ПОСЛЕ idempotency-резолва (docs/billing/03 §4): идемпотентный replay того же
-    # Idempotency-Key обходит gate (не новая генерация → не 402), реальный новый запрос
-    # → 402 (RFC-7807) с reason. Gate перенесён из FastAPI-dependency внутрь сервиса,
-    # чтобы стать idempotency-aware (фикс регрессии S3.5: replay free-юзера ловил 402).
-    # 429 остаётся только за rate-limit (60/min), не за concurrency (каноникализация S3.5).
+    tags=["Проекты"],
+    summary="Создать проект и запустить генерацию",
+    description=(
+        "Создаёт новый проект и запускает асинхронную генерацию сайта по текстовому промту. "
+        "Обязателен заголовок `Idempotency-Key` (защищает от повторного создания при "
+        "повторной отправке запроса). В ответ возвращаются идентификаторы проекта "
+        "(`project_id`) и задачи генерации (`job_id`); статус отслеживается через "
+        "`GET /jobs/{jid}` или поток событий.\n\n"
+        "Если активная подписка отсутствует или исчерпана квота, возвращается `402` "
+        "(`application/problem+json`) с полем `reason` "
+        "(`no_entitlement` / `quota_exhausted` / `project_limit` / `concurrency_limit`) и "
+        "`required_entitlement`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 402, 422, 429),
+    # Quota-gate энфорсится в сервисе ПОСЛЕ idempotency-резолва: идемпотентный replay того же
+    # Idempotency-Key обходит gate (не новая генерация → не 402), реальный новый запрос → 402
+    # с reason. 429 остаётся только за rate-limit (60/min), не за concurrency.
 )
 async def create_project(
     body: CreateProjectRequest,
@@ -58,11 +69,22 @@ async def create_project(
     return CreateProjectResponse(project_id=result.project_id, job_id=result.job_id)
 
 
-@router.get("", response_model=ProjectListResponse)
+@router.get(
+    "",
+    response_model=ProjectListResponse,
+    tags=["Проекты"],
+    summary="Список проектов",
+    description=(
+        "Возвращает список проектов текущего пользователя. У опубликованных проектов "
+        "заполнено поле `live_url` (адрес работающего сайта). Удалённые проекты в список "
+        "не включаются. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 429),
+)
 async def list_projects(user: CurrentUser, session: SessionDep) -> ProjectListResponse:
     projects = await project_service.list_projects(session, user.id)
-    # TD-008 (ADR-016): batched live_url — ОДИН запрос по всем project_id вместо N+1
-    # (прежде get_project_live_url в цикле). Проекты без active-деплоя → live_url=None.
+    # Batched live_url — ОДИН запрос по всем project_id вместо N+1. Проекты без active-деплоя
+    # → live_url=None.
     live_urls = await project_service.get_live_urls_for_projects(
         session, [project.id for project in projects]
     )
@@ -84,16 +106,23 @@ async def list_projects(user: CurrentUser, session: SessionDep) -> ProjectListRe
     "/{project_id}",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=DeleteProjectResponse,
+    tags=["Проекты"],
+    summary="Удалить проект",
+    description=(
+        "Удаляет проект и запускает фоновую очистку всех его ресурсов. Проект сразу "
+        "исчезает из списка (`GET /projects`), полная очистка выполняется асинхронно "
+        "(в ответе `status` = `deleting`). Чужой, несуществующий или уже удалённый проект "
+        "→ `404`. Операция идемпотентна. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
 )
 async def delete_project(
     project_id: str, user: CurrentUser, session: SessionDep
 ) -> DeleteProjectResponse:
-    """DELETE /projects/{pid} (Sprint 4, ADR-011): soft-delete + async GC (project.gc).
+    """Удаляет проект (сразу скрывает из списка) и запускает фоновую очистку ресурсов.
 
-    202 Accepted (status=deleting): проект сразу soft-delete (deleted_at=now()) и исчезает
-    из GET /projects; GC ресурсов (контейнеры/route/volume/S3/БД-каскад) — асинхронно.
-    Cross-tenant: чужой/несуществующий/уже физически удалённый pid → 404 (не раскрываем
-    существование). Идемпотентно: повторный DELETE уже удаляемого проекта → 202 (no-op путь).
+    Чужой/несуществующий/уже удалённый проект → 404. Идемпотентно.
     """
     deleted = await project_service.soft_delete_project(session, user.id, project_id)
     if not deleted:
@@ -105,6 +134,20 @@ async def delete_project(
     "/{project_id}/edits",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=CreateEditResponse,
+    tags=["Правки и ревизии"],
+    summary="Внести правку в опубликованный сайт",
+    description=(
+        "Создаёт задачу правки уже опубликованного сайта по текстовой инструкции. "
+        "Обязателен заголовок `Idempotency-Key`. В ответ возвращается идентификатор задачи "
+        "(`job_id`), статус отслеживается через `GET /jobs/{jid}` или поток событий.\n\n"
+        "Правка возможна только над работающим (опубликованным) сайтом — иначе `409`. "
+        "Действует отдельный лимит правок: при отсутствии подписки или исчерпании лимита "
+        "возвращается `402` с полем `reason` "
+        "(`no_entitlement` / `edit_quota_exhausted` / `concurrency_limit`). Чужой или "
+        "несуществующий проект → `404`. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 402, 404, 409, 422, 429),
 )
 async def create_edit(
     project_id: str,
@@ -113,11 +156,10 @@ async def create_edit(
     session: SessionDep,
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> CreateEditResponse:
-    """POST /projects/{pid}/edits (Sprint 5, ADR-014): post-delivery правка → Agent 4 editor.
+    """Создаёт задачу правки опубликованного сайта по инструкции. Возвращает job_id.
 
-    Idempotency-Key обязателен. Гейтинг — отдельный лимит правок (quota_gate kind='edit'):
-    402 reason ∈ {no_entitlement, edit_quota_exhausted, concurrency_limit}. Правка только
-    над LIVE-сайтом → 409 иначе. Чужой/несуществующий pid → 404 (cross-tenant).
+    Idempotency-Key обязателен. Правка только над работающим сайтом → иначе 409. Лимит
+    исчерпан/нет подписки → 402. Чужой/несуществующий проект → 404.
     """
     if not idempotency_key:
         raise unprocessable("Idempotency-Key header is required.")
@@ -131,13 +173,22 @@ async def create_edit(
     return CreateEditResponse(job_id=result.job_id)
 
 
-@router.get("/{project_id}/revisions", response_model=RevisionsListResponse)
+@router.get(
+    "/{project_id}/revisions",
+    response_model=RevisionsListResponse,
+    tags=["Правки и ревизии"],
+    summary="История ревизий проекта",
+    description=(
+        "Возвращает историю ревизий проекта. Поле `current_revision_id` указывает текущую "
+        "активную ревизию (на неё можно откатиться). Чужой или несуществующий проект → "
+        "`404`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def list_revisions(
     project_id: str, user: CurrentUser, session: SessionDep
 ) -> RevisionsListResponse:
-    """История ревизий проекта (ADR-014). current_revision_id — активная good-ревизия.
-    Чужой/несуществующий pid → 404 (cross-tenant).
-    """
+    """Возвращает историю ревизий проекта. Чужой/несуществующий проект → 404."""
     project = await project_service.get_project(session, user.id, project_id)
     if project is None:
         raise not_found("Project not found.")
@@ -152,6 +203,18 @@ async def list_revisions(
     "/{project_id}/revisions/{revision_no}/rollback",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=RollbackResponse,
+    tags=["Правки и ревизии"],
+    summary="Откатиться на ревизию",
+    description=(
+        "Откатывает сайт на ранее опубликованную ревизию (повторная публикация без новой "
+        "генерации или правки; лимитами правок/генераций не учитывается). В ответ "
+        "возвращается идентификатор задачи (`job_id`) и номер целевой ревизии; прогресс "
+        "отслеживается через `GET /jobs/{jid}`.\n\n"
+        "Целевая ревизия должна быть успешно опубликованной и не текущей — иначе `409`. "
+        "Нет ревизии с таким номером → `404`; чужой или несуществующий проект → `404`. "
+        "Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 409, 429),
 )
 async def rollback_revision(
     project_id: str,
@@ -159,11 +222,10 @@ async def rollback_revision(
     user: CurrentUser,
     session: SessionDep,
 ) -> RollbackResponse:
-    """POST /projects/{pid}/revisions/{revision_no}/rollback (Sprint 5, ADR-014 §B).
+    """Откатывает сайт на ранее опубликованную ревизию. Возвращает job_id.
 
-    Откат на good-ревизию — re-deploy без новой генерации/правки (лимитом НЕ гейтится).
-    202 → re-deploy асинхронный (Celery queue=build), прогресс через GET /jobs/{job_id}.
-    Целевая ревизия не good/уже текущая → 409; нет такой revision_no → 404; чужой pid → 404.
+    Целевая ревизия не опубликована/уже текущая → 409; нет такой ревизии → 404; чужой
+    проект → 404.
     """
     result = await project_service.start_rollback(
         session, user_id=user.id, project_id=project_id, revision_no=revision_no
@@ -171,11 +233,22 @@ async def rollback_revision(
     return RollbackResponse(job_id=result.job_id, target_revision_no=result.target_revision_no)
 
 
-@router.get("/{project_id}", response_model=ProjectOut)
+@router.get(
+    "/{project_id}",
+    response_model=ProjectOut,
+    tags=["Проекты"],
+    summary="Детали проекта",
+    description=(
+        "Возвращает детали проекта, включая адрес работающего сайта (`live_url`), если "
+        "сайт опубликован. Чужой или несуществующий (в том числе удалённый) проект → "
+        "`404`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
 async def get_project(project_id: str, user: CurrentUser, session: SessionDep) -> ProjectOut:
     project = await project_service.get_project(session, user.id, project_id)
     if project is None:
-        # Cross-tenant: не раскрываем существование чужого проекта.
+        # Не раскрываем существование чужого проекта.
         raise not_found("Project not found.")
     live_url = await project_service.get_project_live_url(session, project.id)
     return ProjectOut(

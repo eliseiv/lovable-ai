@@ -57,3 +57,5 @@ infra/fmt_probe.sh
 infra/verify_deploy.sh
 infra/wait_deploy.sh
 infra/wait_recreate.sh
+infra/wait_ci_deploy.sh
+infra/wait_healthy.sh

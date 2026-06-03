@@ -110,6 +110,16 @@ class Settings(BaseSettings):
         "({apps_domain}/s/{site_id} + PathPrefix+StripPrefix, prod). env SITE_ROUTING_MODE "
         "(ADR-017).",
     )
+    # Prod-фикс ADR-017 §Fix: явный priority Traefik-роутера сайта в режиме path. На общем
+    # edge-Traefik (web) обязан быть ВЫШЕ catch-all API-роутера Host("corelysite.shop"),
+    # чтобы {apps_domain}/s/{site_id} детерминированно матчился сайтом (Host && PathPrefix),
+    # а не API. Применяется ТОЛЬКО в режиме path. Лейбл traefik.http.routers.{site_id}.priority.
+    # env SITE_ROUTER_PRIORITY (docs/07-deployment env-контракт).
+    site_router_priority: int = Field(
+        default=100,
+        description="Явный priority Traefik-роутера сайта в режиме path (ADR-017 §Fix). Выше "
+        "catch-all API-роутера Host(apps_domain). env SITE_ROUTER_PRIORITY.",
+    )
     nginx_image: str = Field(default="nginx:alpine")
     sites_host_root: str = Field(
         default="/srv/sites",
