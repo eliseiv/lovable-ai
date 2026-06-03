@@ -1,0 +1,22 @@
+# dashboards.yml — Grafana dashboard provider as code (Sprint 6, ADR-015 §5, observability §3).
+#
+# КОНФИГ-АРТЕФАКТ (docs/07-deployment.md → "Правило конфиг-артефакта"): указывает
+# Grafana загружать dashboards-JSON из /var/lib/grafana/dashboards (смонтирован
+# из infra/grafana/dashboards/, dashboards as code, версионируются в git).
+#
+# 6 нормативных дашбордов (observability §3):
+#   jobs-pipeline / cost / sse-realtime / apns / build-farm / billing-quota.
+
+apiVersion: 1
+
+providers:
+  - name: lovable-dashboards
+    orgId: 1
+    folder: Lovable
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

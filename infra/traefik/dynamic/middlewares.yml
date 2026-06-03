@@ -1,0 +1,24 @@
+# Traefik v3 — динамическая конфигурация (file-провайдер).
+# Общие middlewares и TLS-опции для dev.
+# Источник истины: docs/05-security.md (TLS, сетевые границы),
+# docs/07-deployment.md (Traefik).
+
+http:
+  middlewares:
+    # Базовые security-заголовки для API-роутера.
+    secure-headers:
+      headers:
+        frameDeny: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "no-referrer"
+
+    # Заглушка compression для статики сайтов.
+    site-compress:
+      compress: {}
+
+tls:
+  options:
+    default:
+      # Минимальная версия TLS, когда https используется (prod / опц. dev).
+      minVersion: VersionTLS12

@@ -1,0 +1,80 @@
+# 99 — Open Questions
+
+Реестр блокеров. Формат `Q-<AREA>-<N>`. Закрытие — решением (обновить затронутые docs) или новым ADR.
+
+---
+
+## Q-DEPLOY-1
+**Supply-chain `npm ci` по LLM-сгенерированному `package.json`.** Allowlist registry / vendored baseline / egress-lockdown — какую политику принять, как обрабатывать неизвестные пакеты.
+**Решение (Sprint 4, [ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)):** **egress-lockdown на build (только npm registry) + resource-лимиты.** Build-контейнер в изолированной `BUILD_EGRESS_NETWORK` + egress-proxy, пропускающий **только** `NPM_REGISTRY_ALLOWLIST` (npm-registry); всё остальное (private CIDR, cloud-metadata, прочий интернет) — DROP. `.npmrc` инжектит воркер (не из LLM-дерева). Плюс ресурс-лимиты контейнера (`BUILD_*`). Исполняемый контракт — [ADR-010 §C](adr/ADR-010-build-sandbox-rootless-egress.md), [05-security.md → threat model](05-security.md#threat-model-центр--build-sandbox), [modules/deploy/03-architecture.md §1](modules/deploy/03-architecture.md#1-sandbox-исполнение-недоверенного-кода). Зафиксировано в [08-product-decisions.md §4-4](08-product-decisions.md#sprint-4--sandbox--security). Гасит [TD-001](100-known-tech-debt.md#td-001) совместно с Q-INFRA-1.
+**Блокирует:** Sprint 4 (Sandbox & security).
+**Уточнение scope egress (S4):** allowlist/lockdown накладывается **только на build-песочницу**, НЕ на доверенные application-процессы (web/worker/beat). При детализации egress-контракта S4 учесть, что исходящий трафик доверенных воркеров к внешним API обязан остаться разрешённым: `getProfile` beat-воркера billing → Adapty ([billing §3.1](modules/billing/03-architecture.md#31-периодический-celery-beat-billingresync)), Anthropic API из пайплайна, Apple JWKS из auth. Нормативная формулировка — [05-security → «Граница egress-политики»](05-security.md#граница-egress-политики-build-sandbox-vs-application-процессы-требование-к-sprint-4) (single normative source).
+**Статус:** resolved — **реализовано в Sprint 4** (egress-allowlist через изолированную `BUILD_EGRESS_NETWORK` + egress-proxy `NPM_REGISTRY_ALLOWLIST` + транспорт `BUILD_EGRESS_PROXY_URL`; app-процессы не блокируются). Покрыто unit/integration; гасит [TD-001](100-known-tech-debt.md#td-001). Открытый приёмочный пункт — живой энфорс npm-через-proxy на реальном build-хосте (2 real-stack теста skip), вынесен в приёмочные пункты Sprint 5.
+
+## Q-DEPLOY-2
+**TLS `*.apps.domain`.** Wildcard через DNS-01 (какой DNS-провайдер, хранение token) vs per-subdomain HTTP-01 (риск rate-limit Let's Encrypt).
+**Решение (resolved, [ADR-017](adr/ADR-017-path-based-site-routing.md)/[ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)):** **вопрос снят переходом на path-based routing.** Прод-домен — `corelysite.shop`; сайты раздаются **path-based** `corelysite.shop/s/{site_id}` (НЕ субдомены), API — `corelysite.shop`. Всё на **одном** домене → **один** Let's Encrypt-сертификат, который выпускает **общий edge-Traefik** прод-сервера сам ([ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)). **Wildcard `*.apps.domain` не нужен**, DNS-01/DNS-провайдер/token не требуются. Прежняя целевая модель DNS-01 (S4) отменена для prod — историческая, [05-security.md → Целевая модель wildcard TLS](05-security.md#целевая-модель-wildcard-tls-sprint-4--отменена-для-prod-path-based-см-ниже). Нормативно: [ADR-017](adr/ADR-017-path-based-site-routing.md) (path-routing + StripPrefix + Vite base-path), [modules/deploy/03-architecture.md §2A](modules/deploy/03-architecture.md#2a-path-based-routing-s-site_id-prod--site_routing_modepath-adr-017), [07-deployment.md → Prod-модель](07-deployment.md#prod-модель-shared-traefik-corelysiteshop-adr-018), [05-security.md → TLS](05-security.md#tls).
+**Блокирует:** (исторически) Sprint 4 wildcard TLS — снят. На prod-релиз — **не блокирует** (TLS выпускает общий Traefik).
+**Статус:** **resolved** (path-based снял потребность в wildcard; один сертификат `corelysite.shop` от общего edge-Traefik).
+
+## Q-DEPLOY-3
+**Subdomain takeover / GC при удалении проекта.** Очистка **orphaned** контейнеров, Traefik-route, volume, DNS при **удалении проекта**; политика реюза и предотвращение перехвата освободившегося субдомена.
+**Не входит сюда:** teardown **текущего** деплоя при фейле health/deploy и при вытеснении новой ревизией — это штатный happy-path-fail, **обязателен в Sprint 1** и зафиксирован в [modules/deploy/03-architecture.md §5](modules/deploy/03-architecture.md#5-lifecycle-сайт-деплоя-state-machine-site_deploymentsstatus). Дельта S1↔S4 — [TD-003](100-known-tech-debt.md#td-003).
+**Решение (Sprint 4, [ADR-011](adr/ADR-011-project-delete-gc.md)):** **`DELETE /projects/{pid}` → `202` + soft-delete (`projects.deleted_at`) + асинхронный Celery `project.gc`** — снос всех контейнеров/Traefik-route проекта, volume, S3-артефактов всех ревизий/деплоев, БД-каскад; in-flight джобы → `FAILED(project_deleted)`; идемпотентно. Субдомены opaque (`[a-z0-9]{16}`) и **не реюзаются** — защита от takeover. Исполняемый контракт — [ADR-011](adr/ADR-011-project-delete-gc.md), [modules/deploy/03-architecture.md §6](modules/deploy/03-architecture.md#6-gc-при-удалении-проекта-sprint-4--delete-projectsid-adr-011-закрывает-td-003q-deploy-3), [modules/api/02-api-contracts.md → DELETE](modules/api/02-api-contracts.md#delete-projectspid-sprint-4). Зафиксировано в [08-product-decisions.md §4-5](08-product-decisions.md#sprint-4--sandbox--security). Гасит [TD-003](100-known-tech-debt.md#td-003).
+**Блокирует:** Sprint 4; частично Sprint 5 (teardown ревизий).
+**Статус:** resolved — **реализовано в Sprint 4** (`DELETE /projects/{pid}`→`202`+soft-delete + Celery `project.gc`: полный teardown контейнеров/route/volume/S3/БД-каскад, in-flight→`FAILED(project_deleted)`, идемпотентно, субдомены не реюзаются). Покрыто тестами; гасит [TD-003](100-known-tech-debt.md#td-003). Остаточный наблюдаемый эффект eventual-окна GC — [TD-010](100-known-tech-debt.md#td-010) (метрика/алерт → S6).
+
+## Q-PIPELINE-1
+**Контракт output Agent 3.** Строгая валидируемая схема дерева файлов (пути, бинарность, лимиты размера) до сборки — чтобы фейлить рано, до песочницы.
+**Решение:** полная валидируемая схема зафиксирована в [modules/pipeline/03-architecture.md → «Контракт output Agent 3»](modules/pipeline/03-architecture.md): безопасные относительные пути (без traversal/абсолютных/симлинков), бинарность через `encoding` utf8/base64, лимиты `MAX_FILES`/`MAX_FILE_BYTES`/`MAX_TREE_BYTES`, обязательные `package.json`+entry, allowlist расширений (запрет `.npmrc`/dotfiles). Достаточно для DoD Sprint 1. Контроль содержимого зависимостей (`npm ci` supply-chain) — отдельный слой, остаётся за [Q-DEPLOY-1](#q-deploy-1) (Sprint 4).
+**Статус:** closed-for-S1 (остаток supply-chain → Sprint 4 / Q-DEPLOY-1).
+
+## Q-PIPELINE-2
+**Идемпотентность `/answers`.** Поведение при двойном сабмите / уже продвинувшейся джобе (повторный `POST /answers` на `SPECCING`/`LIVE`).
+**Решение:** детерминированная матрица зафиксирована в [modules/api/02-api-contracts.md → «POST /jobs/{jid}/answers»](modules/api/02-api-contracts.md): повтор тех же ответов → идемпотентный `200`/`202` с тем же `job_id`; джоба уже в `SPECCING`/`BUILDING`/`DEPLOYING`/`LIVE`/`FIXING`/`FAILED` с другими ответами → `409` (RFC-7807); частичные/конфликтующие/чужие `question_id` → `422`.
+**Статус:** closed-for-S1.
+
+## Q-COST-1
+**Дефолты бюджетов и kill по бюджету.** Значения `job_budget_usd`/`monthly_budget_usd` по умолчанию; поведение при убийстве джобы по бюджету (cleanup песочницы/контейнера, сообщение пользователю, состояние `FAILED(budget_exhausted)`).
+**Решение (Sprint 2):** дефолты resilience-гардов зафиксированы в env-контракте и [modules/pipeline/03-architecture.md → §C](modules/pipeline/03-architecture.md#c-четыре-гарда-от-бесконечного-цикла-и-runaway-затрат): `JOB_BUDGET_USD`=$5.0000, `USER_MONTHLY_BUDGET_USD`=$50.0000, `MAX_FIX_ATTEMPTS`=3, `JOB_WALL_CLOCK_BUDGET_S`=3600 s, `CLARIFICATION_TTL_S`=7 дней. **Kill-by-budget:** проверка `spend_usd>=budget_usd` перед каждым LLM-вызовом → прерывание витка без нового Claude-вызова; deploy-ресурсы уже сняты teardown'ом (фейл произошёл до входа в FIXING); пользователю — последний `failure_log` + `failure_reason=budget_exhausted`. Точная калибровка дефолтов под реальную стоимость — Sprint 6 (cost).
+**Блокирует:** Sprint 2 (resilience). Остаток (калибровка/дашборды $) → Sprint 6.
+**Статус:** closed-for-S2 (калибровка дефолтов → Sprint 6).
+
+## Q-INFRA-1
+**Топология build-хостов.** DinD vs shared Docker socket vs dedicated VM на джобу — сила изоляции песочницы vs модель масштабирования build-фермы.
+**Текущая модель (S1):** shared `docker.sock` без gVisor — принятый компромисс, заведён как [TD-001](100-known-tech-debt.md#td-001). Спринт-разметка изоляции — [07-deployment.md → «Модель изоляции сборки по спринтам»](07-deployment.md#модель-изоляции-сборки-по-спринтам). Этот Q закрывает выбор **целевой** топологии в Sprint 4.
+**Решение (Sprint 4, [ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)):** **rootless Docker + egress-allowlist** для build-песочницы (вместо gVisor/`runsc` или shared `docker.sock`). Build-воркеры → rootless Docker-демон (`BUILD_SANDBOX_RUNTIME=rootless`) на отдельных build-хостах; `runsc`/gVisor зарезервирован опционально. Зафиксировано в [08-product-decisions.md §4-3](08-product-decisions.md#sprint-4--sandbox--security), исполняемый контракт — [ADR-010 §A](adr/ADR-010-build-sandbox-rootless-egress.md). Совместно с [Q-DEPLOY-1](#q-deploy-1) гасит [TD-001](100-known-tech-debt.md#td-001).
+**Блокирует:** Sprint 4 (закрытие → погашение TD-001); влияет на Sprint 6 (scale).
+**Статус:** resolved — **реализовано в Sprint 4** (build-воркер на rootless Docker-сокете `BUILD_SANDBOX_RUNTIME=rootless` вместо привилегированного `docker.sock`; build-контейнер изолирован cap-drop/seccomp/`--read-only`/non-root/лимиты `BUILD_*`). Покрыто unit/integration; совместно с [Q-DEPLOY-1](#q-deploy-1) гасит [TD-001](100-known-tech-debt.md#td-001). Открытый приёмочный пункт — живой rootless-энфорс на реальном build-хосте (2 real-stack теста skip), вынесен в приёмочные пункты Sprint 5.
+
+## Q-CLIENT-1
+**Нотификации при backgrounded iOS.** APNs push vs silent push; путь доставки статуса `LIVE`/`FAILED`, когда приложение в фоне.
+**Решение (Sprint 5):** **APNs push** (доставка статуса `LIVE`/`FAILED` в фоне) + SSE/polling в foreground. Зависимость: APNs-ключ/сертификаты от пользователя (**внешняя**, отмечена в [08-product-decisions.md §5-1](08-product-decisions.md#sprint-5--realtime--edits)).
+**Блокирует:** Sprint 5 (Realtime & edits).
+**Статус:** **resolved (APNs реализован в Sprint 5)** — `notify.apns_push` из `job_events`, `device_tokens`, `POST/DELETE /v1/devices` реализованы и покрыты тестами ([ADR-013](adr/ADR-013-apns-push-from-job-events.md), [modules/notify](modules/notify/README.md), README → Статус Sprint 5). Без APNs `.p8`/`APNS_*` (внешняя зависимость пользователя, Apple Developer) push — no-op, пайплайн цел (проверено тестом). Остаточный live-приёмочный пункт (реальный push боевым `.p8`) — в составе E2E Sprint 5, не реоткрывает Q.
+
+## Q-BILLING-1
+**Модель тарифов и квот.** Какие access levels в Adapty; лимиты на тариф (генераций/мес, конкурентных джоб, проектов); поведение при downgrade / grace-period / refund — отзывать ли уже задеплоенные сайты.
+**Решение (Sprint 3.5):** тарифы **Free + Pro** (freemium); access_level имена `free`/`pro` (premium = `pro`). Лимиты — Free: 3 ген/мес, 1 проект, 1 конкурентная; Pro: 100 ген/мес, безлимит проектов, 3 конкурентных (нормативная таблица сидинга `plan_quotas` — [08-product-decisions.md → Sprint 3.5](08-product-decisions.md#sprint-35--billing-adapty)). **Сайты при отмене/refund:** grace 7 дней → teardown; renew в grace → сайт остаётся. Реальные Adapty product IDs привяжутся в дашборде Adapty позже (**зависимость**).
+**Блокирует:** Sprint 3.5 (Billing) — сидинг `plan_quotas`.
+**Статус:** resolved.
+
+## Q-BILLING-2
+**Сверка прав на гейте.** Доверять только вебхукам или всегда дополнительно `getProfile` на гейте (latency vs консистентность при пропущенных вебхуках); частота фоновой ресинхронизации (`getProfile`-ресинк через beat). Уточняет [ADR-004](adr/ADR-004-adapty-source-of-truth.md).
+**Решение (Sprint 3.5):** **вебхуки Adapty — источник истины** (низкая latency на гейте читаем кэш `subscriptions`), **+ периодический `getProfile`-ресинк через beat** как fallback на пропущенные вебхуки. Дополнительный `getProfile` на каждом гейте по умолчанию НЕ делаем (только фоновый ресинк). Зафиксировано в [08-product-decisions.md §3.5-5](08-product-decisions.md#sprint-35--billing-adapty), согласовано с [ADR-004](adr/ADR-004-adapty-source-of-truth.md).
+**Блокирует:** Sprint 3.5.
+**Статус:** resolved.
+
+## Q-BILLING-3
+**Маппинг пользователя ↔ Adapty.** Связка нашего `user.id` ↔ Adapty `customer_user_id`; момент создания (первый запуск iOS vs первая покупка); обработка анонимных профилей.
+**Решение (Sprint 3 / 3.5):** Adapty `customer_user_id` = наш `user.id`. Создаётся **при первом входе iOS** (Sign in with Apple, [ADR-007](adr/ADR-007-sign-in-with-apple.md)) — не при первой покупке, поэтому анонимных профилей не возникает. Вебхук с неизвестным `customer_user_id` (теоретически — рассинхрон) записывается в `billing_events` с `user_id = NULL`, `processed_at = NULL` для последующей обработки/алерта. Зафиксировано в [08-product-decisions.md §3.5-4](08-product-decisions.md#sprint-35--billing-adapty).
+**Блокирует:** Sprint 3 (привязка `adapty_customer_user_id`) и Sprint 3.5.
+**Статус:** resolved.
+
+## Q-BILLING-4
+**Точная схема верификации вебхука и `getProfile` payload v2 при реальной интеграции Adapty.** Код S3.5 реализован и протестирован против **httpx-мока Adapty + HMAC тест-секрета** ([06-testing-strategy](06-testing-strategy.md)), но боевые детали Adapty не верифицированы на живом сервисе:
+1. **Webhook signature.** Имя header'а и формат подписи (предположительно `adapty-signature`, HMAC-SHA256 hex **без** префикса схемы — в отличие, например, от Stripe `t=…,v1=…`) — нужно подтвердить против реальной доставки Adapty. Текущая реализация верификации (`ADAPTY_WEBHOOK_SECRET`, HMAC/`hashlib` stdlib, [05-security §Adapty webhook](05-security.md#adapty-webhook-не-bearer)) рассчитана на hex-HMAC без префикса.
+2. **`getProfile` payload v2.** Точная структура ответа Adapty Server-side API v2 (`access_levels` map vs список, поля `subscriptions[]`, имена `is_active`/`will_renew`/`expires_at`) — реализация маппинга ([billing §2.3/§3](modules/billing/03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица)) основана на предполагаемой схеме v2; контракт-тест httpx-мока обновить под **живой sample** при первой реальной интеграции.
+**Решение:** не зафиксировано — требует доступа к боевому Adapty (sandbox/dashboard). При реальной интеграции: снять живой webhook-sample + `getProfile`-sample, подтвердить/скорректировать header-имя/префикс подписи и схему payload, обновить контракт-тест httpx-мока под живой sample. Расхождение с предположением → правка `app/billing/webhook_handler` (парсинг подписи) и `adapty_client`/маппинга — **код-правка, не пересмотр ADR-009** (механика dual-source/идемпотентности/grace не меняется).
+**Блокирует:** **не блокирует код Sprint 3.5** (реализован и зелёный на моках). Целевой — **момент реальной интеграции Adapty / перед prod-запуском billing**. `blocks_sprint: none` (ответ нужен к первому боевому подключению Adapty, не к спринту разработки).
+**Статус:** open (целевой — реальная интеграция / pre-prod). **На завершение проекта (после Sprint 6):** остаётся единственным open-Q; **не блокирует** код ни одного спринта — числится в остаточных приёмочных пунктах prod-релиза ([README → Остаточные приёмочные пункты, п.2](README.md#остаточные-приёмочные-пункты-для-prod-релиза-живой-e2e-на-боевом-стеке)).

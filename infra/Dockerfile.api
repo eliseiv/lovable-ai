@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1.7
+
+###############################################################################
+# Dockerfile.api — FastAPI (uvicorn) образ.
+# Источник истины: docs/07-deployment.md ("Dockerfile.api").
+#   - База python:3.12-slim
+#   - Зависимости через uv (lock-файл uv.lock)
+#   - Запуск: uvicorn app.api.main:app
+#   - НЕ содержит Docker-клиента и Node — API не собирает и не деплоит.
+# Multi-stage, non-root runtime.
+###############################################################################
+
+############################
+# Stage 1 — builder
+############################
+FROM python:3.12-slim AS builder
+
+# uv — менеджер пакетов (см. docs/02-tech-stack.md). Pinned digest-less tag,
+# берём конкретную версию uv через официальный образ.
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+# Сначала только манифесты — слой кэшируется, пока не меняются зависимости.
+COPY pyproject.toml uv.lock ./
+
+# Устанавливаем зависимости проекта (без самого пакета app) в .venv.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+# Теперь исходники приложения.
+COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+############################
+# Stage 2 — runtime
+############################
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+# curl нужен только для HEALTHCHECK; ставим минимально и чистим кэш apt.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user (docs/05-security.md, чеклист devops).
+RUN groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid app --no-create-home --home-dir /app app
+
+WORKDIR /app
+
+# Виртуальное окружение и код из builder.
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+COPY --from=builder --chown=app:app /app/app /app/app
+COPY --from=builder --chown=app:app /app/alembic.ini /app/alembic.ini
+COPY --from=builder --chown=app:app /app/migrations /app/migrations
+
+USER app
+
+EXPOSE 8000
+
+# Liveness — /healthz (docs/07-deployment.md → Health / readiness).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+    CMD curl -fsS http://localhost:8000/healthz || exit 1
+
+# uvicorn app.api.main:app — entrypoint строго по docs/07-deployment.md.
+CMD ["uvicorn", "app.api.main:app", "--host", "0.0.0.0", "--port", "8000"]

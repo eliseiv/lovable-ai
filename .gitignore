@@ -1,0 +1,45 @@
+# --- Секреты ---
+.env
+*.env
+!.env.example
+infra/traefik/acme.json
+# Sprint 5 (ADR-013, docs/07 "Правило конфиг-артефакта"): APNs .p8 auth-key —
+# секретный конфиг-артефакт от пользователя (Apple Developer). НИКОГДА не
+# коммитим .p8; каталог монтируется secret-mount'ом в worker (см.
+# infra/docker-compose.dev.yml). Каталог сохраняем через .gitkeep.
+infra/secrets/**
+!infra/secrets/
+!infra/secrets/apns/
+!infra/secrets/apns/.gitkeep
+*.p8
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# --- uv ---
+# uv.lock КОММИТИТСЯ (lock-файл, docs/02-tech-stack.md). Не игнорируем.
+
+# --- Build / dist ---
+dist/
+build/
+*.tgz
+
+# --- IDE / OS ---
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Локальные builds-волюмы / эфемерные ---
+/var/builds/

@@ -1,0 +1,67 @@
+# =============================================================================
+# tls-wildcard.yml — ЗАГОТОВКА wildcard TLS *.apps.{domain} (Sprint 4, DEFERRED).
+#
+# Источник истины:
+#   - docs/05-security.md → "Целевая модель wildcard TLS (Sprint 4 — зафиксирована,
+#     активация отложена до прод-домена)"
+#   - docs/07-deployment.md → "Traefik"; Q-DEPLOY-2 (deferred)
+#
+# СТАТУС: НЕ АКТИВНО. Прод-домена пока нет -> dev остаётся APPS_DOMAIN=apps.localhost
+# (http / self-signed, без TLS-verify). Этот файл — конфиг-заготовка: фиксирует
+# целевую модель (ACME DNS-01 wildcard), но НЕ выпускает сертификаты в dev.
+#
+# Весь блок ниже ЗАКОММЕНТИРОВАН намеренно. file-провайдер Traefik читает этот
+# файл, но активного TLS-роутинга он сейчас не добавляет (пустой http:/tls:).
+#
+# --- АКТИВАЦИЯ при появлении прод-домена (Q-DEPLOY-2 -> resolved) ---
+#   1. Задать реальный APPS_DOMAIN (вместо apps.localhost) в .env.
+#   2. Выбрать DNS-провайдера, задать в .env: TLS_DNS_PROVIDER (lego-код),
+#      DNS_PROVIDER_TOKEN (секрет, secret manager / encrypted-at-rest), TLS_ACME_EMAIL.
+#   3. Раскомментировать certresolver в infra/traefik/traefik.yml (static config).
+#   4. Раскомментировать роутер сайтов ниже (навесить tls.certResolver + domains).
+#   5. Health-check сайтов переключается на https + полная TLS-верификация
+#      (prod-ветка modules/deploy/03-architecture.md §4).
+# Концептуально код/инфра не меняются — только env + раскомментировать.
+# =============================================================================
+
+# ВНИМАНИЕ: НИЖЕ ВСЁ ЗАКОММЕНТИРОВАНО НАМЕРЕННО.
+# Ранее файл объявлял пустые секции `http: {}` / `tls: {}`, чтобы «читаться
+# file-провайдером без активного TLS». Это оказалось ДЕФЕКТОМ: Traefik v3
+# file-provider отвергает `http`/`tls` как standalone-элементы с пустым
+# mapping («http cannot be a standalone element») и при этом ОБРЫВАЕТ ВЕСЬ
+# file-провайдер -> middlewares.yml (secure-headers) не грузится -> api-роутер
+# падает («middleware secure-headers@file does not exist») -> 404 на api.localhost.
+#
+# Полностью закомментированный YAML валиден (file-провайдер его игнорирует, но НЕ
+# падает). Целевая модель (она же отменена для prod в пользу path-based routing —
+# ADR-017 / Q-DEPLOY-2 resolved, docs/07-deployment.md) сохранена ниже как
+# справочная заготовка в комментариях, активного роутинга не добавляет.
+# -----------------------------------------------------------------------------
+# ЦЕЛЕВАЯ МОДЕЛЬ (заготовка, активируется при появлении домена). Provider abstract.
+# -----------------------------------------------------------------------------
+# tls:
+#   # Дефолтный wildcard-сертификат, который Traefik запросит у certresolver.
+#   stores:
+#     default:
+#       defaultGeneratedCert:
+#         resolver: apps-wildcard
+#         domain:
+#           main: "${APPS_DOMAIN}"
+#           sans:
+#             - "*.${APPS_DOMAIN}"
+#
+# http:
+#   routers:
+#     # Пример навешивания wildcard-TLS на роутер сайтов (детали хоста —
+#     # динамически по Traefik-лейблам сайт-контейнеров, docs/07-deployment.md).
+#     sites-wildcard:
+#       rule: "HostRegexp(`{subdomain:[a-z0-9]+}.${APPS_DOMAIN}`)"
+#       entryPoints:
+#         - websecure
+#       service: noop@internal
+#       tls:
+#         certResolver: apps-wildcard
+#         domains:
+#           - main: "${APPS_DOMAIN}"
+#             sans:
+#               - "*.${APPS_DOMAIN}"

@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1.7
+
+###############################################################################
+# Dockerfile.worker — Celery worker (queue=llm и/или queue=build).
+# Источник истины: docs/07-deployment.md ("Dockerfile.worker").
+#   - База python:3.12-slim
+#   - uv-зависимости + Docker CLI (build-воркер делает `docker run` сайтов
+#     и запускает песочницу).
+#   - Node НЕ ставится в воркер — сборка идёт в отдельном sandbox-контейнере
+#     (Node 20 LTS внутри песочницы). См. prompt_issues в отчёте devops:
+#     ТЗ просило Node+npm в worker, но docs/07-deployment.md строка 37 это
+#     запрещает; docs — источник истины.
+#   - Запуск: celery -A app.workers.celery_app worker -Q <llm|build> / beat.
+# Multi-stage, non-root runtime.
+#
+# Security note (Sprint 4, ADR-010, закрывает TD-001): build-воркер обращается
+# к ROOTLESS Docker-демону (BUILD_SANDBOX_RUNTIME=rootless), сокет которого
+# монтируется в контейнер как /var/run/docker.sock из ROOTLESS_DOCKER_SOCK
+# (rootless-сокет в $XDG_RUNTIME_DIR непривилегированного пользователя на хосте,
+# см. docker-compose.dev.yml + .env.example). В отличие от S1 (привилегированный
+# системный docker.sock), это НЕ даёт root на хосте при компрометации воркера —
+# user-namespace remap. Build-контейнеры запускаются с egress-allowlist
+# (--network BUILD_EGRESS_NETWORK -> egress-proxy -> только npm-registry) и
+# нормативными флагами изоляции (cap-drop ALL / no-new-privileges / read-only +
+# tmpfs /tmp / non-root UID / seccomp / cpu·mem·pids лимиты / wall-clock timeout)
+# — docs/05-security.md → "Конфигурация запуска build-контейнера", ADR-010 §B.
+# Эти флаги выставляет воркер при docker run build-контейнера (код backend),
+# а не Dockerfile воркера.
+###############################################################################
+
+############################
+# Stage 1 — builder
+############################
+FROM python:3.12-slim AS builder
+
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /uvx /bin/
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=0
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
+
+COPY app ./app
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+############################
+# Stage 2 — runtime
+############################
+FROM python:3.12-slim AS runtime
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PATH="/app/.venv/bin:$PATH"
+
+# Docker CLI (статический клиент) — build-воркер делает `docker run` сайтов.
+# Pinned версия клиента; ставим только CLI, без демона.
+ARG DOCKER_CLI_VERSION=27.3.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_CLI_VERSION}.tgz" \
+       -o /tmp/docker.tgz \
+    && tar -xzf /tmp/docker.tgz -C /tmp \
+    && install -o root -g root -m 0755 /tmp/docker/docker /usr/local/bin/docker \
+    && rm -rf /tmp/docker /tmp/docker.tgz \
+    && docker --version
+
+# Non-root user. Группу docker создаём с фиксированным GID, чтобы воркер мог
+# читать примонтированный docker.sock (GID должен совпасть с хостовым — см.
+# DOCKER_GID в .env.example; в dev обычно 999/988, проверяется в quickstart).
+ARG DOCKER_GID=999
+RUN groupadd --gid 10001 app \
+    && (getent group "${DOCKER_GID}" || groupadd --gid "${DOCKER_GID}" docker) \
+    && useradd --uid 10001 --gid app --no-create-home --home-dir /app app \
+    && usermod -aG "${DOCKER_GID}" app
+
+WORKDIR /app
+
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+COPY --from=builder --chown=app:app /app/app /app/app
+
+USER app
+
+# Celery liveness — ping воркера (docs/07-deployment.md → "Воркеры: Celery ping").
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=5 \
+    CMD celery -A app.workers.celery_app inspect ping -d "celery@$(hostname)" || exit 1
+
+# Дефолтная команда переопределяется в compose (-Q llm / -Q build / beat).
+CMD ["celery", "-A", "app.workers.celery_app", "worker", "-Q", "llm,build", "--loglevel=INFO"]

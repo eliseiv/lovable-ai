@@ -1,0 +1,55 @@
+{
+  "uid": "lovable-sse-realtime",
+  "title": "SSE / realtime",
+  "tags": ["lovable", "sse", "sprint6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Open SSE streams — sum across replicas (lovable_sse_streams_open)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum(lovable_sse_streams_open)", "legendFormat": "open streams" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "SSE rejected 429 (lovable_sse_rejected_total{reason=max_streams_per_key})",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (reason) (rate(lovable_sse_rejected_total[5m]))", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Stream duration p95 by close_reason (lovable_sse_stream_duration_seconds)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, close_reason) (rate(lovable_sse_stream_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{close_reason}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Heartbeat catchup (lovable_sse_heartbeat_catchup_total) — TD-011",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (result) (rate(lovable_sse_heartbeat_catchup_total[5m]))", "legendFormat": "{{result}}" }
+      ]
+    }
+  ]
+}

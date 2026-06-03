@@ -1,0 +1,41 @@
+# datasources.yml — Grafana datasources as code (Sprint 6, ADR-015 §5, observability §3).
+#
+# КОНФИГ-АРТЕФАКТ (docs/07-deployment.md → "Правило конфиг-артефакта"): провижит
+# devops, монтируется ro. СЕКРЕТЫ (Postgres-datasource пароль) — из env через
+# Grafana ${ENV}-подстановку (GF_POSTGRES_DS_PASSWORD), НЕ хардкод (docs/05 Секреты).
+#
+# Два datasource (observability §3):
+#   - Prometheus — основной источник lovable_*-метрик (jobs/cost/SSE/APNs/build/billing).
+#   - Postgres   — per-user/per-job $-панели (SELECT user_id, SUM(...) FROM llm_usage),
+#                  где Prometheus-кардинальность запрещена (ADR-015 §3, observability §2.2).
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s        # = PROMETHEUS_SCRAPE_INTERVAL_S
+    editable: false
+
+  - name: Postgres
+    uid: postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    # Креды — из env (НЕ хардкод). database/user/password подставляет Grafana из
+    # GF_POSTGRES_DS_* (см. grafana-сервис в compose).
+    user: ${GF_POSTGRES_DS_USER}
+    secureJsonData:
+      password: ${GF_POSTGRES_DS_PASSWORD}
+    jsonData:
+      database: ${GF_POSTGRES_DS_DATABASE}
+      sslmode: disable          # dev: internal compose-сеть; prod — managed/TLS
+      postgresVersion: 1600
+      timescaledb: false
+    editable: false

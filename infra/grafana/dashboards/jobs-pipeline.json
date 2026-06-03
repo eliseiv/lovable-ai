@@ -1,0 +1,75 @@
+{
+  "uid": "lovable-jobs-pipeline",
+  "title": "Jobs pipeline",
+  "tags": ["lovable", "pipeline", "sprint6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Jobs in state (lovable_jobs_in_state)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "lovable_jobs_in_state", "legendFormat": "{{state}}/{{kind}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Jobs completed rate (lovable_jobs_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (terminal_state, kind) (rate(lovable_jobs_total[5m]))", "legendFormat": "{{terminal_state}}/{{kind}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Failed by reason (lovable_job_failed_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (reason) (rate(lovable_job_failed_total[5m]))", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Build duration p50/p95 (lovable_build_duration_seconds)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum by (le, result) (rate(lovable_build_duration_seconds_bucket[5m])))", "legendFormat": "p50 {{result}}" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le, result) (rate(lovable_build_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{result}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Fix-loop depth p95 (lovable_fix_loop_depth) — runaway canary",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, terminal_state) (rate(lovable_fix_loop_depth_bucket[15m])))", "legendFormat": "p95 {{terminal_state}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "No-progress trips (lovable_no_progress_trips_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "rate(lovable_no_progress_trips_total[15m])", "legendFormat": "no_progress trips" }
+      ]
+    }
+  ]
+}

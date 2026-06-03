@@ -1,0 +1,91 @@
+# 06 — Testing Strategy
+
+Команды и coverage gate — в [02-tech-stack.md](02-tech-stack.md). Runner: `pytest`. Gate: `--cov=app --cov-fail-under=80`.
+
+## Пирамида тестов
+
+```
+        /\        E2E (мало): промт → LIVE URL на compose-стеке
+       /  \
+      /----\      Contract (немного): API ↔ iOS, output Agent 3, вебхук Adapty
+     /      \
+    /--------\    Integration (средне): API-контракты, резюм пайплайна, идемпотентность
+   /          \
+  /------------\  Unit (много): state-machine переходы, гарды fix-loop, quota-gate, парсинг
+```
+
+## Unit
+
+Быстрые, без внешних сервисов (Postgres/Redis/Claude мокаются или in-memory).
+
+- **State-machine переходы:** легальные/нелегальные переходы (`CREATED→INTERVIEWING`, запрет `LIVE→BUILDING` и т.п.), диспетчер выбирает task по `state`.
+- **Гарды fix-loop (4 гарда, [03-architecture §C](modules/pipeline/03-architecture.md#c-четыре-гарда-от-бесконечного-цикла-и-runaway-затрат)):** (a) `max_fix_attempts` обрывает на N-й попытке → `FAILED(build_unrecoverable)`, `retry_count` инкрементируется только на применённом патче `FIXING→BUILDING` (нормативно — pipeline §C(a)); (b) `spend_usd>=budget_usd` → `FAILED(budget_exhausted)`, kill перед LLM-вызовом; (c) `now()>=wall_clock_deadline` → `FAILED(wall_clock_exceeded)`; (d) no-progress: совпадение `failure_signature` со **второго** фейла → `FAILED(no_progress)`, первый фейл (NULL-сигнатура) гард не трогает.
+- **Сигнатура фейла ([ADR-005](adr/ADR-005-no-progress-failure-signature.md)):** нормализация на фикстурах логов — два прогона одной ошибки с разными путями/таймстампами/PID дают **одну** сигнатуру; две разные ошибки — разные; парсинг шапки `failure_class`.
+- **Reason-коды:** каждый путь `FAILED` ставит корректный `failure_reason` (вкл. `fixer_gave_up` при `unrecoverable:true`, `invalid_agent_output` при исчерпании fix-budget на невалидном дереве).
+- **Классификация исключений ([ADR-006](adr/ADR-006-celery-retry-vs-domain-fixing.md)):** транзиентные (Docker/network/S3/`429`/5xx) → ретраябельны; доменные (build/health/validation-fail) → НЕ Celery-retry, идут в `FIXING`. Граница в `app/workers/retry_policy.py`.
+- **Output Agent 4:** переиспользование схемы `agent_output` (та же валидация, что Agent 3), reserved `.build.json` исключается из дерева, сигнал `unrecoverable`.
+- **Auth (Sprint 3):** Apple identity token verify (mock JWKS) — подпись/`aud`/`iss`/`exp`/`nonce`; индексируемый O(1) token lookup (один argon2-verify, независимость от числа юзеров — [TD-004](100-known-tech-debt.md#td-004)); парсинг `lv_<key_id>_<secret>`; rate-limit token bucket; concurrency cap. Нормативный контракт — [modules/auth/03-architecture.md](modules/auth/03-architecture.md).
+- **Quota-gate:** активный access level + остаток квоты → пропуск; нет прав / квота исчерпана → `402`.
+- **Cost-ledger:** агрегация `llm_usage.cost_usd` в `generation_jobs.spend_usd`.
+- **Парсинг/валидация:** схема output Agent 3 (дерево файлов), парсинг вебхука Adapty.
+
+## Integration
+
+С реальными Postgres + Redis (из compose), Claude и Docker-сборка мокаются.
+
+- **API-контракты:** все endpoints из [modules/api/02-api-contracts.md](modules/api/02-api-contracts.md) — статусы (`202`, `402`, RFC-7807), схемы ответов, auth (401 без Bearer).
+- **Резюм пайплайна:** `POST /answers` переводит `AWAITING_CLARIFICATION → SPECCING` и ставит задачу; sweeper экспайрит зависшую джобу.
+- **FIXING happy-recovery (S2):** `DEPLOYING` build-fail → `FIXING` (deploy-teardown + `failure_log_ref` записан) → `task_fix` → валидный патч Agent 4 → `BUILDING` (пересборка нового source.tgz → dist) → `DEPLOYING` (cleanup-before-run, идемпотентный передеплой того же субдомена) → `LIVE`. `retry_count` инкрементирован ровно один раз (на `FIXING → BUILDING`).
+- **FIXING → FAILED по каждому гарду (S2):** интеграционно прогнать исчерпание (a)/(b)/(c)/(d) → терминальный `FAILED` с корректным reason + последний `failure_log` доступен через `GET /jobs/{id}`.
+- **Celery retry/backoff (S2):** транзиентный инфра-сбой (мок Docker/S3 timeout) ретраится с backoff и восстанавливается без инкремента `retry_count`; исчерпание `max_retries` → `FAILED(infra_error)`.
+- **Sweeper + reconciler (S2):** sweeper переводит просроченный `AWAITING_CLARIFICATION → FAILED(clarification_timeout)`, идемпотентен; reconciler ре-диспетчеризует джобу, застрявшую в `BUILDING/DEPLOYING/FIXING` дольше `STUCK_THRESHOLD_S`, без дабл-постановки таски (`FOR UPDATE SKIP LOCKED` + `dispatch:{job_id}`-lock).
+- **failure_log в S3 (S2):** deploy пишет `logs/{job_id}/build.log` с машинной шапкой; pipeline читает по `failure_log_ref`, парсит `failure_class`, подаёт хвост (`FIXER_LOG_TAIL_BYTES`) в Agent 4.
+- **Идемпотентность:** повторный `POST /projects` / `/edits` с тем же `Idempotency-Key` не создаёт дубль; повторный `/answers` на уже продвинувшейся джобе безопасен ([Q-PIPELINE-2](99-open-questions.md#q-pipeline-2)); повторный вебхук с тем же `adapty_event_id` обрабатывается один раз.
+- **Crash-resumability:** джоба в промежуточном `state` подхватывается диспетчером после рестарта воркера.
+
+## Contract
+
+- **iOS ↔ API:** OpenAPI-схема FastAPI соответствует контракту в `modules/api`. Pact/schema-snapshot.
+- **Output Agent 3:** строгая валидируемая схема дерева файлов ([Q-PIPELINE-1](99-open-questions.md#q-pipeline-1)) — фикстуры валидных/невалидных деревьев.
+- **Adapty webhook:** фикстуры реальных payload'ов событий → корректный апдейт `subscriptions`/`billing_events`.
+
+## E2E (happy-path, главный для Sprint 1)
+
+На dev-стеке (compose в WSL2), реальный Claude, реальный `vite build`:
+
+```
+curl POST /v1/projects {промт} → job_id
+poll GET /jobs/{id} → AWAITING_CLARIFICATION
+GET /jobs/{id}/questions
+POST /jobs/{id}/answers
+poll GET /jobs/{id} → LIVE + live_url
+GET {live_url} → HTTP 200, реально собранный Vite-сайт
+```
+
+Health-check сайта = 200 — критерий прохождения.
+
+### Path-based routing (prod, `SITE_ROUTING_MODE=path`, [ADR-017](adr/ADR-017-path-based-site-routing.md))
+
+Что тестировать при path-режиме (в дополнение к субдомен-E2E):
+- **Traefik-labels:** в режиме `path` навешиваются `PathPrefix("/s/{site_id}")` + StripPrefix-middleware `/s/{site_id}` + `entrypoints=websecure` (unit — генерация лейблов по `SITE_ROUTING_MODE`; assert на имена router/middleware/service и `prefixes`).
+- **StripPrefix:** запрос `GET {APPS_DOMAIN}/s/{site_id}/` доходит до nginx как `/` (integration с поднятым Traefik+nginx, либо unit на конфиг middleware); без StripPrefix nginx получает `/s/{site_id}` → 404.
+- **Vite base-path (нормативно):** build-команда в режиме `path` содержит `--base=/s/{site_id}/` (unit на формирование argv build-контейнера); собранный `index.html` ссылается на ассеты как `/s/{site_id}/assets/...`, и `GET {live_url}assets/...` отдаёт 200 (E2E) — без base-path ассеты 404 за StripPrefix.
+- **`live_url`:** формат `https://{APPS_DOMAIN}/s/{site_id}/` (со слешем); health-check цель = `live_url`.
+- **Режим `subdomain` не сломан:** дефолтный dev-режим (Host-router, `apps.localhost`) проходит существующий E2E без изменений.
+
+### Prod-deploy контракт ([ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md))
+
+- **`docker-compose.prod.yml`:** `api` — `expose` без `ports:` (нет 80/443 наружу); подключён к `web` (`external: true`) + `default`; labels `Host("corelysite.shop")`+`websecure`; нет своего `traefik`/ACME-сервиса; Postgres/Redis/MinIO без `ports:`. Env-ключи символ-в-символ ([07-deployment env](07-deployment.md#канонический-список-ключей)) — devops-reviewer.
+- **CI/CD:** `deploy` job имеет `needs: [lint, type-check, test]` (деплой только на зелёном); prod GitHub Secrets соответствуют [05-security → Секреты](05-security.md#секреты). Живой SSH-деплой на сервер — открытый приёмочный пункт (живой стек); автоматизируемое — проверка структуры workflow (`needs:`, шаги).
+
+## Покрытие по спринтам (DoD-привязка)
+
+| Sprint | Обязательные тесты |
+|---|---|
+| 1 | E2E happy-path; integration API-контрактов и резюма; unit state-machine. |
+| 2 | unit всех 4 гардов fix-loop + сигнатуры фейла (ADR-005) + классификации исключений (ADR-006); integration FIXING happy-recovery (`DEPLOYING→FIXING→BUILDING→DEPLOYING→LIVE`), каждого `FIXING→FAILED(reason)`, Celery retry/backoff (transient→recover, исчерпание→`infra_error`), sweeper(clarification_timeout)+reconciler(crash-resume), чтение/запись `failure_log` в S3. |
+| 3 | **Auth & multi-user.** unit: Apple identity token verify (mock JWKS — валид/невалид подпись, неверный `aud`/`iss`/`exp`/`nonce` → `401`); O(1) token lookup (число argon2-verify не зависит от числа юзеров — TD-004); парсинг формата `lv_<key_id>_<secret>`; token bucket rate-limit. integration: `POST /auth/apple` (upsert по `apple_sub` — новый/существующий user, выдача ключа один раз); мульти-устройство (N токенов на user, логин с нового устройства не трогает старые); revoke (`DELETE /auth/tokens/{id}` → отозванный ключ → `401`, идемпотентность повтора); cross-tenant (чужой `/auth/tokens/{id}` → `404`; чужой проект → `404`); rate-limit 60/min → `429` + `Retry-After`; concurrency cap (1 free → 2-я джоба отклонена); legacy fallback (S1 seeded-ключ продолжает работать на время миграции). |
+| 3.5 | **Billing (Adapty).** unit: верификация подписи вебхука (валид/невалид → `401`); маппинг `event_type`→`subscriptions` (started/renewed→`active`, expired/refunded→`grace`+`grace_until`, billing_issue→`billing_issue`, renew-в-grace→`active`+`grace_until=NULL`); quota-gate каждый `reason` (`no_entitlement`/`quota_exhausted`/`project_limit`/`concurrency_limit`→`402`); `usage_counters` инкремент на успешном старте генерации (НЕ на `/projects`/`/answers`) + идемпотентность по `job_id`; `resolve_access_level`/`resolve_max_concurrent_jobs` (нет строки→free, реальный pro). contract: фикстуры payload вебхука Adapty v2 → корректный апдейт `subscriptions`/`billing_events`. integration: идемпотентность вебхука (повтор `adapty_event_id`→ один апдейт, `200`); неизвестный `customer_user_id`→`billing_events(user_id=NULL)`; quota-gate на `POST /projects` (free 3/3→`402`, pro проходит); `GET /billing/me` (entitlement+остаток); getProfile-ресинк (beat сверяет, не перетирает свежий вебхук; fail-open на кэш при недоступности Adapty); grace-sweep (`grace_until<now`→teardown сайтов→`status=expired`; renew в grace отменяет teardown). `/edits` quota-gate — контракт зафиксирован, активируется в S5. |
+| 4 | **Sandbox & security.** **Sandbox-isolation** ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)): негативные sandbox-escape (попытка записи вне `/workspace` при `--read-only` → fail; попытка privilege-escalation при `no-new-privileges`/`cap-drop ALL`; non-root UID внутри). **Egress-блокировка:** build-контейнер не достучался до private CIDR / cloud-metadata (`169.254.169.254`) / произвольного внешнего хоста — только npm-registry через proxy (allowlist) проходит; постинсталл к не-npm хосту → DROP. **Resource-лимиты:** превышение `--memory`→OOM-kill, `--pids-limit`→fork-bomb обрублен, `BUILD_TIMEOUT_S`→`docker rm -f` зависшей сборки. **App-egress не задет:** воркер/beat по-прежнему ходят к Anthropic/Adapty/Apple JWKS (mock внешних, проверка что egress-lockdown не на app-процессах). **Project GC** ([ADR-011](adr/ADR-011-project-delete-gc.md)): `DELETE /projects/{pid}`→`202`+soft-delete (проект исчез из `GET /projects`); `project.gc` полнота (все контейнеры/route сняты, volume/S3-артефакты всех ревизий удалены, БД-каскад) на mock Docker/S3; идемпотентность (повторный `project.gc`/`DELETE` безопасны); in-flight джоба→`FAILED(project_deleted)` снята из `active_jobs`; **cross-tenant DELETE** (чужой `pid`→`404`, не раскрываем существование); subdomain не реюзается. Где требует реального rootless-демона/сети — отмечается как открытый приёмочный пункт (живой стек), автоматизируемое — через mock Docker/S3 + эфемерный Postgres. |
+| 5 | **Realtime & edits.** **SSE** ([ADR-012](adr/ADR-012-sse-realtime-transport.md)): integration `GET /jobs/{jid}/events` — стрим событий из Redis pub/sub + кадр-снимок при подключении; **reconnect/Last-Event-ID** (catch-up из `job_events WHERE id > n`, дедуп live-кадров, события не теряются в окне между подпиской и catch-up); heartbeat (`: ping` каждые `SSE_HEARTBEAT_S`); завершение `event: done` на терминальном `state`; **cross-tenant** (чужой `jid` → `404`); лимит стримов на ключ → `429`. unit: формат кадра (`id`/`event`/`data`), маппинг `job_events`→SSE. **Edits + лимит** ([ADR-014](adr/ADR-014-edit-limit-revision-rollback.md)): integration `POST /edits` (`kind=edit`, `LIVE→FIXING→LIVE` happy-path: Agent 4 editor → новый `revision` `is_good`, `current_revision_id` обновлён); quota-gate отдельным лимитом (`edits_used < monthly_edits` → пропуск; исчерпание → `402 reason=edit_quota_exhausted`; **edit НЕ списывает `generations_used`, генерация НЕ списывает `edits_used`**); `409` если проект не `LIVE`; идемпотентность по `Idempotency-Key`; авто-rollback при исчерпании гарда → `FAILED(edit_failed_rolled_back)`, сайт остаётся `LIVE` на прежней ревизии. **Rollback** ([ADR-014 §B](adr/ADR-014-edit-limit-revision-rollback.md)): integration `POST .../revisions/{n}/rollback` — re-deploy good-ревизии (mock Docker/S3: новый деплой health 200 → прежний `active`→`superseded` teardown, `current_revision_id` ← целевая); health-fail нового → прежний нетронут (без downtime); rollback на не-good/текущую → `409`; cross-tenant `404`; квотой не гейтится. **APNs** ([ADR-013](adr/ADR-013-apns-push-from-job-events.md)): unit — provider-JWT ES256 (claims `iss`/`kid`, кэш по TTL), выбор APNs-хоста по `environment`, payload-формат; триггер `notify.apns_push` только на `LIVE`/`FAILED`/`AWAITING_CLARIFICATION` (промежуточные — нет); `410`/`400 BadDeviceToken`→`invalidated_at`, `429`/`5xx`→retry; **no-op без credentials** (пайплайн цел). integration — `POST/DELETE /v1/devices` (upsert/инвалидация, cross-tenant `404`); push выбирает только устройства владельца джобы (mock APNs HTTP/2). Где требует реального APNs-сервиса — открытый приёмочный пункт (живой стек); автоматизируемое — через mock httpx HTTP/2. |
+| 6 | **Observability, cost, scale** ([ADR-015](adr/ADR-015-observability-stack.md)/[ADR-016](adr/ADR-016-scale-topology-redis-pool.md), [modules/observability](modules/observability/03-architecture.md)). **Метрики:** unit — counter/gauge/histogram инкрементируются по событиям (job terminal → `lovable_jobs_total`/`lovable_job_failed_total{reason}`, fix-loop → `lovable_fix_loop_depth`, cost-ledger → `lovable_job_cost_usd`/`lovable_llm_tokens_total{token_type}`/`lovable_llm_cache_hit_ratio`, SSE 429 → `lovable_sse_rejected_total`, APNs → `lovable_apns_push_total{result,apns_status}`, quota 402 → `lovable_quota_rejected_total{reason}`, concurrency-block → `lovable_concurrency_block_by_kind_total`, gc → `lovable_project_gc_pending`); **запрет unbounded-labels** (тест: `job_id`/`user_id` не попадают в Prometheus-labels). integration — `GET /metrics` (app) + worker `METRICS_PORT` экспонируют Prometheus text format; имена/типы/labels совпадают с нормативной таблицей символ-в-символ ([observability §2](modules/observability/03-architecture.md#2-нормативная-таблица-метрик)); `/metrics` не публичный (не под `/v1`). **Sentry scrubbing** ([observability §4](modules/observability/03-architecture.md#4-sentry)): unit — `before_send`-hook вырезает секреты из [05-security → Секреты](05-security.md#секреты) (Anthropic/Adapty/APNs `.p8`+JWT/S3/Apple token/DSN-пароли) + секретную часть `lv_<key_id>_<secret>` (остаётся только `key_id`) + маскирует `apns_token`; `send_default_pii=False`; пустой `SENTRY_DSN` → init no-op; correlation-теги `job_id`/`project_id`/`user_id` проставлены. **Cost-калибровка:** unit — Redis budget-счётчик ([observability §5.2](modules/observability/03-architecture.md#52-redis-budget-счётчик-td-006--опциональная-оптимизация-латентности-гейта)): `INCRBYFLOAT budget:{job_id}` после `llm_usage`; гейт читает Redis, **cache-miss → fallback на Postgres `spend_usd` + пере-засев** (никогда не пропустить гейт без Redis-ключа); Postgres остаётся авторитетом ([TD-006](100-known-tech-debt.md#td-006)). **Scale-долг:** integration — N+1 `list_projects` устранён ([TD-008](100-known-tech-debt.md#td-008)): N проектов → **1** SQL-запрос на live_url (счётчик запросов); `billing.resync` батч+курсор ([TD-009](100-known-tech-debt.md#td-009)): `.limit(BATCH)`, самые протухшие первыми, хвост на след. тике; Redis `ConnectionPool` ([TD-007](100-known-tech-debt.md#td-007)): переиспользование (нет per-request `from_url`/`aclose` в rate-limit/SSE — тест на стабильное число соединений/синглтон). **Build-ферма (live):** нагрузочный тест build-фермы (параллельные `vite build` против поднятых build-хостов) — измерение `lovable_build_duration_seconds`/`lovable_queue_depth{queue="build"}`; проверка обрыва runaway гардами (`BUILD_TIMEOUT_S`→`docker rm -f`, fix-loop гарды). Где требует реальных build-хостов/Prometheus/Grafana/Sentry-сервиса — открытый live-приёмочный пункт; автоматизируемое — на in-process registry + mock Sentry transport + эфемерный Redis/Postgres. **Staging E2E ([08 §6-6](08-product-decisions.md#sprint-6--observability-cost-scale)):** накопленные live-приёмочные пункты S1–S5 (реальный APNs `.p8` + SSE reconnect на флапающей сети + rootless+egress-энфорс + Claude+Docker) — прогон на staging перед релизом. |

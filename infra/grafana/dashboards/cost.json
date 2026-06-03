@@ -1,0 +1,75 @@
+{
+  "uid": "lovable-cost",
+  "title": "Cost / $",
+  "tags": ["lovable", "cost", "sprint6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "$/job p50/p95/max vs JOB_BUDGET_USD=5 (lovable_job_cost_usd)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(lovable_job_cost_usd_bucket[1h])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(lovable_job_cost_usd_bucket[1h])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(1.0, sum by (le) (rate(lovable_job_cost_usd_bucket[1h])))", "legendFormat": "max" },
+        { "refId": "D", "expr": "vector(5)", "legendFormat": "JOB_BUDGET_USD" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "$ by agent/model — tiering (lovable_llm_call_cost_usd_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "sum by (agent, model) (rate(lovable_llm_call_cost_usd_total[1h]))", "legendFormat": "{{agent}}/{{model}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Cache hit ratio (lovable_llm_cache_hit_ratio)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "lovable_llm_cache_hit_ratio", "legendFormat": "{{agent}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Tokens by type (lovable_llm_tokens_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (token_type) (rate(lovable_llm_tokens_total[1h]))", "legendFormat": "{{token_type}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "$/user vs USER_MONTHLY_BUDGET_USD=50 (Postgres llm_usage)",
+      "type": "table",
+      "datasource": { "type": "postgres", "uid": "postgres" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT user_id::text AS user_id, ROUND(SUM(cost_usd)::numeric, 4) AS spend_usd, 50 AS monthly_budget_usd FROM llm_usage WHERE created_at >= date_trunc('month', now()) GROUP BY user_id ORDER BY spend_usd DESC LIMIT 50"
+        }
+      ]
+    }
+  ]
+}

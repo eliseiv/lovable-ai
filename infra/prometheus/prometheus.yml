@@ -1,0 +1,61 @@
+# prometheus.yml — scrape-конфиг Lovable-AI (Sprint 6, ADR-015 §1, observability §1-2).
+#
+# КОНФИГ-АРТЕФАКТ (docs/07-deployment.md → "Правило конфиг-артефакта Prometheus/
+# Grafana"): провижит devops, монтируется ro в prometheus-сервис, версионируется
+# в git, СЕКРЕТОВ НЕ СОДЕРЖИТ.
+#
+# Pull-модель: Prometheus scrape'ит /metrics доверенных процессов по СТАТИЧЕСКИМ
+# targets (ручной scale S6 не требует service-discovery — docs/07 Прод-топология):
+#   - api    : api:8000/metrics  (FastAPI internal-route, не публичный /v1, ADR-015 §1)
+#   - worker : worker:${METRICS_PORT}/metrics (prometheus_client.start_http_server)
+#   - beat   : beat:${METRICS_PORT}/metrics
+# Все targets — в сети backend (internal); /metrics НАРУЖУ не публикуется
+# (docs/05-security.md → "Сетевые границы": internal-трафик только в compose-сети).
+#
+# scrape_interval = PROMETHEUS_SCRAPE_INTERVAL_S (docs/07 env-контракт, дефолт 15s).
+# Метрики, требующие имена/типы/labels — нормативная таблица observability §2
+# (префикс lovable_).
+#
+# ПРОД (ADR-016): -Q llm и -Q build разносятся на разные worker-хосты -> добавить
+# их как отдельные targets (worker-llm:9100, worker-build:9100) при разворачивании
+# multi-host; в dev — один worker (llm,build) одним target'ом.
+
+global:
+  scrape_interval: 15s       # = PROMETHEUS_SCRAPE_INTERVAL_S (docs/07 дефолт)
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    env: dev
+
+# Alert-правила (gc-lag/budget-burn/build-queue-depth/resync-lag) — Grafana alert
+# rules поверх метрик (observability §3); on-call-интеграция (Alertmanager/
+# PagerDuty) out-of-scope S6 (ADR-015 §6). Здесь rule_files не подключаем.
+
+scrape_configs:
+  # --- FastAPI app (N stateless-реплик за Traefik) ---
+  # /metrics — internal ASGI-route (не под /v1, не публичный). При ручном scale
+  # репликами (docker compose up --scale api=N) DNS api резолвит все реплики;
+  # для явного per-реплика scrape в проде — статический список api-хостов.
+  - job_name: "api"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["api:8000"]
+        labels:
+          component: api
+
+  # --- Celery worker (-Q llm,build в dev; разносится по хостам в проде ADR-016) ---
+  # prometheus_client.start_http_server(METRICS_PORT) — METRICS_PORT=9100 (docs/07).
+  - job_name: "worker"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9100"]
+        labels:
+          component: worker
+
+  # --- Celery beat (единственный экземпляр: sweeper/reconciler/resync/sweep) ---
+  - job_name: "beat"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["beat:9100"]
+        labels:
+          component: beat

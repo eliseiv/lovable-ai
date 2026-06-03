@@ -1,0 +1,211 @@
+# docs/ — карта документации проекта Lovable-AI
+
+`docs/` — **единственный источник истины** проекта. При расхождении docs ↔ код виноват тот, кто не обновил docs.
+
+## Что это за проект
+
+Backend-сервис для iOS-приложения: по промту пользователя генерирует сайт, собирает (`vite build`), деплоит в собственном nginx-контейнере за Traefik на субдомен `{subdomain}.apps.domain` (opaque-идентификатор деплоя). Ядро — пайплайн из 4 LLM-агентов на Claude с паузой на уточняющие вопросы (human-in-the-loop) и самовосстанавливающимся циклом сборки.
+
+## Карта документов
+
+| Документ | Назначение |
+|---|---|
+| [00-vision.md](00-vision.md) | Продукт, цели, NFR |
+| [01-architecture.md](01-architecture.md) | Компоненты, взаимодействие, границы, диаграмма |
+| [02-tech-stack.md](02-tech-stack.md) | Стек, версии, команды lint/test/build — **единственное место** |
+| [03-data-model.md](03-data-model.md) | Все сущности Postgres, поля, связи |
+| [05-security.md](05-security.md) | Threat-model, auth, секреты, верификация вебхуков |
+| [06-testing-strategy.md](06-testing-strategy.md) | Пирамида тестов, coverage gate |
+| [07-deployment.md](07-deployment.md) | docker-compose, Dockerfile, прод/dev, TLS; **[контракт env-переменных](07-deployment.md#контракт-переменных-окружения-environment-reference)** — единый источник имён env-ключей |
+| [08-product-decisions.md](08-product-decisions.md) | **Реестр утверждённых пользователем продуктовых/инфра-решений** по всем спринтам (тарифы, лимиты, политики) + cross-ref на Q-*/TD-*/ADR-* |
+| [99-open-questions.md](99-open-questions.md) | Реестр Q-NNN-N (блокеры спринтов) |
+| [100-known-tech-debt.md](100-known-tech-debt.md) | Реестр TD-NNN |
+| [adr/INDEX.md](adr/INDEX.md) | Реестр архитектурных решений |
+
+> **API-контракты — per-module** (раздел `04-api.md` намеренно НЕ создаётся): REST-контракты живут в [modules/api/02-api-contracts.md](modules/api/02-api-contracts.md) (вкл. SSE, `/edits`, rollback, `/devices` — Sprint 5), [modules/auth/02-api-contracts.md](modules/auth/02-api-contracts.md) и [modules/billing/02-api-contracts.md](modules/billing/02-api-contracts.md).
+
+## Модули
+
+| Модуль | Документация | Статус |
+|---|---|---|
+| `api` | [modules/api/](modules/api/README.md) | реализован happy-path (Sprint 1) |
+| `auth` | [modules/auth/](modules/auth/README.md) | **реализован (Sprint 3)** — Sign in with Apple, индексируемый O(1) lookup, мульти-устройство, rate-limit/cap |
+| `pipeline` | [modules/pipeline/](modules/pipeline/README.md) | happy-path (Sprint 1); Fixer loop + resilience реализован (Sprint 2) |
+| `deploy` | [modules/deploy/](modules/deploy/README.md) | happy-path (Sprint 1); **sandbox & security реализован (Sprint 4)** — rootless Docker + egress-allowlist + project-GC ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)/[ADR-011](adr/ADR-011-project-delete-gc.md)); **prod-deploy зафиксирован** — path-based routing `/s/{site_id}` ([ADR-017](adr/ADR-017-path-based-site-routing.md)) + shared edge-Traefik `corelysite.shop` ([ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)), [Q-DEPLOY-2](99-open-questions.md#q-deploy-2) resolved |
+| `billing` | [modules/billing/](modules/billing/README.md) | **реализован (Sprint 3.5)** — Adapty webhook+ресинк, entitlements/quota-gate, usage_counters, grace-teardown; **S5:** активирован `/edits`-гейт отдельным лимитом правок ([ADR-014](adr/ADR-014-edit-limit-revision-rollback.md)) |
+| `notify` | [modules/notify/](modules/notify/README.md) | **реализован (Sprint 5)** — APNs push статуса из job_events ([ADR-013](adr/ADR-013-apns-push-from-job-events.md)), `device_tokens`, `/v1/devices`; без APNs `.p8`/`APNS_*` (внешняя зависимость пользователя) push — no-op, пайплайн цел |
+| `observability` | [modules/observability/](modules/observability/README.md) | **реализован (Sprint 6 — финальный)** — Prometheus + Grafana + Sentry ([ADR-015](adr/ADR-015-observability-stack.md)/[ADR-016](adr/ADR-016-scale-topology-redis-pool.md)): нормативная таблица метрик (`/metrics` app+воркеры/beat), 6 Grafana-дашбордов, Sentry-scrubbing, cost-калибровка, Redis pool/batch resync; закрыл наблюдаемостью TD-010/011/012, реализовал метрики-драйверы TD-005/006; живой Prometheus/Grafana/Sentry на реальном DSN — открытый приёмочный пункт (4 real-stack skip) |
+
+## Статус Sprint 1 (реализовано)
+
+По факту прошедшего пайплайна (architect → backend/frontend → reviewers → qa → reviewer) в Sprint 1 **реализован сквозной happy-path**:
+
+- **Pipeline happy-path:** промт → уточняющие вопросы (human-in-the-loop пауза) → ответы → спека (Agent 1/2) → генерация дерева (Agent 3) → `npm ci && vite build` в эфемерном build-контейнере → деплой `nginx:alpine` + Traefik-route → health-check → `state=LIVE` + `live_url`.
+- **Deploy-lifecycle** строки `site_deployments`: `building` → `active`/`failed` с **teardown-on-fail** (снос контейнера+route до перевода джобы в `FIXING`/`FAILED`) и **cleanup-before-run** (идемпотентный `docker rm -f` перед `docker run` — crash-resume / Celery `acks_late`). Контракт `docker run` (`-d`, `--name site_{subdomain}`, `--restart unless-stopped`, `--network`, `-v …:ro`, Traefik-лейблы) совпадает с `app/deploy/docker_deploy.py`.
+- **Env-контракт** приведён к каноническому виду в compose/`.env.example` ([07-deployment.md](07-deployment.md), [TD-002](100-known-tech-debt.md#td-002) — closed).
+
+**Приёмочный пункт, ещё НЕ прогнанный:** реальный E2E на **живом стеке** с `ANTHROPIC_API_KEY` + Docker (фактический прогон промт→LIVE на поднятом окружении) пока не выполнялся из-за отсутствия окружения. Реализован и покрыт тестами **happy-path кода**; живой E2E остаётся открытым приёмочным пунктом Sprint 1.
+
+**Tech-debt после Sprint 1:** [TD-002](100-known-tech-debt.md#td-002) — **closed**. Остаются open: [TD-001](100-known-tech-debt.md#td-001) (docker.sock без gVisor → Sprint 4), [TD-003](100-known-tech-debt.md#td-003) (delta teardown↔GC-on-project-delete → Sprint 4), [TD-004](100-known-tech-debt.md#td-004) (auth O(N) argon2 → Sprint 3).
+
+## Статус Sprint 2 (реализовано)
+
+По факту прошедшего пайплайна (backend → reviewers → qa 262 passed / coverage 88.28% → финальный reviewer approve, `production_ready: true`) в Sprint 2 **реализован Fixer loop + resilience** ([modules/pipeline/03-architecture.md → Sprint 2](modules/pipeline/03-architecture.md#sprint-2--fixer-loop--resilience-исполняемый-контракт)):
+
+- **Agent 4 (Fixer):** вход = спека + дерево + последний `failure_log` последней ревизии текущей джобы; выход = схема `agent_output` (патч → пересборка) или `unrecoverable` → `FAILED`.
+- **Цикл самовосстановления** `FIXING→BUILDING→DEPLOYING→LIVE|FIXING` с инкрементом `retry_count` только на применённом патче (`FIXING→BUILDING`).
+- **4 гарда fix-loop** от runaway: max attempts (`MAX_FIX_ATTEMPTS`), budget (`spend_usd>=JOB_BUDGET_USD`, источник истины — Postgres), wall-clock (`JOB_WALL_CLOCK_BUDGET_S`), no-progress-by-signature ([ADR-005](adr/ADR-005-no-progress-failure-signature.md)) → `FAILED(reason)`.
+- **Разграничение Celery-retry (инфра) vs доменный FIXING (build-fail)** ([ADR-006](adr/ADR-006-celery-retry-vs-domain-fixing.md)).
+- **Beat sweeper** (`AWAITING_CLARIFICATION` TTL) + **reconciler** (crash-resume застрявших `BUILDING/DEPLOYING/FIXING`).
+- **`failure_log` в S3** (`logs/{job_id}/build.log`).
+
+**Приёмочный пункт, ещё НЕ прогнанный:** реальный E2E на **живом стеке** с `ANTHROPIC_API_KEY` + Docker + поднятым Celery-воркером, а также **real-stack execution** Celery `task.retry` через брокер — НЕ прогнаны из-за отсутствия окружения. Fix-loop проверен через **тела тасок с моками** (262 unit/integration зелёные, coverage 88.28%). Реализован и покрыт тестами **код Fixer loop + resilience**; живой E2E и real-stack retry через брокер остаются открытым приёмочным пунктом Sprint 2 — **не выдаётся за «протестировано на живом стеке»**.
+
+**Open question после Sprint 2:** [Q-COST-1](99-open-questions.md#q-cost-1) — **closed-for-S2** (дефолты бюджетов и kill-by-budget зафиксированы; калибровка дефолтов под реальную стоимость → Sprint 6).
+
+**Tech-debt после Sprint 2:** [TD-002](100-known-tech-debt.md#td-002) — **closed** (Sprint 1). Остаются open с целевыми спринтами: [TD-001](100-known-tech-debt.md#td-001) (docker.sock без gVisor → Sprint 4), [TD-003](100-known-tech-debt.md#td-003) (delta teardown↔GC-on-project-delete → Sprint 4), [TD-004](100-known-tech-debt.md#td-004) (auth O(N) argon2 → Sprint 3), [TD-005](100-known-tech-debt.md#td-005) (калибровка нормализаторов сигнатуры фейла + версионирование `failure_log` по витку → Sprint 6), [TD-006](100-known-tech-debt.md#td-006) (быстрый Redis-счётчик бюджета как оптимизация, не пробел → Sprint 6).
+
+## Статус Sprint 3 (реализовано)
+
+По факту прошедшего пайплайна (backend → reviewers → qa 329 passed / coverage 87.26% → финальный reviewer approve, `production_ready: true`) в Sprint 3 **реализован Auth & multi-user** (модуль [auth](modules/auth/README.md), [08-product-decisions §3](08-product-decisions.md#sprint-3--auth--multi-user)):
+
+- **Sign in with Apple** ([ADR-007](adr/ADR-007-sign-in-with-apple.md)): `POST /v1/auth/apple` — верификация Apple identity token (подпись по JWKS Apple, `iss`/`aud`/`exp`/`nonce`), upsert user по `apple_sub`, выдача нашего opaque Bearer-ключа `lv_<key_id>_<secret>` (argon2id-хэш). Пароли не хранятся.
+- **Индексируемый O(1) lookup** ([ADR-008](adr/ADR-008-indexed-api-key-lookup.md), [TD-004](100-known-tech-debt.md#td-004) — **closed**): `key_id`-префикс + UNIQUE-индекс `api_tokens.key_id` → одна строка + один constant-time argon2-verify; O(N) full-scan по юзерам убран.
+- **Мульти-устройство:** N активных `api_tokens` на user; **отзыв** `DELETE /v1/auth/tokens/{id}` + список `GET /v1/auth/tokens`.
+- **Rate-limit** 60 req/min на ключ (Redis token bucket, `app/auth/rate_limit.py`) + **cap конкурентных генераций** (в S3 — дефолт free; реальный tier подключает S3.5).
+- **Cross-tenant изоляция** подтверждена тестом; миграционный путь с S1 seeded-ключа без слома существующих тестов.
+
+**Приёмочный пункт, ещё НЕ прогнанный:** живой E2E на **боевом стеке** с реальным **Apple token flow** (боевой `APPLE_AUDIENCE`/конфигурация iOS) **+ `ANTHROPIC_API_KEY` + Docker** — НЕ прогонялся из-за отсутствия окружения. Auth проверен через **мок JWKS + эфемерный Postgres/Redis** (329 unit/integration зелёные, coverage 87.26%). Реализован и покрыт тестами **код auth**; живой E2E с боевым Apple token flow и Claude+Docker остаётся открытым приёмочным пунктом Sprint 3 — **не выдаётся за «протестировано на живом стеке»**.
+
+**Tech-debt после Sprint 3:** [TD-004](100-known-tech-debt.md#td-004) — **closed** (Sprint 3, индексируемый lookup [ADR-008](adr/ADR-008-indexed-api-key-lookup.md)). Новые open (minor от финального reviewer): [TD-007](100-known-tech-debt.md#td-007) (Redis-подключение без пула в `app/auth/rate_limit.py`, hot path → Sprint 6 scale), [TD-008](100-known-tech-debt.md#td-008) (N+1 в `list_projects` live_url, pre-existing S1 → Sprint 5/6). Остаются open: [TD-001](100-known-tech-debt.md#td-001)/[TD-003](100-known-tech-debt.md#td-003) (→ Sprint 4), [TD-005](100-known-tech-debt.md#td-005)/[TD-006](100-known-tech-debt.md#td-006) (→ Sprint 6). Closed: [TD-002](100-known-tech-debt.md#td-002) (S1).
+
+## Статус Sprint 3.5 (реализовано)
+
+По факту прошедшего пайплайна (backend + devops → reviewers → qa 417 passed / coverage 88% → финальный reviewer approve, `production_ready: true`) в Sprint 3.5 **реализован Billing (Adapty)** (модуль [billing](modules/billing/README.md), [ADR-009](adr/ADR-009-billing-idempotency-resync-grace.md), [08-product-decisions §3.5](08-product-decisions.md#sprint-35--billing-adapty)):
+
+- **Идемпотентный вебхук** `POST /v1/billing/webhook/adapty` (UNIQUE `billing_events.adapty_event_id`, верификация секрета/подписи Adapty `ADAPTY_WEBHOOK_SECRET` → `401`), маппинг `event_type`→`subscriptions` по нормативной таблице ([billing §2.3](modules/billing/03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица)).
+- **Dual-source права** ([ADR-009](adr/ADR-009-billing-idempotency-resync-grace.md)): вебхук = primary, `getProfile`-ресинк = reconcile (периодический beat `billing.resync` + lazy на гейте, rate-limit к Adapty, fail-open на кэш).
+- **Entitlements** заменяют S3-заглушку free: реальный `access_level` из `subscriptions` в concurrency-cap; **quota-gate** на `POST /projects` → `402` (`reason`+`required_entitlement`); контракт `/edits` готов (активен с S5).
+- **`usage_counters`** инкремент на успешном старте генерации (`kind='generation'`, идемпотентно по `job_id`); `GET /billing/me` — entitlement + остаток квоты.
+- **Сидинг `plan_quotas`** (Free+Pro, Alembic data-migration); **grace-teardown** `billing.subscription_sweep` (beat) — `grace_until<now` → teardown `active` сайтов → `status=expired`; renew в grace отменяет.
+
+**Приёмочный пункт, ещё НЕ прогнанный:** живой E2E с **реальным Adapty** (боевой вебхук с настоящей подписью + `getProfile` v2 против реального профиля) **+ Claude + Docker** — НЕ прогонялся из-за отсутствия окружения. Billing проверен через **httpx-мок Adapty API + HMAC тест-секрет + эфемерный Postgres/Redis** (417 unit/integration зелёные, coverage 88%). Реализован и покрыт тестами **код billing**; живой E2E с реальным Adapty и Claude+Docker остаётся открытым приёмочным пунктом Sprint 3.5 — **не выдаётся за «протестировано на живом стеке»**. Точная схема signature-header/префикса и getProfile payload v2 верифицируются при реальной интеграции — [Q-BILLING-4](99-open-questions.md#q-billing-4).
+
+**Open question после Sprint 3.5:** [Q-BILLING-4](99-open-questions.md#q-billing-4) — open (верификация webhook signature-header + точная схема `getProfile` payload v2 при реальной интеграции; **целевой — момент реальной интеграции / перед prod, не блокирует код S3.5**).
+
+**Tech-debt после Sprint 3.5:** новый [TD-009](100-known-tech-debt.md#td-009) (`run_periodic_resync` без батча/LIMIT → Sprint 6 scale). Остаются open: [TD-001](100-known-tech-debt.md#td-001)/[TD-003](100-known-tech-debt.md#td-003) (→ Sprint 4), [TD-005](100-known-tech-debt.md#td-005)/[TD-006](100-known-tech-debt.md#td-006)/[TD-007](100-known-tech-debt.md#td-007)/[TD-009](100-known-tech-debt.md#td-009) (→ Sprint 6), [TD-008](100-known-tech-debt.md#td-008) (→ Sprint 5/6). Closed: [TD-002](100-known-tech-debt.md#td-002) (S1), [TD-004](100-known-tech-debt.md#td-004) (S3).
+
+## Статус Sprint 4 (реализовано)
+
+По факту прошедшего пайплайна (backend + devops → reviewers → qa 462 passed / coverage 87.81% → финальный reviewer approve, `production_ready: true`) в Sprint 4 **реализован Sandbox & security** (модуль [deploy](modules/deploy/README.md), [08-product-decisions §4](08-product-decisions.md#sprint-4--sandbox--security)):
+
+- **Rootless Docker sandbox** ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md), закрывает [TD-001](100-known-tech-debt.md#td-001)): build-воркер `vite build` недоверенного LLM-кода на rootless-сокете (`BUILD_SANDBOX_RUNTIME=rootless`) вместо привилегированного `docker.sock`; build-контейнер изолирован — `cap-drop ALL`, `no-new-privileges`, seccomp, `--read-only` rootfs кроме `/workspace`, non-root UID, лимиты `BUILD_*` (cpus/memory/pids/wall-clock).
+- **Egress-allowlist** ([ADR-010 §C](adr/ADR-010-build-sandbox-rootless-egress.md), закрывает [TD-001](100-known-tech-debt.md#td-001) совместно с rootless): build-контейнер в изолированной `BUILD_EGRESS_NETWORK` + egress-proxy, пропускающий **только** `NPM_REGISTRY_ALLOWLIST`; транспорт через `BUILD_EGRESS_PROXY_URL` (воркер инжектит `http_proxy`/`https_proxy`); private CIDR/cloud-metadata — DROP. App-процессы (web/worker/beat → Adapty/Anthropic/Apple JWKS) НЕ блокируются.
+- **Project GC** ([ADR-011](adr/ADR-011-project-delete-gc.md), закрывает [TD-003](100-known-tech-debt.md#td-003)): `DELETE /projects/{pid}`→`202`+soft-delete (`projects.deleted_at`) + async Celery `project.gc` — полный teardown всех контейнеров/Traefik-route проекта, volume, S3-артефактов всех ревизий, БД-каскад; in-flight→`FAILED(project_deleted)`; идемпотентно; субдомены opaque и **не реюзаются** (защита от subdomain-takeover).
+
+**Приёмочный пункт, ещё НЕ прогнанный:** живой **rootless+egress+npm-через-proxy энфорс на реальном build-хосте** (поднятый rootless Docker-демон + egress-proxy) — НЕ прогонялся из-за отсутствия build-хоста; проверено на **unit/integration** (2 real-stack теста skip). Реализован и покрыт тестами **код sandbox/security/GC**; живой энфорс остаётся открытым приёмочным пунктом — **не выдаётся за «протестировано на живом стеке»**. По рекомендации финального reviewer вынесен в **приёмочные пункты Sprint 5** (при наличии build-хоста).
+
+**Resolved Q после Sprint 4:** [Q-INFRA-1](99-open-questions.md#q-infra-1) (rootless), [Q-DEPLOY-1](99-open-questions.md#q-deploy-1) (egress-allowlist+proxy), [Q-DEPLOY-3](99-open-questions.md#q-deploy-3) (DELETE+GC) — **resolved (реализованы)**. [Q-DEPLOY-2](99-open-questions.md#q-deploy-2) (wildcard TLS) — на момент S4 оставался deferred (целевая модель DNS-01); **позже resolved (2026-06-03)** переходом на path-based routing `corelysite.shop/s/{site_id}` — wildcard снят ([ADR-017](adr/ADR-017-path-based-site-routing.md)/[ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)).
+
+**Tech-debt после Sprint 4:** [TD-001](100-known-tech-debt.md#td-001) — **closed** (rootless+egress, [ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)); [TD-003](100-known-tech-debt.md#td-003) — **closed** (`DELETE`+GC, [ADR-011](adr/ADR-011-project-delete-gc.md)). Новый [TD-010](100-known-tech-debt.md#td-010) (метрика/алерт на eventual-окно async `project.gc` → Sprint 6, рекомендация reviewer). Остаются open: [TD-005](100-known-tech-debt.md#td-005)/[TD-006](100-known-tech-debt.md#td-006)/[TD-007](100-known-tech-debt.md#td-007)/[TD-009](100-known-tech-debt.md#td-009)/[TD-010](100-known-tech-debt.md#td-010) (→ Sprint 6), [TD-008](100-known-tech-debt.md#td-008) (→ Sprint 5/6). Closed: [TD-002](100-known-tech-debt.md#td-002) (S1), [TD-004](100-known-tech-debt.md#td-004) (S3), [TD-001](100-known-tech-debt.md#td-001)/[TD-003](100-known-tech-debt.md#td-003) (S4).
+
+## Статус Sprint 5 (реализовано)
+
+По факту прошедшего пайплайна (backend + devops → reviewers → qa 553 passed / coverage 84% → финальный reviewer approve, `production_ready: true`) в Sprint 5 **реализован Realtime & edits** (продуктовые решения [08 §5](08-product-decisions.md#sprint-5--realtime--edits), [Q-CLIENT-1](99-open-questions.md#q-client-1) resolved):
+
+- **SSE-статус-стрим** ([ADR-012](adr/ADR-012-sse-realtime-transport.md)): `GET /v1/jobs/{jid}/events` — replay из `job_events` по `Last-Event-ID`, heartbeat `SSE_HEARTBEAT_S`, `retry`-hint, завершение `event: done` на терминале, cross-tenant `404`, лимит стримов на ключ (`SSE_MAX_STREAMS_PER_KEY`→`429`). В S1 был минимальный стрим без семантики reconnect — S5 развернул нормативно. Polling `GET /jobs/{jid}` — равноправный fallback.
+- **Post-delivery edits** ([ADR-014](adr/ADR-014-edit-limit-revision-rollback.md)): `POST /v1/projects/{pid}/edits` (`kind=edit`, цикл `LIVE→FIXING→LIVE`, Agent 4 как editor) активирует зафиксированный в S2 edit-контракт ([pipeline](modules/pipeline/03-architecture.md#post-delivery-edit-live--fixing--live--контракт-зафиксирован-реализация-в-sprint-5)). **Отдельный лимит правок** (`plan_quotas.monthly_edits` + `edit_usage_counters`, не из квоты генераций), quota-gate `/edits` активирован ([billing §7](modules/billing/03-architecture.md#7-граница-s5-edits)).
+- **Rollback ревизий** ([ADR-014 §B](adr/ADR-014-edit-limit-revision-rollback.md)): `POST /v1/projects/{pid}/revisions/{revision_no}/rollback` — re-deploy good-ревизии (deploy нового → health 200 → teardown прежнего `active→superseded`, без downtime), `current_revision_id` обновляется ([deploy §7](modules/deploy/03-architecture.md#7-rollback-ревизии-sprint-5--re-deploy-good-ревизии-adr-014)).
+- **APNs push** ([ADR-013](adr/ADR-013-apns-push-from-job-events.md), [Q-CLIENT-1](99-open-questions.md#q-client-1)): `device_tokens` + `POST/DELETE /v1/devices`; Celery `notify.apns_push` из обработчика `job_events` на `LIVE`/`FAILED`/`AWAITING_CLARIFICATION`; HTTP/2 (`httpx[http2]`) + provider-JWT ES256 (`PyJWT[crypto]`); `410`/`400` → инвалидация токена, `429`/`5xx` → Celery retry. **Внешняя зависимость:** APNs `.p8`-ключ/`APNS_*` от пользователя (Apple Developer) — без них push no-op (проверено тестом), пайплайн цел. Новый модуль [notify](modules/notify/README.md).
+- **Concurrency-слот edit/rollback:** джобы `kind ∈ {edit, rollback}` — нетерминальные `generation_jobs` и **занимают слот** `max_concurrent_jobs` наравне с `generation` (единый нормативный источник — [billing §4.3](modules/billing/03-architecture.md#4-entitlements--quota-gate)). На Free (`max_concurrent_jobs=1`) in-flight rollback/edit блокирует старт новой generation — задокументировано как поведение тарифа ([TD-011](100-known-tech-debt.md#td-011) — наблюдаемость/закрепление → S6).
+- **Перенесённый из S4 приёмочный пункт:** живой энфорс rootless+egress+npm-через-proxy на реальном build-хосте ([08 §5-5](08-product-decisions.md#sprint-5--realtime--edits), [TD-001](100-known-tech-debt.md#td-001) closed, остаётся в остаточных live-приёмочных пунктах).
+
+**Data-model S5:** `device_tokens`, `edit_usage_counters`, `plan_quotas.monthly_edits` ([03-data-model.md](03-data-model.md)). **Новые reason-коды:** `edit_failed_rolled_back`. **Новые env:** `SSE_*`, `APNS_*` ([07-deployment.md](07-deployment.md)).
+
+**Приёмочный пункт, ещё НЕ прогнанный:** живой **E2E** — реальный APNs push боевым `.p8`-ключом + SSE reconnect на реальной мобильной/флапающей сети + Claude+Docker — **НЕ прогонялся** из-за отсутствия окружения и внешних credentials. Durability SSE (replay по `Last-Event-ID`) и no-op APNs без credentials **проверены тестами**; **4 real-stack-теста skip**. APNs `.p8`/ключи — **внешняя зависимость пользователя** (Apple Developer). Реализован и покрыт тестами **код SSE/edits/rollback/APNs**; живой E2E остаётся открытым приёмочным пунктом Sprint 5 — **не выдаётся за «протестировано на живом стеке»**. Рекомендация reviewer — **staging-прогон живого E2E перед релизом**.
+
+**Resolved Q после Sprint 5:** [Q-CLIENT-1](99-open-questions.md#q-client-1) — **resolved (APNs реализован)**.
+
+**Tech-debt после Sprint 5:** новые [TD-011](100-known-tech-debt.md#td-011) (SSE heartbeat-ветка не дочитывает `job_events` по таймауту — doc↔code mismatch + остаточный риск «висящего» стрима → S6) и [TD-012](100-known-tech-debt.md#td-012) (`kind=rollback`/`edit` занимают слот `max_concurrent_jobs`; на Free блокируют generation → закрепить наблюдаемость S6). [TD-008](100-known-tech-debt.md#td-008) (N+1 `list_projects`) — **остаётся open**, в S5 при работе над `/revisions` **не погашен** (revisions/rollback не затронули `list_projects`-цикл), целевой → Sprint 6. Остаются open: [TD-005](100-known-tech-debt.md#td-005)/[TD-006](100-known-tech-debt.md#td-006)/[TD-007](100-known-tech-debt.md#td-007)/[TD-009](100-known-tech-debt.md#td-009)/[TD-010](100-known-tech-debt.md#td-010)/[TD-011](100-known-tech-debt.md#td-011)/[TD-012](100-known-tech-debt.md#td-012)/[TD-008](100-known-tech-debt.md#td-008) (→ Sprint 6). Closed: [TD-002](100-known-tech-debt.md#td-002) (S1), [TD-004](100-known-tech-debt.md#td-004) (S3), [TD-001](100-known-tech-debt.md#td-001)/[TD-003](100-known-tech-debt.md#td-003) (S4).
+
+## Статус Sprint 6 (реализован — финальный спринт)
+
+По факту прошедшего пайплайна (backend + devops → reviewers → qa **604 passed / coverage 83.59%** → финальный reviewer approve, `production_ready: true`) в Sprint 6 **реализован Observability/cost/scale** (продуктовые решения [08 §6](08-product-decisions.md#sprint-6--observability-cost-scale), [ADR-015](adr/ADR-015-observability-stack.md)/[ADR-016](adr/ADR-016-scale-topology-redis-pool.md), модуль [observability](modules/observability/README.md)). Ключевое:
+
+- **Метрики (Prometheus):** экспозиция `/metrics` на FastAPI-app (internal, не публичный) **и** Celery-воркерах/beat (`METRICS_PORT`). Нормативная таблица метрик (имя/тип/labels) — [observability §2](modules/observability/03-architecture.md#2-нормативная-таблица-метрик): jobs by state/исход, build duration, fix-loop depth, **$/job + токены/cache hit-rate** (cost-ledger `llm_usage`), SSE (open/429/duration/heartbeat-catchup), APNs (delivered/invalidated/retry/drop по Apple-кодам), edit/rollback (авто-rollback-доля, re-deploy duration, dist-cache-hit), queue depth (`llm`/`build`), worker utilization, billing (402-rate/resync-lag/concurrency-block), gc-lag. **Запрет unbounded-labels** (`job_id`/`user_id` — в Sentry/логи, не в Prometheus).
+- **Grafana:** 6 дашбордов as code (jobs pipeline / cost-$ / SSE-realtime / APNs / build-ферма / billing) + provisioning + alert-правила (gc-lag, budget-burn, queue-depth, resync-lag) — [observability §3](modules/observability/03-architecture.md#3-grafana-дашборды).
+- **Sentry:** FastAPI + Celery, correlation `job_id`/`project_id`/`user_id`, **scrubbing секретов** (`before_send`, `send_default_pii=False`) — Adapty/APNs/Apple/S3-ключи и Bearer-секрет не утекают ([observability §4](modules/observability/03-architecture.md#4-sentry), [05-security → Observability](05-security.md#observability-как-security-сигнал)). Пустой `SENTRY_DSN` → no-op.
+- **Cost-калибровка:** донастройка нормализаторов сигнатуры по `lovable_no_progress_trips_total` ([TD-005](100-known-tech-debt.md#td-005)); опциональный Redis budget-счётчик `INCRBYFLOAT budget:{job_id}` с fallback на Postgres-source-of-truth ([TD-006](100-known-tech-debt.md#td-006)); подтверждение model-tiering (Fixer = Sonnet, env-дельта без кода — [08 §6-2](08-product-decisions.md#sprint-6--observability-cost-scale)).
+- **Scale (несколько хостов, ручной):** API stateless N реплик за Traefik + LLM-воркеры (rate-limit Claude) + build-воркеры на отдельных хостах (rootless+egress); разнесение очередей по хостам; `docker compose scale`/replicas; Redis `ConnectionPool` ([TD-007](100-known-tech-debt.md#td-007)) — [ADR-016](adr/ADR-016-scale-topology-redis-pool.md), [07-deployment → Прод-топология](07-deployment.md#прод-топология). Авто-scaling — out-of-scope (позже).
+- **Закрытие tech-debt (реализовано в S6):** [TD-007](100-known-tech-debt.md#td-007) (Redis pool во всех hot-path), [TD-008](100-known-tech-debt.md#td-008) (N+1 list_projects → batched live_url), [TD-009](100-known-tech-debt.md#td-009) (resync батч+курсор), [TD-010](100-known-tech-debt.md#td-010) (gc-lag метрика/алерт), [TD-011](100-known-tech-debt.md#td-011) (SSE heartbeat re-read `job_events`), [TD-012](100-known-tech-debt.md#td-012) (concurrency-block метрика; rollback/edit остаются в cap) — **CLOSED (Sprint 6)**. [TD-005](100-known-tech-debt.md#td-005) (метрика-драйвер калибровки no_progress) / [TD-006](100-known-tech-debt.md#td-006) (Redis budget-кэш) — **CLOSED-for-S6**: метрики-драйверы/кэш реализованы и покрыты тестами, остаток — тонкая калибровка по дашбордам **пост-релиз** (требует живого трафика, не блокер).
+- **Новые технологии:** `prometheus-client`, `sentry-sdk` (прямые зависимости), образы `prom/prometheus`/`grafana/grafana` ([02-tech-stack → Observability](02-tech-stack.md#observability-sprint-6-prometheus--grafana--sentry)). **Новые env:** `SENTRY_*`/`METRICS_PORT`/`PROMETHEUS_*`/`REDIS_POOL_*`/`BILLING_RESYNC_BATCH_SIZE` ([07-deployment](07-deployment.md#канонический-список-ключей)). **Конфиг-артефакты:** `infra/prometheus/prometheus.yml`, `infra/grafana/provisioning/*`, `infra/grafana/dashboards/*.json` (правило — [07-deployment](07-deployment.md#правило-конфиг-артефакта-prometheusgrafana-sprint-6)).
+
+**Приёмочный пункт, ещё НЕ прогнанный:** живые **Prometheus scrape / Grafana render / Sentry capture на реальном DSN** — НЕ прогонялись из-за отсутствия окружения. Метрики/Sentry/Grafana-конфиг проверены через **unit/integration с реальным Redis + моки** (604 passed, coverage 83.59%, **4 real-stack теста skip**). Реализован и покрыт тестами **код observability**; живой прогон остаётся открытым приёмочным пунктом Sprint 6 — **не выдаётся за «протестировано на живом стеке»**. **Staging-прогон живого E2E** ([08 §6-6](08-product-decisions.md#sprint-6--observability-cost-scale)) закрывает накопленные live-приёмочные пункты S1–S6 перед релизом.
+
+**Tech-debt после Sprint 6:** [TD-007](100-known-tech-debt.md#td-007)/[TD-008](100-known-tech-debt.md#td-008)/[TD-009](100-known-tech-debt.md#td-009)/[TD-010](100-known-tech-debt.md#td-010)/[TD-011](100-known-tech-debt.md#td-011)/[TD-012](100-known-tech-debt.md#td-012) — **CLOSED (S6)**; [TD-005](100-known-tech-debt.md#td-005)/[TD-006](100-known-tech-debt.md#td-006) — **CLOSED-for-S6** (остаток калибровки → пост-релиз). **Все TD-001..012 закрыты** (см. [итоговый раздел](#итоговый-статус-проекта-все-6-спринтов--завершение)). Новых tech-debt в S6 не заведено.
+
+## Спринты (roadmap)
+
+| Sprint | Содержание | Статус |
+|---|---|---|
+| 0 | bootstrap `docs/` | done |
+| 1 | MVP happy-path (промт → LIVE URL, polling, один воркер) | **реализован happy-path** (см. ниже) |
+| 2 | Fixer (Agent 4) + resilience (4 гарда fix-loop, Celery retry/backoff, sweeper+reconciler) | **реализован** (см. ниже; живой E2E + real-stack retry — остаются открытым приёмочным пунктом) ([modules/pipeline/03-architecture.md → Sprint 2](modules/pipeline/03-architecture.md#sprint-2--fixer-loop--resilience-исполняемый-контракт)) |
+| 3 | Auth & multi-user: **Sign in with Apple** ([ADR-007](adr/ADR-007-sign-in-with-apple.md)) + индексируемый lookup ([ADR-008](adr/ADR-008-indexed-api-key-lookup.md), [TD-004](100-known-tech-debt.md#td-004)) + мульти-устройство + rate-limit/concurrency cap | **реализован** (см. ниже; живой E2E с боевым Apple token flow — остаётся открытым приёмочным пунктом) (модуль [auth](modules/auth/README.md), [08-product-decisions §3](08-product-decisions.md#sprint-3--auth--multi-user)) |
+| 3.5 | Billing (Adapty): Free+Pro freemium, лимиты, grace 7д, вебхук+ресинк, quota-gate | **реализован** (см. выше; живой E2E с реальным Adapty + Claude+Docker — остаётся открытым приёмочным пунктом, [Q-BILLING-4](99-open-questions.md#q-billing-4)) ([modules/billing/](modules/billing/README.md), [ADR-009](adr/ADR-009-billing-idempotency-resync-grace.md), Q-BILLING-1/2/3 resolved) |
+| 4 | Sandbox & security: rootless Docker + egress-allowlist ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)), `DELETE /projects/{id}` + полный GC ([ADR-011](adr/ADR-011-project-delete-gc.md)), dev `apps.localhost` | **реализован** (см. выше; живой rootless+egress-энфорс на реальном build-хосте — остаётся открытым приёмочным пунктом → S5) — [TD-001](100-known-tech-debt.md#td-001)/[TD-003](100-known-tech-debt.md#td-003) closed, Q-INFRA-1/Q-DEPLOY-1/3 resolved, Q-DEPLOY-2 на тот момент deferred (**позже resolved** path-based, [ADR-017](adr/ADR-017-path-based-site-routing.md)); новый [TD-010](100-known-tech-debt.md#td-010) (gc-lag метрика → S6) |
+| 5 | Realtime & edits: SSE (reconnect/Last-Event-ID) + polling, APNs push, `/edits` (отдельный лимит правок), revisions+rollback | **реализован** (см. выше; живой E2E — реальный APNs `.p8` + SSE reconnect на флапающей сети + Claude+Docker — остаётся открытым приёмочным пунктом, 4 real-stack skip) ([ADR-012](adr/ADR-012-sse-realtime-transport.md)/[ADR-013](adr/ADR-013-apns-push-from-job-events.md)/[ADR-014](adr/ADR-014-edit-limit-revision-rollback.md); модули [api](modules/api/02-api-contracts.md)/[pipeline](modules/pipeline/03-architecture.md)/[notify](modules/notify/README.md); Q-CLIENT-1 resolved; новые [TD-011](100-known-tech-debt.md#td-011)/[TD-012](100-known-tech-debt.md#td-012) → S6) |
+| 6 | **Observability (Prometheus+Grafana+Sentry) + cost-калибровка + multi-host scale (финальный спринт)**: нормативная таблица метрик (`/metrics` app+воркеры/beat), 6 Grafana-дашбордов as code, Sentry-scrubbing секретов, Redis budget-счётчик ([TD-006](100-known-tech-debt.md#td-006)), Redis pool ([TD-007](100-known-tech-debt.md#td-007)), batched `list_projects` ([TD-008](100-known-tech-debt.md#td-008)), batch+курсор resync ([TD-009](100-known-tech-debt.md#td-009)), gc-lag/SSE-catchup/concurrency-block метрики ([TD-010](100-known-tech-debt.md#td-010)/[TD-011](100-known-tech-debt.md#td-011)/[TD-012](100-known-tech-debt.md#td-012)), ручной multi-host scale | **реализован (финальный)** (см. выше; живой Prometheus scrape/Grafana render/Sentry capture на реальном DSN — остаётся открытым приёмочным пунктом, 4 real-stack skip) ([ADR-015](adr/ADR-015-observability-stack.md)/[ADR-016](adr/ADR-016-scale-topology-redis-pool.md), [modules/observability](modules/observability/README.md), [08 §6](08-product-decisions.md#sprint-6--observability-cost-scale)) |
+
+## Итоговый статус проекта (все 6 спринтов — завершение)
+
+**Все спринты 0/1/2/3/3.5/4/5/6 реализованы** (каждый прошёл полный pipeline: architect → backend/frontend/devops → reviewers → qa → финальный reviewer `production_ready: true`). Проект **функционально завершён**: код реализован и покрыт тестами по DoD каждого спринта. **Живой staging-прогон E2E на боевом стеке — обязательный пункт перед prod-релизом** (см. остаточные приёмочные пункты ниже).
+
+### Сводка реализованного по спринтам
+
+| Sprint | Реализовано (код + тесты) | qa |
+|---|---|---|
+| 0 | bootstrap `docs/` | — |
+| 1 | MVP happy-path: промт → уточняющие вопросы (human-in-the-loop) → спека (Agent 1/2) → дерево (Agent 3) → `vite build` в эфемерном контейнере → деплой nginx+Traefik → health → `LIVE`+`live_url`; deploy-lifecycle с teardown-on-fail + cleanup-before-run; канонический env-контракт | happy-path |
+| 2 | Agent 4 (Fixer) + цикл самовосстановления `FIXING→BUILDING→DEPLOYING→LIVE`; 4 гарда fix-loop (attempts/budget/wall-clock/no-progress); Celery-retry vs доменный FIXING; beat sweeper + reconciler; `failure_log` в S3 | 262 / 88.28% |
+| 3 | Auth & multi-user: Sign in with Apple ([ADR-007](adr/ADR-007-sign-in-with-apple.md)); индексируемый O(1) lookup ([ADR-008](adr/ADR-008-indexed-api-key-lookup.md)); мульти-устройство + отзыв токенов; rate-limit 60/min + concurrency cap; cross-tenant изоляция | 329 / 87.26% |
+| 3.5 | Billing (Adapty): идемпотентный вебхук + dual-source getProfile-ресинк ([ADR-009](adr/ADR-009-billing-idempotency-resync-grace.md)); entitlements + quota-gate `402`; `usage_counters`; grace-teardown через beat; сидинг `plan_quotas` (Free+Pro) | 417 / 88% |
+| 4 | Sandbox & security: rootless Docker ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)) + egress-allowlist; `DELETE /projects/{id}` + полный async GC ([ADR-011](adr/ADR-011-project-delete-gc.md)); субдомены opaque, не реюзаются | 462 / 87.81% |
+| 5 | Realtime & edits: SSE-стрим reconnect/Last-Event-ID ([ADR-012](adr/ADR-012-sse-realtime-transport.md)) + polling fallback; post-delivery `/edits` с отдельным лимитом правок + rollback ревизий ([ADR-014](adr/ADR-014-edit-limit-revision-rollback.md)); APNs push из job_events ([ADR-013](adr/ADR-013-apns-push-from-job-events.md)), модуль notify | 553 / 84% |
+| 6 | Observability: Prometheus `/metrics` (app+воркеры/beat) + нормативная таблица метрик; Grafana 6 дашбордов as code; Sentry + scrubbing секретов ([ADR-015](adr/ADR-015-observability-stack.md)); Redis pool + batch resync + multi-host scale-топология ([ADR-016](adr/ADR-016-scale-topology-redis-pool.md)); cost-калибровка-драйверы | 604 / 83.59% |
+
+### Статус всех TD (реестр [100-known-tech-debt.md](100-known-tech-debt.md))
+
+**Все TD-001..012 закрыты.** TD-001 (S4), TD-002 (S1), TD-003 (S4), TD-004 (S3) — **CLOSED**. TD-007/008/009/010/011/012 — **CLOSED (S6)**. TD-005/006 — **CLOSED-for-S6**: метрики-драйверы калибровки (no_progress) и Redis budget-кэш реализованы и покрыты тестами; **остаток** — тонкая калибровка нормализаторов/подтверждение выигрыша латентности **по дашбордам пост-релиз** (требует живого трафика, не пробел и не блокер). Новых TD в S6 не заведено.
+
+### Статус всех Q (реестр [99-open-questions.md](99-open-questions.md))
+
+- **resolved:** Q-PIPELINE-1/2 (closed-for-S1), Q-COST-1 (closed-for-S2; калибровка → драйверы реализованы S6), Q-INFRA-1 / Q-DEPLOY-1 / Q-DEPLOY-3 (S4, реализованы), Q-CLIENT-1 (S5, APNs), Q-BILLING-1/2/3 (S3.5), **Q-DEPLOY-2 (prod-deploy — path-based routing `corelysite.shop/s/{site_id}` снял wildcard, TLS выпускает общий edge-Traefik; [ADR-017](adr/ADR-017-path-based-site-routing.md)/[ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md))**.
+- **open (целевой — реальная интеграция / pre-prod, не блокирует код):** [Q-BILLING-4](99-open-questions.md#q-billing-4) (точная схема webhook signature-header + `getProfile` payload v2 — подтверждается при реальной интеграции Adapty; расхождение → код-правка парсинга, не пересмотр [ADR-009](adr/ADR-009-billing-idempotency-resync-grace.md)).
+
+### Статус всех ADR (реестр [adr/INDEX.md](adr/INDEX.md))
+
+**ADR-001..018 — все Accepted** и зарегистрированы в INDEX. Действующих противоречий нет. (ADR-017 path-based routing, ADR-018 prod-deploy shared-Traefik + CI/CD — добавлены 2026-06-03 для prod-деплоя `corelysite.shop`; CI/CD-платформа **GitHub Actions** декларирована в стеке — [02-tech-stack → CI/CD-платформа](02-tech-stack.md#cicd-платформа-prod-deploy-adr-018).)
+
+### Остаточные приёмочные пункты для prod-релиза (живой E2E на боевом стеке)
+
+Код всех спринтов реализован и покрыт тестами (unit/integration + real Redis + моки). **Живой staging-прогон E2E — обязательный пункт перед релизом** (накопленные live-приёмочные пункты S1–S6, единый источник — [08 §6-6](08-product-decisions.md#sprint-6--observability-cost-scale)):
+
+1. **S1/S2** — happy-path + fix-loop на живом стеке: `ANTHROPIC_API_KEY` + Docker (промт→LIVE), real-stack Celery `task.retry` через брокер.
+2. **S3.5** — реальный Adapty: боевой вебхук с настоящей подписью + `getProfile` v2 против реального профиля ([Q-BILLING-4](99-open-questions.md#q-billing-4) — снять живой sample, подтвердить/скорректировать header-подпись и payload).
+3. **S4** — rootless+egress+npm-через-proxy энфорс на реальном build-хосте (поднятый rootless Docker-демон + egress-proxy).
+4. **S5** — реальный APNs push боевым `.p8`-ключом (Apple Developer) + SSE reconnect на флапающей мобильной сети.
+5. **S6** — живой Prometheus scrape + Grafana render + Sentry capture на реальном DSN.
+
+**Внешние зависимости пользователя для live-E2E:** `ANTHROPIC_API_KEY`, build-хост с rootless Docker, реальный Adapty (sandbox/dashboard), APNs `.p8` + `APNS_*` (Apple Developer), Sentry DSN. **Прод-деплой:** общий сервер `corelysite.shop` с edge-Traefik + сеть `web` (`external:true`) + SSH deploy-ключ ([ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)); wildcard TLS **больше не требуется** (path-based, [Q-DEPLOY-2](99-open-questions.md#q-deploy-2) resolved).
+
+### Итоговые рекомендации reviewer перед prod
+
+1. **Staging live-E2E S1–S6** (п.1–5 выше) — прогнать на staging до релиза; **production-readiness = код реализован+покрыт тестами; живой staging-прогон обязателен перед релизом**.
+2. **[Q-BILLING-4](99-open-questions.md#q-billing-4)** — снять живой webhook/getProfile sample при первой реальной интеграции Adapty, обновить контракт-тест httpx-мока.
+3. **Prod-deploy ([ADR-017](adr/ADR-017-path-based-site-routing.md)/[ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)):** реализовать `docker-compose.prod.yml` (shared edge-Traefik, сеть `web`, без своего SSL) + path-based routing (`SITE_ROUTING_MODE=path`, StripPrefix, Vite `--base`) + CI/CD (GitHub Actions → SSH deploy на `/opt/corelysite`). Живой деплой на `corelysite.shop` — приёмочный пункт. [Q-DEPLOY-2](99-open-questions.md#q-deploy-2) — **resolved** (wildcard снят path-based; TLS выпускает общий Traefik).
+4. **[TD-005](100-known-tech-debt.md#td-005)/[TD-006](100-known-tech-debt.md#td-006)** — тонкая калибровка нормализаторов сигнатуры фейла и подтверждение выигрыша Redis budget-кэша **по дашбордам Cost/no_progress пост-релиз** (по накопленным боевым данным).
+
+## ADR
+
+См. [adr/INDEX.md](adr/INDEX.md). Ключевые: ADR-001 (state-machine+диспетчер), ADR-002 (nginx-mount vs baked image), ADR-003 (Celery vs RQ), ADR-004 (Adapty как источник истины), ADR-005 (no-progress через сигнатуру фейла), ADR-006 (Celery-retry vs доменный FIXING), ADR-007 (Sign in with Apple), ADR-008 (индексируемый lookup API-key), ADR-009 (billing: идемпотентность вебхуков + getProfile-ресинк + grace-teardown через beat), ADR-010 (build-sandbox: rootless Docker + egress-allowlist), ADR-011 (`DELETE /projects/{id}` + полный GC), ADR-012 (SSE realtime-транспорт: reconnect/Last-Event-ID + replay из job_events), ADR-013 (APNs push из job_events), ADR-014 (отдельный лимит правок + rollback ревизий), ADR-015 (observability: Prometheus+Grafana+Sentry, scrubbing), ADR-016 (multi-host scale + Redis pool + batch resync), ADR-017 (path-based routing сайтов `/s/{site_id}` + StripPrefix + Vite base-path; закрывает Q-DEPLOY-2 — wildcard не нужен), ADR-018 (prod-deploy: общий edge-Traefik `corelysite.shop` + сеть `web` без своего SSL + CI/CD SSH-деплой).

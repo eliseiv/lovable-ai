@@ -1,0 +1,210 @@
+# CI/CD — Lovable-AI (corelysite.shop prod-deploy).
+#
+# Источник истины (нормативный контракт workflow):
+#   - docs/adr/ADR-018-prod-deployment-shared-traefik-cicd.md → "CI/CD"
+#   - docs/07-deployment.md → "CI/CD (контракт GitHub Actions, ADR-018)" (стр. 237-244)
+#   - docs/02-tech-stack.md → "CI/CD-платформа (prod-deploy, ADR-018)" + команды
+#     gate ("Инструменты разработки — команды (канонические)")
+#   - docs/05-security.md → "Секреты" (нормативный список GitHub Secrets)
+#   - docs/06-testing-strategy.md → "Prod-deploy контракт" (needs gate)
+#
+# Контракт (docs/07 стр. 241-242):
+#   Jobs: lint + type-check + test  ->  deploy job c needs: [lint, type-check, test]
+#         (деплой ТОЛЬКО на зелёном — гейт перед prod).
+#   deploy: SSH на сервер -> cd /opt/corelysite -> git pull ->
+#           docker compose -f infra/docker-compose.prod.yml up -d --build.
+#           Чужие /opt/music-backend, /opt/edge НЕ трогаются.
+#
+# Команды gate — КАНОНИЧЕСКИЕ из docs/02-tech-stack.md (НЕ дублируются/НЕ
+# выдумываются здесь): ruff format --check . / ruff check . / mypy app / pytest.
+#
+# Pin: ВСЕ third-party actions запинены по COMMIT SHA (supply-chain — требование
+# docs/02-tech-stack.md: "Pin используемых actions — требование devops"; third-party
+# action исполняет код в раннере с доступом к deploy-секретам). Версия в комментарии.
+#   actions/checkout      v4.2.2 -> 11bd71901bbe5b1630ceea73d27597364c9af683
+#   astral-sh/setup-uv    v5.4.2 -> d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+#   appleboy/ssh-action   v1.2.2 -> 2ead5e36573f08b82fbfce1504f1a4b05a647c6f
+#
+# GitHub Secrets (нормативный список — docs/07 стр. 244 / docs/05 "Секреты"):
+#   Deploy/SSH:  SSH_HOST, SSH_USER, SSH_PRIVATE_KEY
+#   App/secret:  ANTHROPIC_API_KEY, ADAPTY_WEBHOOK_SECRET, ADAPTY_API_KEY,
+#                APNS_AUTH_KEY, APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID,
+#                POSTGRES_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD,
+#                SEED_API_KEY, APPLE_AUDIENCE, опц. SENTRY_DSN.
+#   (CI лишь прокидывает значения этих ключей; .env на сервере собирается из них —
+#    реальные значения НИКОГДА не коммитятся, docs/05 "Секреты".)
+
+name: ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Минимальные права токена (supply-chain): по умолчанию только чтение репозитория.
+permissions:
+  contents: read
+
+# Отменяем устаревшие прогоны на той же ветке/PR (экономия раннеров).
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # lint — формат + статанализ (docs/02-tech-stack: ruff format / ruff check).
+  # ---------------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup uv + Python
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          # Версия Python — из docs/02-tech-stack.md (3.12). uv ставит её сам.
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install deps (lock-файл)
+        run: uv sync --frozen
+
+      # docs/02-tech-stack.md → команды: format-check + lint. Scope — весь пакет
+      # по канонической команде; --check не переформатирует (только проверка).
+      - name: ruff format (check)
+        run: uv run ruff format --check .
+
+      - name: ruff check
+        run: uv run ruff check .
+
+  # ---------------------------------------------------------------------------
+  # type-check — mypy app (docs/02-tech-stack: "Type-check | mypy app").
+  # ---------------------------------------------------------------------------
+  type-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup uv + Python
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install deps (lock-файл)
+        run: uv sync --frozen
+
+      - name: mypy
+        run: uv run mypy app
+
+  # ---------------------------------------------------------------------------
+  # test — pytest на реальных Postgres + Redis (docs/06-testing-strategy.md:
+  # integration с реальными Postgres+Redis из compose; здесь — GH Actions
+  # services). Alembic upgrade перед pytest (миграции до тестов — как migrate-гейт).
+  # Coverage gate — docs/02-tech-stack.md: pytest --cov=app --cov-fail-under=80.
+  # ---------------------------------------------------------------------------
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      # ЭФЕМЕРНЫЙ Postgres CI-раннера (только для прогона pytest). Это НЕ prod-
+      # секрет: контейнер живёт внутри job, недостижим извне, уничтожается после.
+      # Пароль фиксированный тестовый (совпадает с тестовым DSN ниже); prod-пароль
+      # приходит из GitHub Secret POSTGRES_PASSWORD и здесь НЕ используется.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: lovable
+          POSTGRES_PASSWORD: lovable
+          POSTGRES_DB: lovable
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lovable -d lovable"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+
+    env:
+      # Тестовое окружение: DSN к service-контейнерам (host-mapped порты).
+      # Имена ключей — КАНОНИЧЕСКИЕ (docs/07 env-контракт), символ-в-символ.
+      ENVIRONMENT: test
+      DATABASE_URL: postgresql+asyncpg://lovable:lovable@localhost:5432/lovable
+      DATABASE_URL_SYNC: postgresql+psycopg://lovable:lovable@localhost:5432/lovable
+      REDIS_URL: redis://localhost:6379/0
+      CELERY_BROKER_URL: redis://localhost:6379/0
+      CELERY_RESULT_BACKEND: redis://localhost:6379/1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup uv + Python
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install deps (lock-файл)
+        run: uv sync --frozen
+
+      # Миграции до тестов (docs/06: integration с реальной схемой; migrate-гейт).
+      - name: alembic upgrade head
+        run: uv run alembic upgrade head
+
+      - name: pytest (+ coverage gate 80%)
+        run: uv run pytest --cov=app --cov-fail-under=80
+
+  # ---------------------------------------------------------------------------
+  # deploy — ТОЛЬКО на зелёном (needs: [lint, type-check, test]) и ТОЛЬКО на
+  # push в main (не на PR). SSH -> /opt/corelysite -> git pull -> compose up
+  # (docs/07 стр. 242, ADR-018). Чужие /opt/music-backend, /opt/edge не трогаются.
+  #
+  # Идемпотентность: повторный прогон безопасен (git pull + compose up -d --build —
+  # пересборка изменённых образов, рестарт только изменившихся контейнеров; migrate
+  # one-shot гейт alembic upgrade head — idempotent). Rollback — см. infra/README.md
+  # (git checkout предыдущего тега/SHA на сервере + повторный compose up).
+  # ---------------------------------------------------------------------------
+  deploy:
+    needs: [lint, type-check, test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # GitHub Environment 'production' — точка для required reviewers / branch
+    # protection (prod деплоится только из main; ручной approve настраивается в
+    # настройках Environment на GitHub). docs/07 devops-чеклист: prod из main.
+    environment: production
+
+    steps:
+      # SSH-деплой через запиненный appleboy/ssh-action. Приватный ключ —
+      # ТОЛЬКО из GitHub Secrets (SSH_PRIVATE_KEY); публичный — в authorized_keys
+      # deploy-пользователя на сервере (провизия владельца, не в git; docs/05 Секреты).
+      - name: Deploy over SSH (compose up on /opt/corelysite)
+        uses: appleboy/ssh-action@2ead5e36573f08b82fbfce1504f1a4b05a647c6f # v1.2.2
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # set -e: любой шаг падает -> деплой падает (не «частично применился»).
+          # Чужие каталоги /opt/music-backend, /opt/edge НЕ трогаются — работаем
+          # строго в /opt/corelysite (ADR-018: изоляция от чужих сервисов).
+          # migrate-сервис (alembic upgrade head) — гейт ВНУТРИ compose up:
+          # depends_on api/worker/beat ждут service_completed_successfully migrate,
+          # т.е. миграции применяются ДО старта нового кода приложения.
+          script: |
+            set -e
+            cd /opt/corelysite
+            git pull --ff-only
+            docker compose -f infra/docker-compose.prod.yml up -d --build
+            docker compose -f infra/docker-compose.prod.yml ps

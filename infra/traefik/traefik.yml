@@ -1,0 +1,93 @@
+# Traefik v3 — статическая конфигурация (dev).
+# Источник истины: docs/07-deployment.md ("Traefik"), docs/01-architecture.md,
+# docs/02-tech-stack.md (Traefik v3.x).
+#
+# Принципы:
+#   - Docker-провайдер: route сайта подхватывается по лейблам при `docker run`
+#     без рестарта (docs/07-deployment.md строка 42).
+#   - exposedByDefault=false — наружу выходит только то, что явно помечено
+#     traefik.enable=true (security: минимизация открытых поверхностей).
+#   - entrypoints web (:80) и websecure (:443).
+#   - dashboard включён ТОЛЬКО в dev (api.insecure=true) — НЕ для prod.
+#
+# TLS *.apps.domain (wildcard) — способ выпуска открыт, Q-DEPLOY-2 (Sprint 4).
+# В dev сайты отдаются по http на *.apps.localhost; api — по http и (опц.)
+# self-signed https. Реальные ACME-резолверы добавляются в prod-конфиге.
+
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+# --- Точки входа ---
+entryPoints:
+  web:
+    address: ":80"
+    # В prod здесь будет redirect web -> websecure. В dev оставляем http,
+    # чтобы *.apps.localhost работали без локального CA (TLS — Q-DEPLOY-2).
+  websecure:
+    address: ":443"
+
+# --- Провайдеры ---
+providers:
+  docker:
+    # Socket монтируется read-only (docs/07-deployment.md строка 19).
+    endpoint: "unix:///var/run/docker.sock"
+    # Route только для контейнеров с явным traefik.enable=true.
+    exposedByDefault: false
+    # Сеть, в которой Traefik общается с сайт-контейнерами и api.
+    network: lovable_traefik
+    # Подхватываем динамические сайт-роуты, появляющиеся при `docker run`.
+    watch: true
+  file:
+    # Статически-объявленные dynamic-конфиги (TLS options, middlewares).
+    directory: /etc/traefik/dynamic
+    watch: true
+
+# --- API / dashboard ---
+# DEV ONLY. insecure-режим открывает дашборд на :8080 без auth.
+# В prod дашборд закрывается auth-middleware или вовсе выключается.
+api:
+  dashboard: true
+  insecure: true
+
+# --- Логи ---
+log:
+  level: INFO
+accessLog: {}
+
+# --- Health / ping ---
+ping:
+  entryPoint: web
+
+# =============================================================================
+# certresolvers — ЗАГОТОВКА (Sprint 4, DEFERRED, Q-DEPLOY-2). НЕ активны в dev.
+# Источник истины: docs/05-security.md → "Целевая модель wildcard TLS".
+#
+# В dev резолверов нет (http, *.apps.localhost без TLS-verify). Блок ниже —
+# конфиг-заготовка целевой модели; активируется при появлении прод-домена
+# (см. infra/traefik/dynamic/tls-wildcard.yml → "АКТИВАЦИЯ"). Provider abstract:
+# конкретный DNS-провайдер выбирается при выборе домена (env TLS_DNS_PROVIDER).
+# =============================================================================
+# certificatesResolvers:
+#   # api.{domain} — стандартный серт через HTTP-01 (docs/05-security.md → TLS).
+#   letsencrypt:
+#     acme:
+#       email: "${TLS_ACME_EMAIL}"
+#       storage: /letsencrypt/acme.json
+#       httpChallenge:
+#         entryPoint: web
+#   # *.apps.{domain} — wildcard ТОЛЬКО через ACME DNS-01 (единственный способ
+#   # для wildcard; per-subdomain HTTP-01 отвергнут — rate-limit Let's Encrypt).
+#   apps-wildcard:
+#     acme:
+#       email: "${TLS_ACME_EMAIL}"
+#       storage: /letsencrypt/acme-wildcard.json
+#       dnsChallenge:
+#         # Provider ABSTRACT до выбора домена/DNS-провайдера (lego-код).
+#         provider: "${TLS_DNS_PROVIDER}"
+#         # Токен DNS-провайдера — секрет (env, encrypted-at-rest, secret manager):
+#         #   DNS_PROVIDER_TOKEN передаётся как env-переменная провайдера lego
+#         #   (имя env зависит от провайдера, напр. CF_DNS_API_TOKEN для cloudflare).
+#         resolvers:
+#           - "1.1.1.1:53"
+#           - "8.8.8.8:53"

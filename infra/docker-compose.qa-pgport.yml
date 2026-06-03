@@ -1,0 +1,25 @@
+# QA-only override: ONLY remap Postgres host port (host has a Postgres on 5432).
+# No api/prometheus workarounds — DEFECT 2 (prometheus multiproc) and DEFECT 3
+# (Traefik api router) are fixed in code, so api is reached via Traefik api.localhost
+# as-documented. Internal compose networking (postgres:5432) is unchanged.
+name: lovable
+
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:55432:5432"
+
+# QA-only: the base compose pins build_egress to 172.31.0.0/16 (synced with the
+# squid build_clients acl). On this host an unrelated stack (bizdev-bot_default)
+# already holds 172.31.0.0/16, so the network fails to create. No build container
+# runs in this QA pass (generation skipped, no ANTHROPIC key) -> squid's
+# build_clients acl is never exercised; relocating the subnet to a free /16 only
+# unblocks network creation and does not change any tested behavior.
+networks:
+  build_egress:
+    name: lovable_build_egress
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.16.0.0/16

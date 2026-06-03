@@ -1,0 +1,55 @@
+{
+  "uid": "lovable-apns",
+  "title": "APNs",
+  "tags": ["lovable", "apns", "notify", "sprint6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Push outcome by result (lovable_apns_push_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (result) (rate(lovable_apns_push_total[5m]))", "legendFormat": "{{result}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Push by Apple status (lovable_apns_push_total{apns_status})",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (apns_status) (rate(lovable_apns_push_total[5m]))", "legendFormat": "{{apns_status}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Tokens invalidated (lovable_apns_tokens_invalidated_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (reason) (rate(lovable_apns_tokens_invalidated_total[5m]))", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "APNs request latency p95 (lovable_apns_request_latency_seconds)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(lovable_apns_request_latency_seconds_bucket[5m])))", "legendFormat": "p95" }
+      ]
+    }
+  ]
+}

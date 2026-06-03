@@ -1,0 +1,555 @@
+# docker-compose.prod.yml — PROD-стек Lovable-AI (shared edge-Traefik, corelysite.shop).
+#
+# Источник истины:
+#   - docs/adr/ADR-018-prod-deployment-shared-traefik-cicd.md (нормативный контракт)
+#   - docs/07-deployment.md → "Prod-модель: shared Traefik (corelysite.shop, ADR-018)"
+#     + "Контракт docker-compose.prod.yml" (стр. 224-231)
+#   - docs/05-security.md → "Prod: общий edge-Traefik (доверие)", "Секреты"
+#   - docs/02-tech-stack.md → "CI/CD-платформа (prod-deploy, ADR-018)"
+#
+# ВНЕШНИЕ ТРЕБОВАНИЯ СРЕДЫ (источник истины prod, ADR-018 Context):
+#   - Общий Linux-сервер (Ubuntu 22.04): чужой music-backend + общий edge-Traefik,
+#     держащий 80/443, терминирующий TLS и выпускающий Let's Encrypt САМ.
+#   - Наш сервис встраивается БЕЗ занятия 80/443 и БЕЗ своего nginx/SSL/ACME.
+#   - НЕ публиковать порты наружу; только expose внутреннего порта uvicorn.
+#   - Подключить api к ВНЕШНЕЙ docker-сети `web` (external: true, уже создана
+#     владельцем сервера). Маршрут — через docker-labels; общий Traefik подхватит.
+#   - Каталог сервиса /opt/corelysite. Чужие /opt/music-backend, /opt/edge не трогать.
+#   - Домен API: corelysite.shop.
+#
+# Запуск (на prod-сервере, выполняет CI deploy-job по SSH):
+#   cd /opt/corelysite && git pull && \
+#     docker compose -f infra/docker-compose.prod.yml up -d --build
+#
+# ВАЛИДАЦИЯ: `docker compose -f infra/docker-compose.prod.yml config` ВНЕ
+# prod-сервера может падать на отсутствии внешней сети `web` (external: true ->
+# compose её не создаёт; она существует только на prod-сервере). Это КОРРЕКТНОЕ
+# поведение (ADR-018 Consequences): отсутствие `web` -> деплой падает, а не
+# "настроится по дефолту". Для локальной проверки структуры можно временно
+# создать сеть: `docker network create web`.
+#
+# Переменные окружения — из .env (см. .env.prod.example). РЕАЛЬНЫЕ СЕКРЕТЫ
+# в репозиторий НЕ коммитятся (docs/05-security.md → Секреты); на prod-сервере
+# .env провижится из GitHub Secrets / secret-manager (encrypted-at-rest).
+#
+# Сети:
+#   - web      — ВНЕШНЯЯ (external: true), общего edge-Traefik. Сюда подключены
+#                api (для router-labels) и worker (чтобы создавать сайт-контейнеры
+#                в этой же сети — общий Traefik их видит, TRAEFIK_NETWORK=web).
+#                Postgres/Redis/MinIO в `web` НЕ входят (внутренний трафик).
+#   - default  — внутренняя: api/worker/beat <-> postgres/redis/minio. Наружу
+#                не выходит, портов наружу не публикует.
+#
+# Тома: pgdata (Postgres), minio-data (MinIO).
+#
+# ОТЛИЧИЯ ОТ docker-compose.dev.yml (dev-инвариант НЕ ломается — dev-compose
+# остаётся для dev): нет своего traefik-сервиса (используется чужой edge);
+# нет своего ACME/SSL; api на expose (не ports 80/443); router rule
+# Host(corelysite.shop)+websecure (dev: Host(api.${API_DOMAIN})+web); сеть web
+# external (dev: своя lovable_traefik); prod-env (ENVIRONMENT=prod,
+# APPS_DOMAIN=corelysite.shop, TRAEFIK_NETWORK=web, SITE_ROUTING_MODE=path).
+#
+# OBSERVABILITY (prometheus/grafana): в этом prod-compose НЕ разворачиваются —
+# основной фокус ADR-018 = API+worker+БД на shared-сервере без конфликта 80/443.
+# /metrics всё равно экспонируется (api GET /metrics internal; worker/beat на
+# METRICS_PORT, expose без host-bind) — scrape опционален и может вестись внешним
+# Prometheus владельца/отдельным стеком (docs/07 "Правило конфиг-артефакта:
+# Prometheus/Grafana": в проде observability-стек опционален; pull-модель). Если
+# нужны на этом хосте — добавляются отдельным compose-файлом с bind ТОЛЬКО на
+# 127.0.0.1 (как в dev), чтобы не занимать публичные порты shared-сервера.
+
+name: corelysite
+
+#
+# x-app-env: КАНОНИЧЕСКИЙ контракт env-ключей приложения (PROD-значения).
+# Источник истины имён — docs/07-deployment.md → "Канонический список ключей".
+# Settings(extra="ignore") молча глотает несовпадающие имена -> имена ниже
+# обязаны совпадать символ-в-символ с полями Settings (upper-case).
+# PROD-ОТЛИЧИЯ от dev (docs/07 стр. 231, ADR-018):
+#   ENVIRONMENT=prod, APPS_DOMAIN=corelysite.shop, TRAEFIK_NETWORK=web,
+#   SITE_ROUTING_MODE=path.
+# СЕКРЕТЫ приходят из .env (на prod-сервере провижатся из GitHub Secrets /
+# secret-manager); в .env.prod.example — только плейсхолдеры.
+#
+x-app-env: &app-env
+  # --- Окружение (PROD) ---
+  # ENVIRONMENT=prod -> is_prod: TLS-verify on, S3-endpoint к AWS при пустом
+  # S3_ENDPOINT_URL и пр. (docs/07 env-контракт, поле environment).
+  ENVIRONMENT: prod
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # --- Postgres DSN (async, asyncpg) — поле database_url ---
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  # --- Sync DSN для Alembic (миграции) — НЕ поле Settings, читает alembic ---
+  DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  # --- Redis (брокер Celery + result backend + pub/sub) — поле redis_url ---
+  REDIS_URL: redis://redis:6379/0
+  # CELERY_* — НЕ поля Settings, читает celery напрямую (extra=ignore их глотает).
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  # --- S3 / MinIO (канонические имена; НЕ S3_ACCESS_KEY_ID / три бакета) ---
+  # В этом prod-стеке S3 = self-hosted MinIO (сервис ниже). При переезде на AWS S3
+  # (docs/07: "в проде на AWS S3 — S3_ENDPOINT_URL пусто/None") убрать сервис minio,
+  # очистить S3_ENDPOINT_URL и задать реальные S3_ACCESS_KEY/S3_SECRET_KEY/S3_REGION.
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  S3_BUCKET: ${S3_BUCKET:-lovable-artifacts}
+  # Self-hosted MinIO по http в internal-сети -> false. На AWS S3 -> true.
+  S3_USE_SSL: ${S3_USE_SSL:-false}
+  # --- LLM ---
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # --- Auth ---
+  SEED_API_KEY: ${SEED_API_KEY}
+  # Apple Sign in (Sprint 3) — ожидаемый aud identity token (bundle/Services ID).
+  APPLE_AUDIENCE: ${APPLE_AUDIENCE:-mba.gipsy.lovable}
+  # --- Деплой сайтов / роутинг (PROD: path-based на corelysite.shop) ---
+  # docs/07 стр. 231 + ADR-018: prod = path-based, домен corelysite.shop,
+  # сайт-контейнеры в сети web (общий Traefik видит их).
+  APPS_DOMAIN: ${APPS_DOMAIN:-corelysite.shop}
+  # PROD: path-based routing (ADR-017): сайты на {APPS_DOMAIN}/s/{site_id}
+  # + PathPrefix+StripPrefix + Vite --base. backend ветвит labels/live_url по
+  # этому ключу.
+  SITE_ROUTING_MODE: ${SITE_ROUTING_MODE:-path}
+  # PROD: docker-сеть, в которой общий edge-Traefik видит сайт-контейнеры = web
+  # (внешняя сеть, external: true). worker подключает сайт-контейнеры к ней.
+  TRAEFIK_NETWORK: ${TRAEFIK_NETWORK:-web}
+  NGINX_IMAGE: ${NGINX_IMAGE:-nginx:alpine}
+  SITES_HOST_ROOT: ${SITES_HOST_ROOT:-/srv/sites}
+  BUILDS_ROOT: ${BUILDS_ROOT:-/var/builds}
+  # --- Sprint 2: Fixer loop + resilience (дефолты — docs/07 env-контракт) ---
+  AGENT4_MODEL: ${AGENT4_MODEL:-claude-sonnet-4-6}
+  MAX_FIX_ATTEMPTS: ${MAX_FIX_ATTEMPTS:-3}
+  JOB_BUDGET_USD: ${JOB_BUDGET_USD:-5.0000}
+  USER_MONTHLY_BUDGET_USD: ${USER_MONTHLY_BUDGET_USD:-50.0000}
+  JOB_WALL_CLOCK_BUDGET_S: ${JOB_WALL_CLOCK_BUDGET_S:-3600}
+  FIXER_LOG_TAIL_BYTES: ${FIXER_LOG_TAIL_BYTES:-32768}
+  CLARIFICATION_TTL_S: ${CLARIFICATION_TTL_S:-604800}
+  CLARIFICATION_SWEEP_INTERVAL_S: ${CLARIFICATION_SWEEP_INTERVAL_S:-600}
+  STUCK_THRESHOLD_S: ${STUCK_THRESHOLD_S:-900}
+  RECONCILE_INTERVAL_S: ${RECONCILE_INTERVAL_S:-120}
+  # --- Sprint 3.5: Billing / Adapty ---
+  # СЕКРЕТЫ: ADAPTY_WEBHOOK_SECRET / ADAPTY_API_KEY из .env (плейсхолдеры в
+  # .env.prod.example), реальные значения НЕ коммитятся.
+  ADAPTY_WEBHOOK_SECRET: ${ADAPTY_WEBHOOK_SECRET}
+  ADAPTY_API_KEY: ${ADAPTY_API_KEY}
+  ADAPTY_API_BASE: ${ADAPTY_API_BASE:-https://api.adapty.io/api/v2}
+  BILLING_RESYNC_INTERVAL_S: ${BILLING_RESYNC_INTERVAL_S:-3600}
+  GRACE_PERIOD_DAYS: ${GRACE_PERIOD_DAYS:-7}
+  SUBSCRIPTION_SWEEP_INTERVAL_S: ${SUBSCRIPTION_SWEEP_INTERVAL_S:-3600}
+  # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
+  BUILD_SANDBOX_RUNTIME: ${BUILD_SANDBOX_RUNTIME:-rootless}
+  # PROD: build-контейнеры по-прежнему в изолированной egress-сети build-воркера
+  # (rootless+egress, ADR-010). Это НЕ сеть web — build-песочница недоверенного
+  # кода lockdown'ится отдельно (docs/05 "Граница egress-политики").
+  BUILD_EGRESS_NETWORK: ${BUILD_EGRESS_NETWORK:-corelysite_build_egress}
+  NPM_REGISTRY_ALLOWLIST: ${NPM_REGISTRY_ALLOWLIST:-registry.npmjs.org}
+  BUILD_EGRESS_PROXY_URL: ${BUILD_EGRESS_PROXY_URL:-http://egress-proxy:3128}
+  BUILD_CPU_LIMIT: ${BUILD_CPU_LIMIT:-2}
+  BUILD_MEM_LIMIT: ${BUILD_MEM_LIMIT:-2g}
+  BUILD_PIDS_LIMIT: ${BUILD_PIDS_LIMIT:-512}
+  BUILD_TIMEOUT_S: ${BUILD_TIMEOUT_S:-600}
+  # Дефолт пуст -> build-код НЕ передаёт --security-opt seccomp (встроенный Docker
+  # default seccomp активен). Непустой путь -> devops провижит JSON на build-хосте.
+  BUILD_SECCOMP_PROFILE: ${BUILD_SECCOMP_PROFILE:-}
+  GC_QUEUE: ${GC_QUEUE:-build}
+  GC_S3_BATCH_SIZE: ${GC_S3_BATCH_SIZE:-1000}
+  # --- Sprint 5: Realtime (SSE) & push (APNs) — ADR-012 / ADR-013 ---
+  SSE_HEARTBEAT_S: ${SSE_HEARTBEAT_S:-15}
+  SSE_RETRY_MS: ${SSE_RETRY_MS:-3000}
+  SSE_MAX_STREAMS_PER_KEY: ${SSE_MAX_STREAMS_PER_KEY:-5}
+  # APNs: APNS_KEY_ID/APNS_TEAM_ID/APNS_BUNDLE_ID + .p8 — внешняя зависимость
+  # пользователя (Apple Developer). Без credentials notify.apns_push — no-op.
+  # PROD по умолчанию = production-хост (api.push.apple.com).
+  APNS_ENV: ${APNS_ENV:-production}
+  APNS_KEY_ID: ${APNS_KEY_ID:-}
+  APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+  APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-mba.gipsy.lovable}
+  # СЕКРЕТ (SecretStr): содержимое .p8 PEM-строкой. Если задан — приоритетнее
+  # APNS_AUTH_KEY_PATH. РЕАЛЬНОЕ значение НЕ коммитится.
+  APNS_AUTH_KEY: ${APNS_AUTH_KEY:-}
+  # Путь к .p8 ВНУТРИ worker-контейнера (если APNS_AUTH_KEY пуст). Файл провижит
+  # devops/secret-mount (см. volume worker ниже). В git НЕ коммитится.
+  APNS_AUTH_KEY_PATH: ${APNS_AUTH_KEY_PATH:-/secrets/apns/AuthKey.p8}
+  APNS_JWT_TTL_S: ${APNS_JWT_TTL_S:-2400}
+  # --- Sprint 6: Observability (ADR-015) + scale (ADR-016) ---
+  # СЕКРЕТ (SecretStr|None): DSN Sentry. Пусто -> Sentry-init no-op. НЕ коммитится.
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.05}
+  # В проде по умолчанию тег = prod (иначе берётся ENVIRONMENT=prod).
+  SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-prod}
+  METRICS_PORT: ${METRICS_PORT:-9100}
+  # Масштаб репликами контейнера (один процесс на реплику) -> multiproc НЕ нужен.
+  PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-}
+  PROMETHEUS_SCRAPE_INTERVAL_S: ${PROMETHEUS_SCRAPE_INTERVAL_S:-15}
+  REDIS_POOL_MAX_CONNECTIONS: ${REDIS_POOL_MAX_CONNECTIONS:-50}
+  REDIS_POOL_TIMEOUT_S: ${REDIS_POOL_TIMEOUT_S:-5.0}
+  BILLING_RESYNC_BATCH_SIZE: ${BILLING_RESYNC_BATCH_SIZE:-200}
+
+services:
+  # ----------------------------------------------------------------------------
+  # Postgres 16 — system of record (docs/03-data-model.md).
+  # PROD: ТОЛЬКО в default (internal), БЕЗ ports наружу (docs/07 стр. 227,
+  # docs/05 "Prod: общий edge-Traefik": внутренний трафик не публикуется).
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # Redis 7 — брокер Celery + result backend + pub/sub + счётчики.
+  # PROD: ТОЛЬКО в default, БЕЗ ports наружу.
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # MinIO — S3-совместимое хранилище. PROD: ТОЛЬКО в default, БЕЗ ports наружу.
+  # (При переезде на AWS S3 этот сервис и minio-setup удаляются, S3_ENDPOINT_URL
+  #  очищается — docs/02-tech-stack.md: "в прод — S3 или MinIO-кластер".)
+  # ----------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # minio-setup — одноразовое создание ЕДИНОГО бакета (idempotent), затем выходит.
+  # ----------------------------------------------------------------------------
+  minio-setup:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-lovable-artifacts}
+    networks:
+      - default
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb --ignore-existing local/$$S3_BUCKET;
+      echo 'minio-setup: bucket ready';
+      "
+    restart: "no"
+
+  # ----------------------------------------------------------------------------
+  # migrate — Alembic upgrade head. ГЕЙТ перед стартом api/worker/beat
+  # (docs devops-чеклист: migrations runs до старта нового кода). One-shot.
+  # ----------------------------------------------------------------------------
+  migrate:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    image: corelysite-api:prod
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  # ----------------------------------------------------------------------------
+  # api — FastAPI (uvicorn app.api.main:app, порт 8000 — Dockerfile.api EXPOSE).
+  #
+  # PROD-контракт (docs/07 стр. 226, ADR-018):
+  #   - expose: [8000] (НЕ ports: 80/443 — не публикуем наружу).
+  #   - сети: web (external) + default.
+  #   - labels: traefik.enable=true; router rule Host(corelysite.shop);
+  #     entrypoints=websecure; loadbalancer.server.port=8000.
+  #   - traefik.docker.network=web -> Traefik берёт IP api в сети web.
+  #   - БЕЗ своего ACME/SSL (общий edge-Traefik терминирует TLS и выпускает LE).
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    image: corelysite-api:prod
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - web
+      - default
+    # НЕ ports: — порты наружу НЕ публикуются (ADR-018: только expose). Внешний
+    # доступ — исключительно через router-labels общего edge-Traefik по сети web.
+    expose:
+      - "8000"
+    labels:
+      - "traefik.enable=true"
+      # Traefik берёт IP контейнера в сети web (общий edge-Traefik подключён к web).
+      - "traefik.docker.network=web"
+      # PROD router: Host(corelysite.shop) на websecure (docs/07 стр. 226, ADR-018).
+      - "traefik.http.routers.corelysite-api.rule=Host(`corelysite.shop`)"
+      - "traefik.http.routers.corelysite-api.entrypoints=websecure"
+      # TLS-терминацию и ACME (Let's Encrypt для corelysite.shop) несёт ОБЩИЙ
+      # edge-Traefik владельца: его websecure-entrypoint уже терминирует TLS.
+      # Поэтому НЕ навешиваем ни router-level tls=true, ни certresolver — это
+      # поле чужого edge (требование владельца, docs/07 §Prod-модель, ADR-018).
+      # Router-level tls=true без certresolver на общем edge может дать self-signed
+      # серт вместо ожидаемого Let's Encrypt. Нормативный набор лейблов — без них.
+      # Бэкенд-порт uvicorn (Dockerfile.api EXPOSE 8000).
+      - "traefik.http.services.corelysite-api.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # egress-proxy — forward-proxy build-песочницы (Sprint 4, ADR-010 §C).
+  # PROD: build-песочница недоверенного LLM-кода lockdown'ится egress-allowlist
+  # (только npm-registry). Это ОТДЕЛЬНАЯ граница от сети web (docs/05 "Граница
+  # egress-политики": lockdown ТОЛЬКО на build-песочнице, не на app/worker/beat).
+  # Наружу порт НЕ публикуется — доступен только из build_egress по имени
+  # egress-proxy:3128.
+  # ----------------------------------------------------------------------------
+  egress-proxy:
+    # Pinned Canonical squid (squid 6.x, Ubuntu 24.04). Тег `_stable` удалён из
+    # Docker Hub (Canonical отказался от stable-канала ubuntu/squid) -> перешли на
+    # `_edge` той же ветки 6.6-24.04 (pinned, НЕ latest/edge floating; squid 6.14).
+    # squid.conf приведён к совместимости с squid 6.13+ (убран dns_v4_first,
+    # дедуплицирован dstdomain). Логи — в штатные /var/log/squid/* (writable для
+    # user proxy), форвард в docker logs делает entrypoint образа (tail -F);
+    # healthcheck — реальная listen-проба 3128 (ниже), а не `squid -k parse`.
+    image: ubuntu/squid:6.6-24.04_edge
+    volumes:
+      - ./egress-proxy/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      - build_egress
+      - egress_uplink
+    # Healthcheck — РЕАЛЬНАЯ проверка запущенного процесса, а не синтаксиса
+    # конфига (как в dev). Прежний `squid -k parse` был ложно-зелёным: контейнер
+    # мог крэшить в цикле, оставаясь "healthy", и впустую разблокировал worker
+    # (depends_on egress-proxy: service_healthy). Теперь healthy ⇔ squid жив
+    # (pidof) И слушает 3128. Образ ubuntu/squid не содержит nc/ss/curl/
+    # squidclient -> listen-probe встроенным bash /dev/tcp. /dev/tcp — фича bash,
+    # не POSIX sh, поэтому проба через `bash -c` (CMD, не CMD-SHELL).
+    healthcheck:
+      test: ["CMD", "bash", "-c", "pidof squid >/dev/null 2>&1 && (echo > /dev/tcp/127.0.0.1/3128) >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # worker — Celery (queue=llm + queue=build).
+  #
+  # PROD (docs/07 стр. 228, ADR-018):
+  #   - сети: default (БД/Redis/MinIO) + web (чтобы СОЗДАВАТЬ сайт-контейнеры в
+  #     сети web — общий Traefik их видит, TRAEFIK_NETWORK=web) + build_egress
+  #     (создаёт build-контейнеры недоверенного кода в изолированной egress-сети).
+  #   - rootless Docker + egress-build-изоляция СОХРАНЕНА (ADR-010): build-воркер
+  #     обращается к ROOTLESS Docker-демону (ROOTLESS_DOCKER_SOCK), build-контейнеры
+  #     запускаются с cap-drop ALL / no-new-privileges / read-only / non-root UID /
+  #     seccomp / cpu·mem·pids лимитами / wall-clock timeout + egress-allowlist
+  #     (docs/05 "Конфигурация запуска build-контейнера", ADR-010 §B). На prod
+  #     rootless Docker — требование ADR-010/Q-INFRA-1 (выделенные build-хосты).
+  #   - Сайт-контейнеры (nginx) воркер деплоит в сеть web (TRAEFIK_NETWORK=web) с
+  #     PathPrefix(/s/{site_id})+StripPrefix-labels (ADR-017); worker имеет доступ
+  #     к docker.sock (rootless) и к сети web -> создаёт их корректно.
+  #
+  # ПРОД-ТОПОЛОГИЯ роста (ADR-016, docs/07 Прод-топология): при масштабе -Q llm и
+  # -Q build разносятся на разные worker-пулы/хосты. Здесь (shared single-host
+  # prod, ADR-018) — один worker на обе очереди, как стартовая конфигурация.
+  # Ручной scale: docker compose -f infra/docker-compose.prod.yml up -d --scale worker=N.
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+      args:
+        DOCKER_GID: ${DOCKER_GID:-999}
+    image: corelysite-worker:prod
+    environment:
+      <<: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      egress-proxy:
+        condition: service_healthy
+    networks:
+      - default
+      # web — чтобы worker создавал nginx-сайт-контейнеры в сети web (общий
+      # Traefik их видит) и дотягивался до них для health-check live_url.
+      - web
+      # build_egress — создаёт build-контейнеры недоверенного кода в изолированной
+      # egress-allowlist сети (ADR-010 §C). Отдельная граница от web (docs/05).
+      - build_egress
+    volumes:
+      # Sprint 4 (ADR-010, TD-001): rootless Docker-демон. ROOTLESS_DOCKER_SOCK —
+      # путь rootless-сокета на prod build-хосте (в $XDG_RUNTIME_DIR
+      # непривилегированного пользователя). НЕ привилегированный системный
+      # /var/run/docker.sock -> компрометация воркера не даёт root на хосте.
+      - ${ROOTLESS_DOCKER_SOCK}:/var/run/docker.sock
+      # Sprint 5 (ADR-013): secret-mount КАТАЛОГА с APNs .p8 (read-only). Файл
+      # провижит devops/пользователь (Apple Developer AuthKey.p8); в git НЕ
+      # коммитится. Нет файла + APNS_AUTH_KEY пуст -> notify.apns_push no-op.
+      - ${APNS_AUTH_KEY_HOST_PATH:-./secrets/apns}:/secrets/apns:ro
+    command:
+      - "celery"
+      - "-A"
+      - "app.workers.celery_app"
+      - "worker"
+      - "-Q"
+      - "llm,build"
+      - "--loglevel=INFO"
+      - "--concurrency=2"
+    # Sprint 6 (ADR-015 §1): worker экспонирует prometheus_client.start_http_server
+    # на METRICS_PORT. expose без host-bind — наружу НЕ публикуется, доступен
+    # только внутри compose-сети (scrape опционален в проде).
+    expose:
+      - "${METRICS_PORT:-9100}"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping -d celery@$$(hostname) || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # beat — Celery beat. Единственный экземпляр (docs/07 стр. 100/154).
+  # Несёт периодику: sweeper уточнений (E1), reconciler застрявших джоб (E2),
+  # billing.resync, billing.subscription_sweep (S3.5). Schedule задаёт backend
+  # в коде; интервалы/пороги beat читает из env через Settings (x-app-env).
+  # PROD: только default (БД/Redis); сайт-контейнеры не создаёт -> web не нужна.
+  # ----------------------------------------------------------------------------
+  beat:
+    image: corelysite-worker:prod
+    environment:
+      <<: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+    command:
+      - "celery"
+      - "-A"
+      - "app.workers.celery_app"
+      - "beat"
+      - "--loglevel=INFO"
+      # PersistentScheduler пишет schedule-файл; дефолт — cwd (/app), owned
+      # root:root, а процесс под non-root UID 10001 (app) -> beat крэшил
+      # `_gdbm.error [Errno 13] Permission denied: 'celerybeat-schedule'`. Пишем
+      # в writable /tmp (как в dev). Без флага не стартуют sweeper/reconciler/
+      # billing.resync/subscription_sweep.
+      - "--schedule=/tmp/celerybeat-schedule"
+    expose:
+      - "${METRICS_PORT:-9100}"
+    # HEALTHCHECK beat: SCHEDULER-liveness, НЕ worker-ping (идентично dev).
+    # `celery inspect ping` — control-команда для WORKER-узлов (consumer'ов); beat
+    # НЕ consumer и никогда не отвечает -> "No nodes replied" -> ложный unhealthy
+    # при ЖИВОМ beat (docs/07 стр. 272 "Воркеры: Celery ping" нормативна для
+    # воркеров, НЕ для beat). Проба = liveness beat-процесса по /proc/*/cmdline
+    # (образ python:3.12-slim БЕЗ pgrep/ps — только /proc+tr+grep, что в образе
+    # есть). Паттерн `celery_app .*[b]eat`: `[b]eat` исключает самосовпадение пробы
+    # и отсекает worker-cmdline (есть celery_app, нет beat). `$$f` -> compose-escape
+    # для shell-`$f`. Проверено живым прогоном (см. dev): healthy при живом beat.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'for f in /proc/[0-9]*/cmdline; do tr "\000" " " < "$$f" 2>/dev/null; echo; done | grep -q "celery_app .*[b]eat"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+networks:
+  # web — ВНЕШНЯЯ сеть общего edge-Traefik (external: true). compose её НЕ создаёт;
+  # она существует на prod-сервере (создаёт владелец). Отсутствие -> деплой падает
+  # (ADR-018 Consequences: корректное поведение, не "настроится по дефолту").
+  # Имя сети в Docker = `web` (name: web фиксирует имя без compose-префикса, чтобы
+  # совпасть с TRAEFIK_NETWORK=web, по которой worker создаёт сайт-контейнеры).
+  web:
+    external: true
+    name: web
+  # default — внутренняя сеть app<->БД/Redis/MinIO. Наружу не выходит.
+  default:
+    driver: bridge
+  # build_egress — изолированная сеть build-песочницы (ADR-010 §C). internal:true
+  # => нет выхода в интернет/внутреннюю сеть; build-контейнер сидит ТОЛЬКО в ней,
+  # единственный путь наружу — egress-proxy. Имя фиксировано и обязано совпадать
+  # с BUILD_EGRESS_NETWORK (x-app-env) символ-в-символ.
+  build_egress:
+    name: corelysite_build_egress
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/16
+  # egress_uplink — обычный bridge, даёт ТОЛЬКО egress-proxy выход к npm-registry.
+  egress_uplink:
+    name: corelysite_egress_uplink
+    driver: bridge
+
+volumes:
+  pgdata:
+  redis-data:
+  minio-data:

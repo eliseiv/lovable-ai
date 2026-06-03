@@ -1,0 +1,40 @@
+# QA-only override: remap host port bindings to avoid conflicts with other
+# local stacks (host Postgres on 5432, another Redis on 6379). Internal compose
+# networking (service names postgres:5432 / redis:6379) is unchanged — only the
+# host-published ports move. Used by QA live-E2E run; NOT a deployment artifact.
+# Traefik keeps 80/443 (free on this host). !override replaces the base ports list
+# (compose merges lists by append otherwise).
+#
+# Это ЧИСТО QA-артефакт (remap портов под локальный live-E2E), НЕ deployment-файл
+# и НЕ источник истины. Никаких defect-override'ов здесь больше нет: ранее
+# присутствовавшие обходы (PROMETHEUS_MULTIPROC_DIR: null; «api router disabled
+# из-за отсутствия secure-headers@file») сняты как УСТАРЕВШИЕ — оба дефекта
+# закрыты в каноническом infra/docker-compose.dev.yml, что подтверждено живым
+# прогоном:
+#   1) PROMETHEUS_MULTIPROC_DIR — пуст-но-присутствует в x-app-env; api при этом
+#      поднимается healthy (backend обрабатывает пустое значение defensive ->
+#      single-process режим). Override на null больше не нужен.
+#   2) secure-headers@file — middleware определён в traefik/dynamic/middlewares.yml
+#      и в живом Traefik имеет "status":"enabled"; api-router api@docker —
+#      "status":"enabled", middlewares=[secure-headers@file], rule
+#      Host(api.${API_DOMAIN}). Router работает штатно, НЕ disabled.
+name: lovable
+
+services:
+  postgres:
+    ports: !override
+      - "127.0.0.1:55432:5432"
+  redis:
+    ports: !override
+      - "127.0.0.1:56379:6379"
+  minio:
+    ports: !override
+      - "127.0.0.1:59000:9000"
+      - "127.0.0.1:59001:9001"
+  # Publish api directly on host for live-E2E probes — ТОЛЬКО QA-удобство (прямой
+  # доступ к api без DNS api.${API_DOMAIN}/Traefik в локальном прогоне). Traefik
+  # api-router при этом исправен и доступен штатно (см. шапку п.2); прямой bind
+  # здесь не «обход дефекта», а упрощение E2E-проб. Bind ТОЛЬКО на 127.0.0.1.
+  api:
+    ports:
+      - "127.0.0.1:8000:8000"

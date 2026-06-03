@@ -1,0 +1,797 @@
+# docker-compose.dev.yml — dev-стек Lovable-AI (Sprint 1, MVP happy-path).
+# Источник истины: docs/07-deployment.md, docs/01-architecture.md,
+# docs/02-tech-stack.md, docs/05-security.md.
+#
+# Запуск:  docker compose -f infra/docker-compose.dev.yml up
+# (см. docs/02-tech-stack.md → "Запуск dev-стека"; quickstart — infra/README.md)
+#
+# Переменные окружения — из .env (см. .env.example). Реальные секреты в репозиторий
+# НЕ коммитятся.
+#
+# Сети:
+#   - backend  — внутренняя: api/worker/beat <-> postgres/redis/minio. Наружу не выходит.
+#   - traefik  — для сайт-контейнеров и api: Traefik роутит сюда (lovable_traefik,
+#                имя совпадает с providers.docker.network в traefik/traefik.yml
+#                и со значением TRAEFIK_NETWORK в .env — все три ОБЯЗАНЫ совпадать,
+#                иначе Traefik не увидит сайт-контейнеры).
+#
+# Тома: pgdata (Postgres), minio-data (MinIO).
+
+name: lovable
+
+#
+# x-app-env: КАНОНИЧЕСКИЙ контракт env-ключей приложения.
+# Источник истины — docs/07-deployment.md → "Контракт переменных окружения",
+# зафиксирован 1:1 по app/core/config.py (поля Settings) и app/storage/s3.py.
+# Settings(extra="ignore") молча глотает несовпадающие имена -> имена ниже
+# обязаны совпадать символ-в-символ с полями Settings (upper-case).
+# DATABASE_URL_SYNC / CELERY_* — НЕ поля Settings; их читают alembic/celery
+# напрямую, Settings их игнорирует (extra=ignore). Это допустимо (docs стр. 65).
+#
+x-app-env: &app-env
+  # --- Окружение ---
+  ENVIRONMENT: dev
+  LOG_LEVEL: INFO
+  # --- Postgres DSN (async, asyncpg) — поле database_url ---
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  # --- Sync DSN для Alembic (миграции) — НЕ поле Settings, читает alembic ---
+  DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+  # --- Redis (брокер Celery + result backend + pub/sub) — поле redis_url ---
+  REDIS_URL: redis://redis:6379/0
+  # CELERY_* — НЕ поля Settings, читает celery напрямую (extra=ignore их глотает).
+  CELERY_BROKER_URL: redis://redis:6379/0
+  CELERY_RESULT_BACKEND: redis://redis:6379/1
+  # --- S3 / MinIO (канонические имена; НЕ S3_ACCESS_KEY_ID / три бакета) ---
+  S3_ENDPOINT_URL: http://minio:9000
+  S3_REGION: ${S3_REGION}
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+  # ЕДИНЫЙ бакет; разделение артефактов — key-префиксами sources|dist|logs|specs/{job}/.
+  S3_BUCKET: ${S3_BUCKET}
+  S3_USE_SSL: "false"
+  # --- LLM ---
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # --- Auth (seeded ключ для MVP, docs/05-security.md) ---
+  SEED_API_KEY: ${SEED_API_KEY}
+  # --- Деплой сайтов ---
+  APPS_DOMAIN: ${APPS_DOMAIN}
+  # Docker-сеть, в которой Traefik видит nginx-контейнеры сайтов. ДОЛЖНА точно
+  # совпадать с реальной docker-сетью, к которой подключены и traefik, и сайты
+  # (см. networks.traefik.name ниже = lovable_traefik). НЕ SITE_NETWORK.
+  TRAEFIK_NETWORK: ${TRAEFIK_NETWORK}
+  # Образ nginx для контейнеров сайтов (docs/02-tech-stack.md). НЕ SITE_NGINX_IMAGE.
+  NGINX_IMAGE: ${NGINX_IMAGE}
+  # Хостовый каталог, монтируемый в nginx-контейнеры как dist/.
+  SITES_HOST_ROOT: ${SITES_HOST_ROOT}
+  # Эфемерный каталог распаковки/сборки на build-воркере.
+  BUILDS_ROOT: ${BUILDS_ROOT}
+  # --- Sprint 2: Fixer loop + resilience ---
+  # Канонические имена и дефолты — docs/07-deployment.md → env-контракт (стр. 46,
+  # 62-70) + docs/modules/pipeline/03-architecture.md §C/§E. Имена совпадают
+  # символ-в-символ с полями Settings (config.py). Поля Settings для части ключей
+  # добавляет backend (config.py пока несёт только job_budget_usd /
+  # user_monthly_budget_usd / max_fix_attempts; остальные — зависимость backend,
+  # до их появления Settings(extra=ignore) их игнорирует, но имена уже канонические).
+  # Beat-сервис наследует этот же x-app-env -> sweeper/reconciler-задачи (celery
+  # beat schedule, регистрируется backend в app.workers.celery_app) читают
+  # интервалы/пороги через Settings. Расписание здесь НЕ дублируется CLI-флагами,
+  # чтобы не конфликтовать с кодовым schedule (docs §E: оба job'а в celery beat).
+  # Agent 4 (Fixer) tiering-модель; отладка дороже генерации -> default Opus.
+  AGENT4_MODEL: claude-opus-4-8
+  # Гард (a): hard cap глубины fix-loop (§C).
+  MAX_FIX_ATTEMPTS: "3"
+  # Гард (b): cost cap джобы, USD numeric-строкой (§C).
+  JOB_BUDGET_USD: "5.0000"
+  # Технический потолок Claude-затрат юзера/мес, USD numeric-строкой.
+  USER_MONTHLY_BUDGET_USD: "50.0000"
+  # Гард (c): wall-clock cap джобы, секунды (§C). 3600 = 1 ч.
+  JOB_WALL_CLOCK_BUDGET_S: "3600"
+  # Сколько байт хвоста failure_log подаётся Agent 4 (контроль токенов, §F). 32 KiB.
+  FIXER_LOG_TAIL_BYTES: "32768"
+  # TTL джобы в AWAITING_CLARIFICATION до FAILED(clarification_timeout) (§E1). 7 дней.
+  CLARIFICATION_TTL_S: "604800"
+  # Частота beat-sweeper'а уточнений, секунды (§E1).
+  CLARIFICATION_SWEEP_INTERVAL_S: "600"
+  # Порог "зависания" джобы в BUILDING/DEPLOYING/FIXING для reconciler'а, секунды (§E2). 15 мин.
+  STUCK_THRESHOLD_S: "900"
+  # Частота beat-reconciler'а застрявших джоб, секунды (§E2).
+  RECONCILE_INTERVAL_S: "120"
+  # --- Sprint 3.5: Billing / Adapty ---
+  # Канонические имена и дефолты — docs/07-deployment.md → env-контракт (стр. 74-79).
+  # Имена совпадают символ-в-символ с полями Settings (config.py). Поля Settings
+  # (adapty_webhook_secret / adapty_api_key / adapty_api_base / billing_resync_interval_s
+  # / grace_period_days / subscription_sweep_interval_s) добавляет backend при
+  # реализации S3.5 — до их появления Settings(extra=ignore) их игнорирует, имена
+  # уже канонические (devops-reviewer проверяет символ-в-символ).
+  # СЕКРЕТЫ: ADAPTY_WEBHOOK_SECRET / ADAPTY_API_KEY приходят из .env (плейсхолдеры
+  # в .env.example), реальные значения в репозиторий НЕ коммитятся (docs/05-security.md).
+  # Секрет/ключ верификации подписи вебхука Adapty (POST /v1/billing/webhook/adapty,
+  # S2S, не Bearer; невалидно -> 401). Потребитель: api.
+  ADAPTY_WEBHOOK_SECRET: ${ADAPTY_WEBHOOK_SECRET}
+  # Secret-ключ Adapty Server-side API (getProfile-ресинк). Потребитель: api+worker.
+  ADAPTY_API_KEY: ${ADAPTY_API_KEY}
+  # Базовый URL Adapty Server-side API v2 (дефолт из docs). Потребитель: api+worker.
+  ADAPTY_API_BASE: ${ADAPTY_API_BASE:-https://api.adapty.io/api/v2}
+  # Интервал beat-ресинка getProfile (fallback на пропущенные вебхуки) + TTL свежести
+  # subscriptions.synced_at для lazy-ресинка на гейте, секунды. 3600 = 1 ч. Потребитель: worker/beat.
+  BILLING_RESYNC_INTERVAL_S: "3600"
+  # Длительность grace-периода сайтов при expire/refund (grace_until = expire + это),
+  # дни. Продуктово = 7 (docs/08 §3.5-6). Потребитель: worker.
+  GRACE_PERIOD_DAYS: "7"
+  # Частота beat-sweeper'а grace-teardown сайтов (billing.subscription_sweep), секунды.
+  # 3600 = 1 ч. Потребитель: worker/beat.
+  SUBSCRIPTION_SWEEP_INTERVAL_S: "3600"
+  # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
+  # Канонические имена и дефолты — docs/07-deployment.md → env-контракт (стр. 80-88).
+  # Имена совпадают символ-в-символ с полями Settings (config.py). Поля Settings
+  # (build_sandbox_runtime / build_egress_network / npm_registry_allowlist /
+  # build_egress_proxy_url / build_cpu_limit / build_mem_limit / build_pids_limit /
+  # build_timeout_s / build_seccomp_profile / gc_queue / gc_s3_batch_size) добавляет backend при
+  # реализации S4 (build_seccomp_profile заменяет хардкод-константу default.json,
+  # условная передача флага, ADR-010 §B-1) — до их
+  # появления Settings(extra=ignore) их игнорирует, имена уже канонические
+  # (devops-reviewer проверяет символ-в-символ). Все потребители — worker.
+  # НЕ секреты.
+  #
+  # Runtime build-песочницы: rootless (дефолт, ADR-010 §A) / runsc (опц. gVisor
+  # поверх). Определяет, к какому Docker-сокету обращается build-воркер
+  # (rootless docker.sock в $XDG_RUNTIME_DIR vs привилегированный системный).
+  BUILD_SANDBOX_RUNTIME: rootless
+  # Имя изолированной Docker-сети build-контейнера (--network build-контейнера).
+  # ДОЛЖНО совпадать с реальной docker-сетью build_egress (networks.build_egress.name
+  # ниже = lovable_build_egress). Сеть internal:true -> без выхода в интернет/
+  # внутреннюю сеть; egress только к egress-proxy -> npm-registry (ADR-010 §C).
+  BUILD_EGRESS_NETWORK: ${BUILD_EGRESS_NETWORK}
+  # Хосты npm-registry, пропускаемые egress-proxy (CSV). Прочий egress — DROP.
+  # ДОЛЖЕН соответствовать acl npm_registry dstdomain в infra/egress-proxy/squid.conf
+  # (менять синхронно). Q-DEPLOY-1.
+  NPM_REGISTRY_ALLOWLIST: ${NPM_REGISTRY_ALLOWLIST:-registry.npmjs.org}
+  # URL egress-proxy в build_egress, через который build-контейнер ходит к npm
+  # (ADR-010 §C). ТРАНСПОРТ-сторона allowlist: воркер инжектит его в build-контейнер
+  # как -e http_proxy= / -e https_proxy=. Build-сеть internal (нет прямого маршрута
+  # к registry) -> без этого npm ci не имеет выхода. Указывает на egress-proxy-сервис
+  # (имя:порт = egress-proxy:3128, см. сервис egress-proxy ниже; squid слушает 3128),
+  # НЕ на app-процессы. host совпадает с именем сервиса egress-proxy в build_egress.
+  BUILD_EGRESS_PROXY_URL: ${BUILD_EGRESS_PROXY_URL:-http://egress-proxy:3128}
+  # --cpus build-контейнера (resource-exhaustion).
+  BUILD_CPU_LIMIT: "2"
+  # --memory build-контейнера.
+  BUILD_MEM_LIMIT: 2g
+  # --pids-limit build-контейнера (анти-fork-bomb).
+  BUILD_PIDS_LIMIT: "512"
+  # Wall-clock таймаут сборки, секунды (воркер делает docker rm -f по истечении).
+  BUILD_TIMEOUT_S: "600"
+  # Путь к кастомному seccomp JSON-профилю build-контейнера (ADR-010 §B-1).
+  # ДЕФОЛТ ПУСТ -> build-код НЕ передаёт --security-opt seccomp=...; действует
+  # встроенный default seccomp Docker (syscall-фильтр активен) -> провизия файла
+  # НЕ нужна. Это не секрет (путь, не credential). Docker не имеет токена
+  # seccomp=default — только путь к JSON или unconfined (unconfined контрактом
+  # не предусмотрен). ПРИ ЗАПОЛНЕНИИ непустым путём (напр. /etc/lovable/seccomp/
+  # build.json) build-код передаёт --security-opt seccomp={path}, и тогда devops
+  # ОБЯЗАН провизить этот JSON-профиль по указанному пути на build-хосте / в
+  # образе worker (сейчас НЕ требуется — дефолт пуст). Пустой дефолт через :- ,
+  # чтобы пустое значение не падало на unset-переменной.
+  BUILD_SECCOMP_PROFILE: ${BUILD_SECCOMP_PROFILE:-}
+  # --- Sprint 4: GC при удалении проекта (ADR-011) ---
+  # Celery-очередь джобы project.gc (доступ к Docker для teardown). = build.
+  GC_QUEUE: build
+  # Размер батча batch-delete S3-артефактов в project.gc.
+  GC_S3_BATCH_SIZE: "1000"
+  # --- Sprint 5: Realtime (SSE) & push (APNs) — ADR-012 / ADR-013 ---
+  # Канонические имена и дефолты — docs/07-deployment.md → env-контракт
+  # (стр. 91-100). Имена совпадают символ-в-символ с полями Settings (config.py).
+  # Поля Settings (sse_heartbeat_s / sse_retry_ms / sse_max_streams_per_key /
+  # apns_env / apns_key_id / apns_team_id / apns_bundle_id / apns_auth_key /
+  # apns_auth_key_path / apns_jwt_ttl_s) добавляет backend при реализации S5 — до
+  # их появления Settings(extra=ignore) их игнорирует, имена уже канонические
+  # (devops-reviewer проверяет символ-в-символ).
+  #
+  # SSE (потребитель: api) — ADR-012. НЕ секреты.
+  # Интервал SSE-heartbeat (": ping") на GET /jobs/{jid}/events — держит idle-
+  # соединение через прокси/NAT.
+  SSE_HEARTBEAT_S: "15"
+  # Значение retry: в SSE-потоке (hint клиенту по интервалу reconnect), мс.
+  SSE_RETRY_MS: "3000"
+  # Макс. одновременных SSE-стримов на ключ (защита воркеров); сверх -> 429.
+  SSE_MAX_STREAMS_PER_KEY: "5"
+  #
+  # APNs (потребитель: worker — notify.apns_push исполняется в Celery, ADR-013).
+  # APNS_KEY_ID / APNS_TEAM_ID / APNS_BUNDLE_ID + .p8-ключ — ВНЕШНЯЯ ЗАВИСИМОСТЬ
+  # ПОЛЬЗОВАТЕЛЯ (Apple Developer). Без credentials notify.apns_push — no-op
+  # (push неактивен, пайплайн цел; ADR-013 §5, docs/07 стр. 104).
+  # Дефолтный APNs-хост: sandbox (api.sandbox.push.apple.com) / production
+  # (api.push.apple.com). Override per-device через device_tokens.environment.
+  APNS_ENV: ${APNS_ENV:-sandbox}
+  # Apple Key ID .p8-ключа (claim kid provider-JWT). Внешняя зависимость.
+  # Плейсхолдер в .env.example; реальное значение в репозиторий НЕ коммитится.
+  APNS_KEY_ID: ${APNS_KEY_ID:-}
+  # Apple Team ID (claim iss provider-JWT). Внешняя зависимость.
+  APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+  # Bundle ID iOS-приложения (заголовок apns-topic). Внешняя зависимость.
+  APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-mba.gipsy.lovable}
+  # СЕКРЕТ (SecretStr): содержимое .p8-ключа (PEM-строка) — для secret-manager
+  # без ФС. Если задан — приоритетнее APNS_AUTH_KEY_PATH (ADR-013 §5, docs/07
+  # стр. 98/109). Реальное значение НЕ коммитится; в dev обычно пусто ->
+  # backend читает файл по APNS_AUTH_KEY_PATH, а при отсутствии и того — no-op.
+  APNS_AUTH_KEY: ${APNS_AUTH_KEY:-}
+  # Путь к .p8-файлу ВНУТРИ контейнера worker (если не задан APNS_AUTH_KEY).
+  # .p8 — СЕКРЕТНЫЙ КОНФИГ-АРТЕФАКТ: монтируется secret-mount'ом из
+  # APNS_AUTH_KEY_HOST_PATH (см. volume в worker ниже), файл провижит ПОЛЬЗОВАТЕЛЬ
+  # (Apple Developer .p8), в git НЕ коммитится (docs/07 "Правило конфиг-артефакта",
+  # docs/05 §APNs). Дефолт-путь существует как точка монтирования; если файл не
+  # провижен и APNS_AUTH_KEY пуст -> notify.apns_push no-op.
+  APNS_AUTH_KEY_PATH: ${APNS_AUTH_KEY_PATH:-/secrets/apns/AuthKey.p8}
+  # TTL кэша provider-JWT (переподпись не чаще; Apple отвергает частую регенерацию), сек.
+  APNS_JWT_TTL_S: "2400"
+  # --- Sprint 6: Observability (ADR-015) + scale (ADR-016) ---
+  # Канонические имена и дефолты — docs/07-deployment.md → env-контракт
+  # (стр. 103-111). Имена совпадают символ-в-символ с полями Settings (config.py).
+  # Поля Settings (sentry_dsn / sentry_traces_sample_rate / sentry_environment /
+  # metrics_port / prometheus_multiproc_dir / prometheus_scrape_interval_s /
+  # redis_pool_max_connections / redis_pool_timeout_s / billing_resync_batch_size)
+  # добавляет backend при реализации S6 — до их появления Settings(extra=ignore)
+  # их игнорирует, имена уже канонические (devops-reviewer проверяет
+  # символ-в-символ).
+  #
+  # --- Sentry (потребитель: both — api+worker, ADR-015 §4). ---
+  # СЕКРЕТ (SecretStr|None): DSN проекта Sentry. ПУСТО/None -> Sentry-init no-op
+  # (фича неактивна, процесс цел, как APNs без credentials; docs/07 стр. 103).
+  # Реальное значение НЕ коммитится; в dev обычно пусто (плейсхолдер в .env.example).
+  SENTRY_DSN: ${SENTRY_DSN:-}
+  # Доля трейсов в Sentry (низкая, чтобы не жечь quota). НЕ секрет.
+  SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE:-0.05}
+  # environment-тег Sentry. Если None -> берётся ENVIRONMENT. НЕ секрет.
+  SENTRY_ENVIRONMENT: ${SENTRY_ENVIRONMENT:-dev}
+  # --- Prometheus / metrics (ADR-015 §1). НЕ секреты. ---
+  # Порт prometheus_client.start_http_server на Celery-воркере/beat (отдельный
+  # HTTP-порт для scrape; у воркера нет ASGI, app экспонирует /metrics через
+  # FastAPI на 8000 и этот порт ему не нужен). Prometheus scrape'ит
+  # worker:${METRICS_PORT}/metrics + beat:${METRICS_PORT}/metrics (internal сеть,
+  # НЕ наружу). Совпадает с экспозицией порта worker/beat ниже и target в
+  # infra/prometheus/prometheus.yml.
+  METRICS_PORT: ${METRICS_PORT:-9100}
+  # Каталог multiprocess-режима prometheus-client, ЕСЛИ app запускается несколькими
+  # uvicorn-процессами в контейнере. В dev/проде app масштабируется РЕПЛИКАМИ
+  # контейнера (один процесс на реплику, observability §1) -> multiproc НЕ нужен,
+  # оставляем ПУСТО (нормативный явный выбор режима, docs/07 стр. 107). НЕ секрет.
+  PROMETHEUS_MULTIPROC_DIR: ${PROMETHEUS_MULTIPROC_DIR:-}
+  # Интервал scrape (значение для prometheus.yml; в Settings — справочно/для
+  # exporter'ов). ДОЛЖЕН совпадать с scrape_interval в infra/prometheus/prometheus.yml.
+  PROMETHEUS_SCRAPE_INTERVAL_S: ${PROMETHEUS_SCRAPE_INTERVAL_S:-15}
+  # --- Scale: Redis ConnectionPool (ADR-016, закрытие TD-007) + resync batch
+  # (закрытие TD-009). НЕ секреты. ---
+  # Размер переиспользуемого ConnectionPool на процесс (rate-limit/SSE/budget
+  # вместо per-request from_url). Следить vs maxclients Redis при росте реплик.
+  REDIS_POOL_MAX_CONNECTIONS: ${REDIS_POOL_MAX_CONNECTIONS:-50}
+  # Таймаут ожидания свободного соединения из пула, секунды.
+  REDIS_POOL_TIMEOUT_S: ${REDIS_POOL_TIMEOUT_S:-5.0}
+  # .limit(BATCH) + курсор synced_at ASC в billing.resync (самые протухшие
+  # первыми, хвост на след. тиках). Потребитель: worker/beat.
+  BILLING_RESYNC_BATCH_SIZE: ${BILLING_RESYNC_BATCH_SIZE:-200}
+
+services:
+  # ----------------------------------------------------------------------------
+  # Postgres 16 — system of record (docs/03-data-model.md).
+  # ----------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+    # Порт наружу только для dev-удобства (psql с хоста). Bind на localhost.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # Redis 7 — брокер Celery + result backend + pub/sub + счётчики.
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    networks:
+      - backend
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ----------------------------------------------------------------------------
+  # MinIO — S3-совместимое хранилище (исходники / артефакты / логи).
+  # ----------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    networks:
+      - backend
+    ports:
+      # API и консоль — только на localhost в dev.
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # minio-setup — одноразовое создание бакетов (idempotent), затем выходит.
+  # ----------------------------------------------------------------------------
+  minio-setup:
+    image: minio/mc:RELEASE.2024-11-21T17-21-54Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # ЕДИНЫЙ бакет (key-префиксы sources|dist|logs|specs/{job}/ создаются
+      # неявно при put_object, см. app/storage/s3.py + docs/07-deployment.md).
+      S3_BUCKET: ${S3_BUCKET}
+    networks:
+      - backend
+    entrypoint: >
+      /bin/sh -c "
+      set -e;
+      mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\";
+      mc mb --ignore-existing local/$$S3_BUCKET;
+      echo 'minio-setup: bucket ready';
+      "
+    restart: "no"
+
+  # ----------------------------------------------------------------------------
+  # Traefik v3 — reverse-proxy. api.<API_DOMAIN> -> api; *.<APPS_DOMAIN> -> сайты.
+  # Docker-провайдер, socket read-only (docs/07-deployment.md строка 19).
+  # ----------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.2
+    command:
+      - "--configFile=/etc/traefik/traefik.yml"
+    volumes:
+      # Socket read-only — Traefik только читает события Docker.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+    networks:
+      - traefik
+      - backend
+    ports:
+      - "80:80"
+      - "443:443"
+      # Dashboard (DEV ONLY, api.insecure=true) — только localhost.
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ----------------------------------------------------------------------------
+  # migrate — Alembic upgrade head. Гейт перед стартом api/worker
+  # (docs devops-чеклист: migrations runs до старта нового кода).
+  # ----------------------------------------------------------------------------
+  migrate:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    image: lovable-api:dev
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
+  # ----------------------------------------------------------------------------
+  # api — FastAPI (uvicorn app.api.main:app). Лейблы Traefik для api.<API_DOMAIN>.
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.api
+    image: lovable-api:dev
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - backend
+      - traefik
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=lovable_traefik"
+      # Роутер API: Host(api.<API_DOMAIN>), путь /v1 (docs: api.domain, /v1).
+      - "traefik.http.routers.api.rule=Host(`api.${API_DOMAIN}`)"
+      - "traefik.http.routers.api.entrypoints=web"
+      - "traefik.http.routers.api.middlewares=secure-headers@file"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ----------------------------------------------------------------------------
+  # egress-proxy — forward-proxy build-песочницы (Sprint 4, ADR-010 §C).
+  # Единственный разрешённый исходящий путь build-контейнера: пропускает ТОЛЬКО
+  # npm-registry (NPM_REGISTRY_ALLOWLIST), всё прочее — DROP. Конфиг и allowlist —
+  # infra/egress-proxy/squid.conf (+ README). Pinned образ (Canonical squid).
+  #
+  # Две сети:
+  #   - build_egress (internal:true) — здесь его видит build-контейнер; у этой
+  #     сети нет выхода в интернет/внутреннюю сеть. Build-контейнер сидит ТОЛЬКО
+  #     в ней -> его единственный путь наружу = этот proxy.
+  #   - egress_uplink (обычный bridge) — даёт САМОМУ proxy выход к npm.
+  #
+  # ГРАНИЦА (docs/05-security.md → "Граница egress-политики"): этот lockdown —
+  # ТОЛЬКО для build-песочницы. api/worker/beat через proxy НЕ ходят; их egress
+  # к Anthropic / Adapty getProfile / Apple JWKS — прямой, не ограничен.
+  # ----------------------------------------------------------------------------
+  egress-proxy:
+    # Pinned Canonical squid (squid 6.x, Ubuntu 24.04). Тег `_stable` удалён из
+    # Docker Hub (Canonical отказался от stable-канала ubuntu/squid) -> перешли на
+    # `_edge` той же ветки 6.6-24.04 (pinned, НЕ latest/edge floating; squid 6.14).
+    # squid.conf приведён к совместимости с squid 6.13+ (убран dns_v4_first,
+    # дедуплицирован dstdomain). Логи пишутся в штатные /var/log/squid/* (writable
+    # для user proxy), форвард в docker logs делает entrypoint образа (tail -F);
+    # healthcheck — реальная listen-проба 3128 (см. healthcheck ниже), а не
+    # синтаксис-only `squid -k parse`.
+    image: ubuntu/squid:6.6-24.04_edge
+    volumes:
+      - ./egress-proxy/squid.conf:/etc/squid/squid.conf:ro
+    networks:
+      # Имя build_egress зафиксировано (lovable_build_egress) и обязано совпадать
+      # с BUILD_EGRESS_NETWORK в .env (его читает worker как --network build-контейнера).
+      - build_egress
+      - egress_uplink
+    # Наружу порт НЕ публикуется: proxy доступен только из build_egress по
+    # имени сервиса egress-proxy:3128 (минимизация поверхности).
+    # Healthcheck — РЕАЛЬНАЯ проверка запущенного процесса, а не синтаксиса
+    # конфига. Прежний `squid -k parse` валидировал ТОЛЬКО синтаксис (ложно-
+    # зелёный): контейнер мог крэшить в цикле, но healthcheck оставался "healthy"
+    # -> worker (depends_on egress-proxy: service_healthy) разблокировался впустую.
+    # Теперь healthy ⇔ (а) процесс squid жив (pidof) И (б) реально слушает 3128.
+    # Образ ubuntu/squid НЕ содержит nc/ss/netstat/curl/squidclient, поэтому
+    # listen-probe делаем встроенным в bash псевдо-устройством /dev/tcp (bash в
+    # образе есть; проверено живым прогоном: healthy при работе, unhealthy после
+    # падения squid). ВАЖНО: /dev/tcp — фича bash, а не POSIX sh, поэтому проба
+    # запускается ЯВНО через `bash -c` (CMD, не CMD-SHELL: CMD-SHELL дал бы
+    # /bin/sh, где /dev/tcp не работает).
+    healthcheck:
+      test: ["CMD", "bash", "-c", "pidof squid >/dev/null 2>&1 && (echo > /dev/tcp/127.0.0.1/3128) >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # worker — Celery, обе очереди (llm,build) одним контейнером для S1
+  # (docs/07-deployment.md строка 21: "в dev можно один контейнер с обеими").
+  #
+  # Sprint 4 (ADR-010, закрывает TD-001): build-контейнеры недоверенного кода
+  # воркер запускает через ROOTLESS Docker-демон (BUILD_SANDBOX_RUNTIME=rootless,
+  # сокет в $XDG_RUNTIME_DIR непривилегированного пользователя на build-хосте),
+  # а НЕ через привилегированный системный docker.sock. Это снимает корень
+  # риска TD-001: компрометация воркера не даёт root на хосте (user-ns remap).
+  # См. SECURITY NOTE ниже про монтирование сокета в dev/prod.
+  #
+  # nginx-контейнеры сайтов остаются на обычном Docker-сокете deploy-хоста
+  # (docs/07-deployment.md строка 153) — это доверенный deploy-путь, не песочница.
+  # ----------------------------------------------------------------------------
+  worker:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile.worker
+      args:
+        DOCKER_GID: ${DOCKER_GID}
+    image: lovable-worker:dev
+    environment:
+      <<: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+      # egress-proxy должен быть готов до старта воркера: build-контейнеры,
+      # которые воркер поднимает per-job, ходят в npm только через него.
+      egress-proxy:
+        condition: service_healthy
+    networks:
+      - backend
+      # worker в сети traefik, чтобы дотягиваться до сайт-контейнеров для
+      # health-check {subdomain}.apps.domain.
+      - traefik
+      # worker подключён к build_egress, чтобы (а) создавать build-контейнеры
+      # в этой сети, (б) сам видел сеть для docker run --network. Build-контейнер
+      # сидит ТОЛЬКО в build_egress; worker в ней + backend/traefik.
+      - build_egress
+    volumes:
+      # Sprint 4 (ADR-010, закрывает TD-001): воркер обращается к ROOTLESS
+      # Docker-демону. ROOTLESS_DOCKER_SOCK — путь rootless-сокета на хосте
+      # (в WSL2 обычно /run/user/<uid>/docker.sock; задаётся в .env). Это НЕ
+      # привилегированный системный /var/run/docker.sock S1 — компрометация
+      # воркера не даёт root на хосте (user-namespace remap).
+      # nginx-контейнеры сайтов (deploy, доверенный путь) при необходимости
+      # деплоятся через тот же rootless-демон на dev-хосте; в prod build-хосты
+      # (rootless) и deploy-хосты разделены (docs/07-deployment.md → Прод-топология).
+      - ${ROOTLESS_DOCKER_SOCK}:/var/run/docker.sock
+      # Sprint 5 (ADR-013, docs/07 "Правило конфиг-артефакта"): secret-mount
+      # КАТАЛОГА с APNs .p8-ключом (read-only) в /secrets/apns контейнера.
+      # Монтируем директорию (а НЕ файл) намеренно: bind-mount несуществующего
+      # хост-ФАЙЛА создал бы пустую директорию на его месте и сломал чтение —
+      # mount каталога idempotent (пустой каталог -> файла AuthKey.p8 нет ->
+      # notify.apns_push no-op, пайплайн цел; ADR-013 §5). Хостовый каталог —
+      # APNS_AUTH_KEY_HOST_PATH (дефолт ./secrets/apns, в .gitignore, см.
+      # infra/secrets/apns/.gitkeep). .p8 — СЕКРЕТНЫЙ КОНФИГ-АРТЕФАКТ, кладёт
+      # его в этот каталог ПОЛЬЗОВАТЕЛЬ (Apple Developer AuthKey.p8), в git
+      # файл НЕ коммитится. Имя файла внутри = AuthKey.p8 -> полный путь
+      # /secrets/apns/AuthKey.p8 СОВПАДАЕТ с APNS_AUTH_KEY_PATH (x-app-env),
+      # откуда backend читает ключ. В prod — secret-manager / secret-mount
+      # хоста (docs/05 §Секреты, encrypted-at-rest). :ro — ключ только читается.
+      - ${APNS_AUTH_KEY_HOST_PATH:-./secrets/apns}:/secrets/apns:ro
+    command:
+      - "celery"
+      - "-A"
+      - "app.workers.celery_app"
+      - "worker"
+      - "-Q"
+      - "llm,build"
+      - "--loglevel=INFO"
+      - "--concurrency=2"
+    # Sprint 6 (ADR-015 §1): worker экспонирует prometheus_client.start_http_server
+    # на METRICS_PORT (отдельный HTTP-порт; у воркера нет ASGI). Prometheus scrape'ит
+    # worker:${METRICS_PORT}/metrics в сети backend (internal) — порт НАРУЖУ не
+    # публикуется (нет host-bind), доступен только внутри compose-сети.
+    # ПРОД-ТОПОЛОГИЯ (ADR-016, docs/07 Прод-топология): в dev — ОДИН worker на обе
+    # очереди (llm,build); в проде -Q llm и -Q build разносятся на РАЗНЫЕ
+    # worker-пулы/хосты (rate-limit Claude vs CPU+изоляция build-фермы). Ручной
+    # scale: docker compose up --scale worker=N (или отдельные сервисы worker-llm/
+    # worker-build с -Q llm / -Q build на prod-хостах). Build-воркер сохраняет
+    # rootless+egress (ADR-010) — разнесение очередей НЕ меняет изоляцию.
+    expose:
+      - "${METRICS_PORT:-9100}"
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app inspect ping -d celery@$$(hostname) || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ----------------------------------------------------------------------------
+  # beat — Celery beat. Единственный экземпляр (docs/07-deployment.md стр. 100/154).
+  # Sprint 2 (docs/modules/pipeline/03-architecture.md §E): несёт две периодики —
+  #   E1 sweeper AWAITING_CLARIFICATION по TTL (CLARIFICATION_TTL_S), частота
+  #      CLARIFICATION_SWEEP_INTERVAL_S (600 s);
+  #   E2 reconciler застрявших BUILDING/DEPLOYING/FIXING (STUCK_THRESHOLD_S 900 s),
+  #      частота RECONCILE_INTERVAL_S (120 s).
+  # Sprint 3.5 (docs/07-deployment.md стр. 81): к ним добавляются ещё две beat-джобы —
+  #   billing.resync               частота BILLING_RESYNC_INTERVAL_S (3600 s);
+  #   billing.subscription_sweep   частота SUBSCRIPTION_SWEEP_INTERVAL_S (3600 s).
+  # Это единственный beat-процесс; все четыре джобы регистрирует backend в коде.
+  # Schedule задаётся backend в коде (celery beat schedule в app.workers.celery_app),
+  # интервалы/пороги beat читает из env через Settings (наследует x-app-env).
+  # Devops НЕ дублирует расписание CLI-флагами -> нет конфликта с кодовым schedule.
+  # Можно остановить: docker compose stop beat.
+  # ----------------------------------------------------------------------------
+  beat:
+    image: lovable-worker:dev
+    environment:
+      <<: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - backend
+    command:
+      - "celery"
+      - "-A"
+      - "app.workers.celery_app"
+      - "beat"
+      - "--loglevel=INFO"
+      # PersistentScheduler пишет schedule-файл; по умолчанию — в cwd (/app),
+      # который owned root:root (Dockerfile.worker), а процесс идёт под non-root
+      # UID 10001 (app) -> beat крэшил `_gdbm.error [Errno 13] Permission denied:
+      # 'celerybeat-schedule'`. Пишем в /tmp (drwxrwxrwt, writable для app —
+      # проверено). Без этого флага sweeper/reconciler/billing.resync/
+      # subscription_sweep не стартуют (beat в крэш-цикле).
+      - "--schedule=/tmp/celerybeat-schedule"
+    # Sprint 6 (ADR-015 §1): beat экспонирует prometheus_client.start_http_server
+    # на METRICS_PORT (отдельный HTTP-порт; у beat нет ASGI). Prometheus scrape'ит
+    # beat:${METRICS_PORT}/metrics в сети backend (internal) — порт НАРУЖУ не
+    # публикуется (нет host-bind), доступен только внутри compose-сети.
+    expose:
+      - "${METRICS_PORT:-9100}"
+    # HEALTHCHECK beat: SCHEDULER-liveness, НЕ worker-ping.
+    # `celery inspect ping` — control-команда для WORKER-узлов (consumer'ов):
+    # beat-scheduler НЕ consumer и НИКОГДА не отвечает на ping -> "No nodes replied"
+    # -> вечный unhealthy при ЖИВОМ beat (ложно-отрицательный; docs/07 стр. 272
+    # "Воркеры: Celery ping" нормативна для воркеров, НЕ для beat). Поэтому проба =
+    # liveness самого beat-процесса: сканируем /proc/*/cmdline на наличие процесса
+    # `celery ... app.workers.celery_app ... beat`.
+    #   - Образ python:3.12-slim НЕ содержит pgrep/ps/procps (проверено живым
+    #     прогоном), поэтому НЕ используем pgrep — только /proc + tr + grep, которые
+    #     в образе есть. /proc всегда смонтирован в Linux-контейнере.
+    #   - cmdline NUL-разделён -> tr "\000" " " склеивает аргументы одного процесса
+    #     в строку, echo даёт по-процессную границу (celery и beat одного PID не
+    #     путаются с другими).
+    #   - Паттерн `celery_app .*[b]eat`: класс `[b]eat` исключает САМОСОВПАДЕНИЕ —
+    #     строка проверки никогда не содержит литерал `beat`, поэтому grep не ловит
+    #     собственный cmdline пробы; одновременно отсекает worker-процесс (у него
+    #     есть celery_app, но НЕТ beat). Проверено живым прогоном: healthy при живом
+    #     beat (exit 0), unhealthy при его отсутствии (exit 1) и при worker-cmdline.
+    # CMD-SHELL — нужен shell (glob /proc/[0-9]*, pipe). `$$f` -> compose-escape
+    # для `$f` (одинарный $ compose трактует как СВОЮ переменную и подставит пусто;
+    # $$ даёт литерал $ shell'у). Проверено `compose config`: рендерится в `$f`.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'for f in /proc/[0-9]*/cmdline; do tr "\000" " " < "$$f" 2>/dev/null; echo; done | grep -q "celery_app .*[b]eat"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # prometheus — pull-метрики (Sprint 6, ADR-015 §1, observability §1-2).
+  # Scrape'ит /metrics: api-реплик (api:8000/metrics, internal FastAPI-route) +
+  # worker/beat (worker:${METRICS_PORT}, beat:${METRICS_PORT}) — pull-модель,
+  # статические targets (ручной scale S6 не требует service-discovery, docs/07
+  # Прод-топология). Scrape-конфиг — infra/prometheus/prometheus.yml (КОНФИГ-
+  # АРТЕФАКТ, docs/07 "Правило конфиг-артефакта Prometheus/Grafana"): монтируется
+  # ro, версионируется в git, секретов не содержит.
+  #
+  # СЕТЬ: только backend (internal) — Prometheus должен дотягиваться до api/worker/
+  # beat, которые там сидят. /metrics НЕ публичный (docs/05 "Сетевые границы":
+  # internal-трафик только внутри compose-сети).
+  #
+  # ПОРТ: UI Prometheus биндится ТОЛЬКО на 127.0.0.1 (dev-удобство, не наружу).
+  # Pinned образ (docs/02-tech-stack.md → Observability).
+  # ----------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    networks:
+      - backend
+    ports:
+      # UI только на localhost (dev). НЕ наружу.
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------------------
+  # grafana — дашборды/алерты as code (Sprint 6, ADR-015 §5, observability §3).
+  # Datasources Prometheus + Postgres ($/user из llm_usage, где Prometheus-
+  # кардинальность недопустима) — provisioning infra/grafana/provisioning/.
+  # 6 нормативных дашбордов (jobs/cost/SSE/APNs/build-ферма/billing) as code —
+  # infra/grafana/dashboards/*.json. Все — КОНФИГ-АРТЕФАКТЫ (docs/07 "Правило
+  # конфиг-артефакта"): провижит devops, версионируются в git, секреты (admin-
+  # пароль, Postgres-datasource пароль) — из env (Grafana ${ENV}-подстановка),
+  # НЕ хардкод.
+  #
+  # СЕТЬ: backend — Grafana ходит к prometheus:9090 и postgres:5432 (datasources).
+  # ПОРТ: UI ТОЛЬКО на 127.0.0.1 (docs ТЗ: dashboard на 127.0.0.1, не наружу).
+  # Pinned образ (docs/02-tech-stack.md → Observability).
+  # ----------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      # СЕКРЕТЫ (плейсхолдеры в .env.example; реальные значения НЕ коммитятся).
+      # admin creds — из env, НЕ хардкод (docs/07 "Правило конфиг-артефакта").
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Анонимный доступ выключен; регистрация запрещена.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # Postgres-datasource пароль (для $/user панели) — из env, подставляется
+      # в provisioning/datasources через ${GF_POSTGRES_DS_PASSWORD}.
+      GF_POSTGRES_DS_PASSWORD: ${POSTGRES_PASSWORD}
+      GF_POSTGRES_DS_USER: ${POSTGRES_USER}
+      GF_POSTGRES_DS_DATABASE: ${POSTGRES_DB}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - backend
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      # UI ТОЛЬКО на localhost (dev ТЗ). НЕ наружу.
+      - "127.0.0.1:3000:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+
+networks:
+  backend:
+    driver: bridge
+  traefik:
+    # Фиксированное имя сети — на него ОБЯЗАНЫ ссылаться (символ-в-символ):
+    #   - traefik.yml (providers.docker.network)
+    #   - лейблы api (traefik.docker.network)
+    #   - TRAEFIK_NETWORK в .env (читает worker для nginx-контейнеров сайтов).
+    name: lovable_traefik
+    driver: bridge
+  # build_egress — изолированная сеть build-песочницы (Sprint 4, ADR-010 §C).
+  # internal:true => НЕТ выхода в интернет и НЕТ доступа к внутренней сети
+  # (postgres/redis/minio/traefik). Build-контейнер сидит ТОЛЬКО в ней; его
+  # единственный путь наружу — egress-proxy (он же в этой сети + в egress_uplink).
+  # Фиксированное имя lovable_build_egress ОБЯЗАНО совпадать символ-в-символ с
+  # BUILD_EGRESS_NETWORK в .env (его читает worker как --network build-контейнера).
+  build_egress:
+    name: lovable_build_egress
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        # Подсеть синхронизирована с acl build_clients в egress-proxy/squid.conf.
+        - subnet: 172.31.0.0/16
+  # egress_uplink — обычный bridge, даёт ТОЛЬКО egress-proxy выход в интернет
+  # к npm-registry. Build-контейнер в этой сети НЕ состоит.
+  egress_uplink:
+    name: lovable_egress_uplink
+    driver: bridge
+
+volumes:
+  pgdata:
+  minio-data:
+  # Sprint 6 (ADR-015): TSDB Prometheus + state/SQLite Grafana.
+  prometheus-data:
+  grafana-data:

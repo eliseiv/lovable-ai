@@ -1,0 +1,65 @@
+{
+  "uid": "lovable-billing-quota",
+  "title": "Billing / quota",
+  "tags": ["lovable", "billing", "quota", "scale", "sprint6"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Quota rejected 402 by reason (lovable_quota_rejected_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (reason) (rate(lovable_quota_rejected_total[5m]))", "legendFormat": "{{reason}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Concurrency block by kind (lovable_concurrency_block_by_kind_total) — TD-012",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (blocked_kind, holder_kind) (rate(lovable_concurrency_block_by_kind_total[5m]))", "legendFormat": "{{blocked_kind}} blocked by {{holder_kind}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Adapty resync lag (lovable_adapty_resync_lag_seconds) — TD-009",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "lovable_adapty_resync_lag_seconds", "legendFormat": "resync lag" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Resync batch full/partial (lovable_billing_resync_batch)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.95, sum by (le, result) (rate(lovable_billing_resync_batch_bucket[15m])))", "legendFormat": "p95 {{result}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Rate-limit rejected 429 by scope (lovable_rate_limit_rejected_total)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (scope) (rate(lovable_rate_limit_rejected_total[5m]))", "legendFormat": "{{scope}}" }
+      ]
+    }
+  ]
+}
