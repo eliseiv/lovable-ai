@@ -69,10 +69,7 @@ def test_traefik_labels_path_pathprefix_stripprefix_websecure():
     # ADR-017 §Fix: правило теперь Host(apps_domain) && PathPrefix(/s/{site_id}). Host(...)
     # обязателен (на общей сети web под чужим edge-Traefik правило без Host матчило бы любой
     # хост — перехват чужих запросов).
-    assert (
-        labels[f"{router}.rule"]
-        == f"Host(`{settings.apps_domain}`) && PathPrefix(`{prefix}`)"
-    )
+    assert labels[f"{router}.rule"] == f"Host(`{settings.apps_domain}`) && PathPrefix(`{prefix}`)"
     assert "Host(" in labels[f"{router}.rule"]
     assert f"PathPrefix(`{prefix}`)" in labels[f"{router}.rule"]
     # Явный priority выше catch-all API-роутера Host(apps_domain) (ADR-017 §Fix), из

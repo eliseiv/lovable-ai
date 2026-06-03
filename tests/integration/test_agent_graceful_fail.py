@@ -57,21 +57,15 @@ async def _run_agent_task_in_thread(task, coro_factory, job_id):  # noqa: ANN001
 
 
 def _auth_error() -> AuthenticationError:
-    return AuthenticationError(
-        "no key", response=httpx.Response(401, request=_REQ), body=None
-    )
+    return AuthenticationError("no key", response=httpx.Response(401, request=_REQ), body=None)
 
 
 def _rate_limit_error() -> RateLimitError:
-    return RateLimitError(
-        "rate limited", response=httpx.Response(429, request=_REQ), body=None
-    )
+    return RateLimitError("rate limited", response=httpx.Response(429, request=_REQ), body=None)
 
 
 def _server_error() -> APIStatusError:
-    return APIStatusError(
-        "server error", response=httpx.Response(503, request=_REQ), body=None
-    )
+    return APIStatusError("server error", response=httpx.Response(503, request=_REQ), body=None)
 
 
 async def _setup_user() -> None:
@@ -145,9 +139,7 @@ def _no_publish(monkeypatch):  # noqa: ANN001, ANN202
         return None
 
     monkeypatch.setattr("app.pipeline.events.publish_event", _noop_publish)
-    monkeypatch.setattr(
-        "app.notify.trigger.enqueue_push_if_significant", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.notify.trigger.enqueue_push_if_significant", lambda *a, **k: None)
 
 
 @pytest.fixture(autouse=True)

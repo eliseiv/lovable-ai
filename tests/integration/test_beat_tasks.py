@@ -168,9 +168,7 @@ def _noop_publish_patch(monkeypatch) -> None:  # noqa: ANN001
 
     monkeypatch.setattr("app.pipeline.events.publish_event", _noop_publish)
     # APNs trigger дёргается transition'ом при FAILED — нейтрализуем (нет Celery-брокера).
-    monkeypatch.setattr(
-        "app.notify.trigger.enqueue_push_if_significant", lambda *a, **k: None
-    )
+    monkeypatch.setattr("app.notify.trigger.enqueue_push_if_significant", lambda *a, **k: None)
 
 
 # --- sweeper ---
@@ -463,9 +461,7 @@ async def test_reconciler_dispatch_lock_prevents_double_dispatch(beat_env, monke
     """Redis dispatch-lock: повторный прогон в окне lock-TTL НЕ дублирует постановку."""
     settings = get_settings()
     _noop_publish_patch(monkeypatch)
-    jid = await _make_job(
-        JobState.FIXING, transition_age_seconds=settings.stuck_threshold_s + 100
-    )
+    jid = await _make_job(JobState.FIXING, transition_age_seconds=settings.stuck_threshold_s + 100)
 
     import app.workers.beat_tasks as beat
 
