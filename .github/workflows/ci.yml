@@ -12,7 +12,9 @@
 #   Jobs: lint + type-check + test  ->  deploy job c needs: [lint, type-check, test]
 #         (деплой ТОЛЬКО на зелёном — гейт перед prod).
 #   deploy: SSH на сервер -> cd /opt/corelysite -> git pull ->
-#           docker compose -f infra/docker-compose.prod.yml up -d --build.
+#           docker compose -f infra/docker-compose.prod.yml --env-file .env up -d --build.
+#           (--env-file .env обязателен: .env в /opt/corelysite, а project-dir
+#            compose = infra/; без него ${VAR} blank -> exit 1.)
 #           Чужие /opt/music-backend, /opt/edge НЕ трогаются.
 #
 # Команды gate — КАНОНИЧЕСКИЕ из docs/02-tech-stack.md (НЕ дублируются/НЕ
@@ -202,9 +204,15 @@ jobs:
           # migrate-сервис (alembic upgrade head) — гейт ВНУТРИ compose up:
           # depends_on api/worker/beat ждут service_completed_successfully migrate,
           # т.е. миграции применяются ДО старта нового кода приложения.
+          # --env-file .env: project-directory compose = каталог compose-файла
+          # (infra/), поэтому без явного --env-file compose ищет infra/.env, а
+          # реальный .env лежит в /opt/corelysite/.env -> все ${VAR} blank,
+          # ${ROOTLESS_DOCKER_SOCK} пустой -> volume ":/var/run/docker.sock"
+          # невалиден (empty section) -> exit 1. Явный --env-file .env (как в
+          # ручном деплое) подхватывает /opt/corelysite/.env. docs/07 §CI/CD, ADR-018.
           script: |
             set -e
             cd /opt/corelysite
             git pull --ff-only
-            docker compose -f infra/docker-compose.prod.yml up -d --build
-            docker compose -f infra/docker-compose.prod.yml ps
+            docker compose -f infra/docker-compose.prod.yml --env-file .env up -d --build
+            docker compose -f infra/docker-compose.prod.yml --env-file .env ps

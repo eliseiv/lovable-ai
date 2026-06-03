@@ -34,7 +34,7 @@
 ### CI/CD (нормативный контракт GitHub Actions)
 
 - **Pipeline:** `lint` + `type-check` + `test` (jobs) → **`deploy` job только после успеха всех** (`needs:`).
-- **Deploy:** SSH на сервер → `cd /opt/corelysite` → `git pull` → `docker compose -f docker-compose.prod.yml up -d --build`. Чужие `/opt/music-backend`, `/opt/edge` не трогаются.
+- **Deploy:** SSH на сервер → `cd /opt/corelysite` → `git pull` → `docker compose -f infra/docker-compose.prod.yml --env-file .env up -d --build`. `--env-file .env` **обязателен**: project-directory compose = каталог compose-файла (`infra/`), без явного `--env-file` ищется `infra/.env`, а реальный `.env` — в `/opt/corelysite/.env` → переменные blank → деплой падает. Чужие `/opt/music-backend`, `/opt/edge` не трогаются.
 - **GitHub Secrets (prod):** `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY` (deploy-ключ), `ANTHROPIC_API_KEY`, `ADAPTY_WEBHOOK_SECRET`, `ADAPTY_API_KEY`, `APNS_AUTH_KEY` (+ `APNS_KEY_ID`/`APNS_TEAM_ID`/`APNS_BUNDLE_ID`), `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`/`MINIO_ROOT_PASSWORD` (или S3-creds), `SEED_API_KEY`, `APPLE_AUDIENCE`, опц. `SENTRY_DSN`. Полный нормативный список секретов — [05-security.md → Секреты](../05-security.md#секреты) + [07-deployment.md → env-контракт](../07-deployment.md#канонический-список-ключей); CI лишь прокидывает значения этих ключей.
 - **SSH-ключ — секретный конфиг-артефакт:** приватный deploy-ключ хранится **только** в GitHub Secrets (`SSH_PRIVATE_KEY`), публичный — в `~/.ssh/authorized_keys` deploy-пользователя на сервере (провизия — владелец сервера/devops). Не коммитится в git ([05-security.md → Секреты](../05-security.md#секреты)).
 

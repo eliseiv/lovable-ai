@@ -50,3 +50,10 @@ infra/setup_server_git.sh
 infra/check_swagger.sh
 infra/prod_probe.sh
 config_err.txt
+
+infra/diag.sh
+infra/e2e_prod.sh
+infra/fmt_probe.sh
+infra/verify_deploy.sh
+infra/wait_deploy.sh
+infra/wait_recreate.sh
