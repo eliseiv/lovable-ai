@@ -83,7 +83,7 @@ flowchart TB
 1. `access_level` пользователя из `subscriptions` (кэш; §3.2). `status ∈ {active, grace}` → проходит; `billing_issue`/`expired`/нет активной подписки на платном → `402 reason=no_entitlement`. Free-тариф всегда активен (его `status` дефолтно `active`).
 2. `max_projects` (только `POST /projects`): `COUNT(projects WHERE user_id)` `>= max_projects` (и `max_projects IS NOT NULL`) → `402 reason=project_limit`.
 3. `max_concurrent_jobs`: `active_jobs(user) >= max_concurrent_jobs` → `402 reason=concurrency_limit`. `active_jobs` — `COUNT` нетерминальных `generation_jobs` (та же логика, что [auth §6](../auth/03-architecture.md), но по реальному `access_level`). **Нормативно (единый источник, Sprint 5):** этот `COUNT` **kind-агностичен** — нетерминальные джобы `kind ∈ {generation, edit, rollback}` ([ADR-014](../../adr/ADR-014-edit-limit-revision-rollback.md)) **все занимают слот** `max_concurrent_jobs`. Следствие на Free (`max_concurrent_jobs=1`): in-flight `rollback`/`edit` блокирует старт новой `generation`/`edit` (`402 reason=concurrency_limit`) — документированное поведение тарифа. **Sprint 6 (закрытие наблюдаемостью [TD-012](../../100-known-tech-debt.md#td-012)):** отказ старта из-за занятого слота инструментируется `lovable_concurrency_block_by_kind_total{blocked_kind,holder_kind}` ([observability §2.7](../observability/03-architecture.md#27-billing--quota-billing)). **Продуктовое решение S6:** rollback/edit **остаются** в cap (семантика слота не меняется); долг закрывается метрикой, не изменением поведения — [TD-012](../../100-known-tech-debt.md#td-012)/[observability §6](../observability/03-architecture.md#6-scale-наблюдаемость-и-закрытие-долга-cross-ref-adr-016). Пересмотр (вывести rollback из cap) — отдельным ADR при существенной доле блокировок на дашборде Billing, не в S6.
-4. `usage_counters.generations_used` за текущий `period` `>= plan_quotas.monthly_generations` → `402 reason=quota_exhausted`.
+4. **Бизнес-квота генераций с учётом бонус-кредитов ([ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md)):** эффективный лимит `kind=generation` = `plan_quotas.monthly_generations` (за `period`) **+** `users.bonus_generations_balance`. Пропуск, если `usage_counters.generations_used < monthly_generations` **ИЛИ** `users.bonus_generations_balance > 0`; иначе (плановая квота исчерпана **и** нет кредитов) → `402 reason=quota_exhausted`. Бонус-кредиты учитываются **только** для `kind=generation`; правки (`kind=edit`) гейтятся `monthly_edits` (§7), кредиты их не покрывают. Семантика баланса/списания — §10.
 
 Любое нарушение → `402` (RFC-7807, `required_entitlement` + `reason`, [02-api-contracts §3](02-api-contracts.md#3-quota-gate-на-post-v1projects-и-post-v1projectspidedits)). Успех → разрешить старт.
 
@@ -97,6 +97,7 @@ flowchart TB
 - **Точка инкремента:** переход джобы из `CREATED` в активную обработку (фактический старт Agent 1 / постановка первой task пайплайна) для `kind='generation'`. Идемпотентность по джобе: инкремент привязан к первому старту конкретной `job_id` (guard от двойного инкремента при Celery `acks_late`/реплее — флаг/событие на джобе, не повторяется при crash-resume).
 - `period` = `YYYY-MM` (UTC) на момент старта. Сверка с `plan_quotas.monthly_generations` — в quota-gate (§4).
 - Гейт (§4) проверяет квоту **до** старта; инкремент — **на** успешном старте. Окно «прошёл гейт, но старт не случился» инкремент не делает (квота не сгорает на неуспехе постановки).
+- **Списание плановой квоты vs бонус-кредита ([ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md), §10):** на успешном старте generation-джобы меняется **ровно одна** из двух величин — пока `usage_counters.generations_used < monthly_generations`, инкрементируется `usage_counters.generations_used` (как описано выше); когда плановая квота за `period` исчерпана и `users.bonus_generations_balance > 0`, вместо инкремента счётчика **декрементируется** `users.bonus_generations_balance` на 1 (кредит). Тот же idempotency-guard по `job_id` покрывает обе ветки (двойного списания при Celery-реплее/crash-resume нет). Плановая квота тратится **первой** — кредиты не сгорают раньше времени.
 
 ---
 
@@ -147,3 +148,26 @@ stateDiagram-v2
 
 ## 9. Сидинг `plan_quotas`
 Alembic data-migration сидит Free + Pro. Нормативные значения — [03-data-model → plan_quotas](../../03-data-model.md#plan_quotas) и [08 §3.5](../../08-product-decisions.md#sprint-35--billing-adapty): Free = 3 ген/1 проект/1 конкурентная; Pro = 100 ген/безлимит проектов/3 конкурентных. access_level имена `free`/`pro`. Реальные Adapty product IDs привязываются в дашборде Adapty (**внешняя зависимость**) — `plan_quotas` ключуется по `access_level`, не по product_id.
+
+---
+
+## 10. Бонус-генерации (кредиты, [ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
+
+Кредиты — начисляемый админом запас генераций **сверх** плановой месячной квоты. Нормативная модель — [03-data-model → credit_grants](../../03-data-model.md#credit_grants-бонус-генерации-adr-021) + `users.bonus_generations_balance`. Начисление/просмотр — админ-плоскость ([modules/admin/02-api-contracts.md](../admin/02-api-contracts.md)).
+
+### 10.1 Модель величины
+- **Источник истины баланса** — денормализованная колонка `users.bonus_generations_balance INT` (O(1)-чтение на гейте/`billing/me`). Append-only `credit_grants` хранит **историю начислений/коррекций** (аудит + идемпотентность), не сам остаток.
+- **Инвариант:** `bonus_generations_balance >= 0`. Накопительный — **НЕ обнуляется помесячно** (в отличие от `usage_counters`, ключуемого `period`); переносится между периодами.
+
+### 10.2 Начисление (админ)
+- `POST /v1/admin/users/{user_id}/credits` `{ amount, reason? }` ([admin §3](../admin/02-api-contracts.md)): атомарно в одной транзакции — insert `credit_grants(amount, reason, idempotency_key, created_by='admin')` **и** `UPDATE users SET bonus_generations_balance = bonus_generations_balance + :amount`. `amount > 0` — начисление; `amount < 0` — операторская коррекция (но результат не < 0: при попытке увести в минус → `409`, транзакция откатывается).
+- **Идемпотентность** — заголовок `Idempotency-Key` (опц.): UNIQUE `credit_grants(user_id, idempotency_key)` → повтор no-op, возврат текущего баланса. Без ключа каждый вызов = новое начисление.
+
+### 10.3 Списание (на старте генерации)
+- На успешном старте generation-джобы (та же точка, что инкремент `usage_counters` — §5) меняется **ровно одна** величина: плановая квота **или** кредит. Порядок: **плановая квота первой** — пока `usage_counters.generations_used < plan_quotas.monthly_generations`, тратится она (инкремент `generations_used`); по её исчерпании и при `bonus_generations_balance > 0` — декремент `bonus_generations_balance` на 1.
+- Идемпотентность по `job_id` (тот же guard, что §5) — обе ветки защищены от двойного списания при Celery-реплее/crash-resume.
+- Кредиты применяются **только** к `kind=generation`. `kind=edit` — `monthly_edits`/`edit_usage_counters` (§7), кредиты не покрывают. `kind=rollback` — не гейтится и не списывает (§4/§7).
+
+### 10.4 Отражение в `GET /billing/me`
+- Добавляется `quota.bonus_generations_remaining` = `users.bonus_generations_balance`.
+- `generations_remaining = max(0, monthly_generations - generations_used) + bonus_generations_balance` (плановый остаток + кредиты). Нормативный контракт — [02-api-contracts §2](02-api-contracts.md#2-get-v1billingme).

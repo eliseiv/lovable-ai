@@ -31,6 +31,12 @@ logger = get_logger(__name__)
 _REQUIRED_ENTITLEMENT = "pro"
 
 
+async def _bonus_balance(session: AsyncSession, user_id: str) -> int:
+    """Накопительный баланс бонус-генераций пользователя (ADR-021). 0, если юзера нет."""
+    user = await session.get(User, user_id)
+    return user.bonus_generations_balance if user is not None else 0
+
+
 async def enforce_quota_gate(
     session: AsyncSession,
     user_id: str,
@@ -110,8 +116,12 @@ async def enforce_quota_gate(
                     required_entitlement=_REQUIRED_ENTITLEMENT,
                 )
     else:
+        # Эффективный лимит kind=generation = monthly_generations + bonus_generations_balance
+        # (ADR-021 §D / docs/billing §4). Пропуск, если плановая квота не исчерпана ИЛИ есть
+        # кредиты. Списание (плановая первой, затем кредит) — на старте джобы (usage §10.3).
         used = await usage.get_usage(session, user_id)
-        if used >= quota.monthly_generations:
+        bonus = await _bonus_balance(session, user_id)
+        if used >= quota.monthly_generations and bonus <= 0:
             metrics.quota_rejected_total.labels(reason="quota_exhausted").inc()
             raise payment_required(
                 f"Monthly generation quota exhausted ({used}/{quota.monthly_generations} "

@@ -52,14 +52,16 @@ Auth: Bearer.
   "status": "active",
   "period": "2026-06",
   "quota": { "monthly_generations": 100, "generations_used": 12,
-             "generations_remaining": 88,
+             "bonus_generations_remaining": 10,
+             "generations_remaining": 98,
              "monthly_edits": null, "edits_used": 3, "edits_remaining": null,
              "max_concurrent_jobs": 3, "active_jobs": 0,
              "max_projects": null, "projects_used": 4 } }
 ```
 - `status` ∈ `active` / `grace` / `billing_issue` / `expired` (см. `subscriptions.status`). `max_projects: null` = безлимит (Pro).
+- **Бонус-генерации ([ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md)):** `bonus_generations_remaining` = `users.bonus_generations_balance` (накопительный баланс кредитов, начисляемых админом сверх плановой квоты; **не** обнуляется помесячно). `generations_remaining = max(0, monthly_generations - generations_used) + bonus_generations_remaining` — суммарно доступные генерации (плановый остаток + кредиты). Списание на старте генерации тратит плановую квоту первой, затем кредиты ([03-architecture §10](03-architecture.md#10-бонус-генерации-кредиты-adr-021)). В примере: `max(0, 100-12)=88` план + `10` кредитов = `98`.
 - **Sprint 5** ([ADR-014](../../adr/ADR-014-edit-limit-revision-rollback.md)): `monthly_edits`/`edits_used`/`edits_remaining` — **отдельный лимит правок** (`plan_quotas.monthly_edits` + `edit_usage_counters` за текущий `period`). `monthly_edits: null` = безлимит (Pro) → `edits_remaining: null`; иначе `edits_remaining = max(0, monthly_edits - edits_used)`.
-- **Источник:** `subscriptions` (кэш Adapty) для `access_level`/`status` + `usage_counters`/`edit_usage_counters` (текущий `period`) + `plan_quotas` (лимиты) + `COUNT` активных джоб/проектов. `generations_remaining = max(0, monthly_generations - generations_used)`.
+- **Источник:** `subscriptions` (кэш Adapty) для `access_level`/`status` + `usage_counters`/`edit_usage_counters` (текущий `period`) + `plan_quotas` (лимиты) + `users.bonus_generations_balance` (кредиты, [ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md)) + `COUNT` активных джоб/проектов. `generations_remaining = max(0, monthly_generations - generations_used) + bonus_generations_remaining`.
 - Нет подписки/нет строки `subscriptions` → дефолт `access_level: "free"`, `status: "active"`, квота free-тарифа из `plan_quotas`.
 - **Lazy-ресинк:** если `subscriptions.synced_at` старше TTL (`BILLING_RESYNC_INTERVAL_S`) — best-effort `getProfile` перед ответом (не блокирует при недоступности Adapty: отдаём кэш). [03-arch §3](03-architecture.md#3-ресинк-getprofile).
 

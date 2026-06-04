@@ -14,6 +14,7 @@ erDiagram
     users ||--o{ subscriptions : has
     users ||--o{ usage_counters : tracks
     users ||--o{ edit_usage_counters : tracks_edits
+    users ||--o{ credit_grants : granted_bonus
     users ||--o{ device_tokens : registers
     users ||--o{ billing_events : receives
     projects ||--o{ generation_jobs : has
@@ -37,8 +38,11 @@ erDiagram
 | `api_key_hash` | text NULL | **Legacy (S1).** argon2id-хэш единственного seeded Bearer-ключа. С Sprint 3 реальные токены живут в `api_tokens` (мульти-устройство, индексируемый lookup). Поле сохранено на время миграции (fallback-путь, [ADR-008](adr/ADR-008-indexed-api-key-lookup.md) → «Миграционный путь»); становится nullable. |
 | `adapty_customer_user_id` | text NULL UNIQUE | Связка с Adapty профилем = `users.id`. Создаётся при первом входе iOS ([Q-BILLING-3](99-open-questions.md#q-billing-3) resolved). |
 | `monthly_budget_usd` | numeric(10,4) | Технический потолок затрат Claude на юзера (отдельно от бизнес-квоты). |
+| `bonus_generations_balance` | int NOT NULL default 0 | **ADR-021.** Накопительный баланс бонус-генераций (кредитов), начисляемых админом **сверх** плановой месячной квоты ([ADR-021 §D](adr/ADR-021-admin-plane-and-bonus-credits.md)). **НЕ обнуляется помесячно** (в отличие от `usage_counters.generations_used`, ключуемого `period`). Денормализованный O(1)-баланс для quota-gate/`billing/me`; источник истины величины — эта колонка (атомарно мутируется), история начислений — append-only `credit_grants`. **Инвариант:** `>= 0` (отрицательная коррекция не уводит ниже 0). Списание на старте generation-джобы **только после** исчерпания плановой квоты (`usage_counters.generations_used >= monthly_generations`) — [modules/billing/03-architecture.md §10](modules/billing/03-architecture.md#10-бонус-генерации-кредиты-adr-021). Миграция `20260604_0001`. |
 | `status` | text | `active` / `suspended`. |
 | `created_at` | timestamptz | |
+
+> **ADR-021 (login-as без Apple):** `apple_sub=NULL` теперь допустим **не только** для legacy S1 seed-юзера, но и для юзеров, созданных через `POST /v1/admin/login-as` (выпуск пользовательского токена за `user_id` без Sign in with Apple, [ADR-021 §B](adr/ADR-021-admin-plane-and-bonus-credits.md)). UNIQUE-индекс по `apple_sub` сохраняется (NULL не нарушает UNIQUE в Postgres). `adapty_customer_user_id = users.id` проставляется и для admin-created юзеров (как при Apple-входе).
 
 ## api_tokens (Sprint 3)
 
@@ -231,6 +235,22 @@ erDiagram
 | `edits_used` | int | Инкремент на **успешный старт edit-джобы** (`kind='edit'`, постановка первой `task_fix`-edit), **не** на `POST /edits` и **не** на rollback. Атомарный upsert `ON CONFLICT (user_id, period) DO UPDATE`, идемпотентно по `job_id`. Сверяется с `plan_quotas.monthly_edits` на quota-gate `/edits`. Нормативная точка — [modules/billing/03-architecture.md §7](modules/billing/03-architecture.md#7-граница-s5-edits). |
 
 > Rollback (`POST .../rollback`) **не** инкрементирует `edit_usage_counters` — это передеплой существующей good-ревизии без новой генерации/правки ([ADR-014 §A](adr/ADR-014-edit-limit-revision-rollback.md)).
+
+### credit_grants (бонус-генерации, ADR-021)
+
+Append-only ledger начислений/коррекций бонус-генераций (кредитов) админом ([ADR-021 §D](adr/ADR-021-admin-plane-and-bonus-credits.md)). Аудит-история + точка идемпотентности начисления. Текущий баланс — денормализован в `users.bonus_generations_balance` (источник истины величины); ledger хранит **историю изменений**, не сам остаток.
+
+| Поле | Тип | Заметки |
+|---|---|---|
+| `id` | text PK | `cg_...`. |
+| `user_id` | text FK→users NOT NULL | Получатель кредитов. Индекс по `(user_id)`. |
+| `amount` | int NOT NULL | Дельта баланса: `> 0` — начисление, `< 0` — операторская коррекция/списание. Применение `amount` к `users.bonus_generations_balance` — атомарно в одной транзакции с insert этой строки; результирующий баланс **не может стать < 0** (`409` при попытке увести в минус — [modules/admin/02-api-contracts.md §3](modules/admin/02-api-contracts.md)). |
+| `reason` | text NULL | Опц. человекочитаемая причина начисления (операторская заметка, аудит). |
+| `idempotency_key` | text NULL | Партиальный UNIQUE-индекс `(user_id, idempotency_key) WHERE idempotency_key IS NOT NULL`. Дедуп начисления по заголовку `Idempotency-Key` (`POST /v1/admin/users/{user_id}/credits`): повтор с тем же ключом → no-op (строка не дублируется), возврат текущего баланса. Без ключа — каждый вызов = новая строка. |
+| `created_by` | text NOT NULL default 'admin' | Кто начислил. Сейчас единственный источник — админ (`ADMIN_API_KEY`); per-operator-аудит — отдельный ADR при необходимости ([ADR-021 §Consequences](adr/ADR-021-admin-plane-and-bonus-credits.md)). |
+| `created_at` | timestamptz NOT NULL | Момент начисления. |
+
+> **Списание кредитов НЕ создаёт строку `credit_grants`.** Расход кредита на старте generation-джобы — атомарный декремент `users.bonus_generations_balance` (как `usage_counters` для плановой квоты), не ledger-запись. `credit_grants` фиксирует **только** админские начисления/коррекции (входящий поток), не помесячный расход. Семантика списания — [modules/billing/03-architecture.md §10](modules/billing/03-architecture.md#10-бонус-генерации-кредиты-adr-021). Миграция `20260604_0001`.
 
 ### device_tokens (Sprint 5)
 

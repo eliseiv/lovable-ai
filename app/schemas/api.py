@@ -229,7 +229,12 @@ class RegisterDeviceResponse(BaseModel):
 class BillingQuota(BaseModel):
     monthly_generations: int = Field(description="Лимит генераций в месяц.")
     generations_used: int = Field(description="Использовано генераций в текущем месяце.")
-    generations_remaining: int = Field(description="Остаток генераций в текущем месяце.")
+    bonus_generations_remaining: int = Field(
+        description="Остаток бонус-генераций (кредитов) — накопительный, не обнуляется помесячно."
+    )
+    generations_remaining: int = Field(
+        description="Суммарный остаток генераций: плановый остаток + бонус-кредиты."
+    )
     monthly_edits: int | None = Field(description="Лимит правок в месяц (`null` — безлимит).")
     edits_used: int = Field(description="Использовано правок в текущем месяце.")
     edits_remaining: int | None = Field(
@@ -248,6 +253,67 @@ class BillingMeResponse(BaseModel):
     status: str = Field(description="Статус подписки.")
     period: str = Field(description="Расчётный период в формате `YYYY-MM`.")
     quota: BillingQuota = Field(description="Лимиты и остатки квот.")
+
+
+# --- Админ-плоскость (ADR-021, не в публичной схеме: include_in_schema=False) ---
+
+
+class AdminLoginAsRequest(BaseModel):
+    user_id: str | None = Field(
+        default=None,
+        description="Идентификатор пользователя. Нет такого — пользователь создаётся; "
+        "опущен — генерируется новый идентификатор.",
+    )
+    device_label: str | None = Field(
+        default=None, description="Метка устройства (по умолчанию admin-login)."
+    )
+
+
+class AdminLoginAsResponse(BaseModel):
+    api_key: str = Field(description="Bearer-ключ пользователя (`lv_<key_id>_<secret>`).")
+    token_id: str = Field(description="Идентификатор выданного токена.")
+    user_id: str = Field(description="Идентификатор пользователя.")
+
+
+class AdminGrantCreditsRequest(BaseModel):
+    amount: int = Field(
+        description="Дельта баланса бонус-генераций: >0 — начисление, <0 — коррекция."
+    )
+    reason: str | None = Field(default=None, description="Причина начисления (заметка оператора).")
+
+
+class AdminGrantCreditsResponse(BaseModel):
+    user_id: str = Field(description="Идентификатор пользователя.")
+    amount_applied: int = Field(description="Применённая дельта баланса.")
+    bonus_generations_balance: int = Field(description="Итоговый баланс бонус-генераций.")
+
+
+class AdminUserQuota(BaseModel):
+    monthly_generations: int = Field(description="Лимит генераций в месяц.")
+    generations_used: int = Field(description="Использовано генераций в текущем месяце.")
+    generations_remaining: int = Field(
+        description="Суммарный остаток генераций: плановый остаток + бонус-кредиты."
+    )
+    monthly_edits: int | None = Field(description="Лимит правок в месяц (`null` — безлимит).")
+    edits_used: int = Field(description="Использовано правок в текущем месяце.")
+    edits_remaining: int | None = Field(
+        description="Остаток правок в текущем месяце (`null` — безлимит)."
+    )
+    max_concurrent_jobs: int | None = Field(
+        description="Лимит одновременных задач (`null` — безлимит)."
+    )
+    active_jobs: int = Field(description="Число активных задач сейчас.")
+    max_projects: int | None = Field(description="Лимит проектов (`null` — безлимит).")
+    projects_used: int = Field(description="Число активных проектов.")
+
+
+class AdminUserResponse(BaseModel):
+    user_id: str = Field(description="Идентификатор пользователя.")
+    access_level: str = Field(description="Текущий тариф (`free` / `pro`).")
+    status: str = Field(description="Статус подписки.")
+    period: str = Field(description="Расчётный период в формате `YYYY-MM`.")
+    bonus_generations_balance: int = Field(description="Баланс бонус-генераций (кредитов).")
+    quota: AdminUserQuota = Field(description="Лимиты и остатки квот пользователя.")
 
 
 # --- Health/readiness (служебное, не в публичной схеме) ---

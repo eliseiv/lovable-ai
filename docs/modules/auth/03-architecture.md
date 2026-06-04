@@ -67,6 +67,14 @@ flowchart TB
 - **Код ответа (каноникализация S3.5):** превышение cap → `402 reason=concurrency_limit` (RFC-7807, единый payment-gate billing — [modules/billing/02-api-contracts.md §3](../billing/02-api-contracts.md#3-quota-gate-на-post-v1projects-и-post-v1projectspidedits)). `429` остаётся **только** за rate-limit 60/min (§5). Прежняя S3-формулировка «`429`/`402`» уточнена: для concurrency — `402`.
 - Реализация счётчика: авторитет — Postgres (`COUNT` активных `generation_jobs` по `user_id`, согласовано с денормализованным `generation_jobs.user_id`); Redis-счётчик как быстрый гейт — опционально (та же логика, что [TD-006](../../100-known-tech-debt.md#td-006) для бюджета, не блокирует S3).
 
+## 7. Admin login-as: upsert юзера без `apple_sub` ([ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
+
+`POST /v1/admin/login-as` (админ-плоскость, [modules/admin/03-architecture.md §2](../admin/03-architecture.md#2-login-as-adr-021)) переиспользует `token_service` для выпуска пользовательского Bearer за указанного `user_id`, минуя Apple Sign-In:
+- **Резолв юзера:** `body.user_id` найден → берём; не найден (или опущен) → создаём `users` (`id` = переданный или `u_...`, **`apple_sub=NULL`**, `adapty_customer_user_id=users.id`, `status='active'`, `bonus_generations_balance=0`).
+- **`apple_sub=NULL` допустим** для admin-created юзеров (расширение S1-инварианта seed-юзера; UNIQUE по `apple_sub` не нарушается — NULL вне UNIQUE в Postgres). [03-data-model → users](../../03-data-model.md#users).
+- **Выпуск токена** — тот же `token_service` (новая строка `api_tokens`, `device_label` = `body.device_label` или `"admin-login"`), `lv_<key_id>_<secret>` один раз.
+- Защита эндпоинта — `require_admin` (`X-Admin-Key`), **не** Bearer. Контракт — [modules/admin/02-api-contracts.md](../admin/02-api-contracts.md).
+
 ## Конвенции
 - Все секреты ключей — только argon2-хэш в БД; в логах — только `key_id`, **никогда** `secret`.
 - Auth-провалы → `401` без раскрытия конкретной непрошедшей проверки.

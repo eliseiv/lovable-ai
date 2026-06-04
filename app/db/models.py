@@ -46,6 +46,15 @@ class User(Base):
     monthly_budget_usd: Mapped[Decimal] = mapped_column(
         Numeric(10, 4), nullable=False, default=Decimal("50.0000")
     )
+    # ADR-021: накопительный баланс бонус-генераций (кредитов), начисляемых админом сверх
+    # плановой месячной квоты. НЕ обнуляется помесячно (в отличие от usage_counters).
+    # Денормализованный O(1)-баланс (источник истины величины; история — credit_grants).
+    # Инвариант: >= 0. Списание на старте generation-джобы — только после исчерпания плановой
+    # квоты (docs/modules/billing/03 §10). Атомарно мутируется в одной транзакции с insert
+    # credit_grants (начисление) или с count_generation_start (списание).
+    bonus_generations_balance: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("0")
+    )
     status: Mapped[str] = mapped_column(String, nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -429,6 +438,47 @@ class BillingEvent(Base):
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class CreditGrant(Base):
+    """Append-only ledger начислений/коррекций бонус-генераций (ADR-021, docs §credit_grants).
+
+    Аудит-история начислений админом + точка идемпотентности (партиальный UNIQUE
+    (user_id, idempotency_key) при заданном ключе). Текущий баланс денормализован в
+    users.bonus_generations_balance (источник истины величины); ledger хранит историю
+    изменений, не сам остаток. Списание кредитов (на старте генерации) строку НЕ создаёт.
+    """
+
+    __tablename__ = "credit_grants"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # cg_...
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    # Дельта баланса: > 0 — начисление, < 0 — операторская коррекция/списание. Применяется к
+    # users.bonus_generations_balance атомарно в одной транзакции с insert этой строки;
+    # результирующий баланс не может стать < 0 (409 при попытке увести в минус).
+    amount: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Партиальный UNIQUE (user_id, idempotency_key) WHERE idempotency_key IS NOT NULL —
+    # дедуп по заголовку Idempotency-Key (повтор → no-op, возврат текущего баланса).
+    idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Кто начислил. Сейчас единственный источник — админ (ADMIN_API_KEY).
+    created_by: Mapped[str] = mapped_column(
+        Text, nullable=False, default="admin", server_default="admin"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        # Идемпотентность начисления: один и тот же Idempotency-Key на user_id не дублируется.
+        Index(
+            "uq_credit_grants_user_idempotency",
+            "user_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=sql_text("idempotency_key IS NOT NULL"),
+        ),
     )
 
 

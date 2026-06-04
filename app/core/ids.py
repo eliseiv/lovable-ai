@@ -76,6 +76,11 @@ def new_device_token_id() -> str:
     return _opaque("dev_")
 
 
+def new_credit_grant_id() -> str:
+    """Opaque ID строки credit_grants (`cg_...`, ADR-021 бонус-генерации)."""
+    return _opaque("cg_")
+
+
 def new_subdomain() -> str:
     """Opaque-идентификатор деплоя [a-z0-9]{16} (НЕ project_id)."""
     return "".join(secrets.choice(_SUBDOMAIN_ALPHABET) for _ in range(16))

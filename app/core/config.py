@@ -97,6 +97,18 @@ class Settings(BaseSettings):
         "RATE_LIMIT_PER_MIN, docs/05-security.md §Rate-limit).",
     )
 
+    # --- Админ-плоскость (ADR-021, docs/07-deployment env-контракт) ---
+    # Секрет X-Admin-Key для require_admin на /v1/admin/* (login-as, бонус-кредиты).
+    # Сравнивается constant-time (hmac.compare_digest). Пусто/None → плоскость отключена
+    # (require_admin всегда 401). Работает в dev И prod (безопасность — секрет, не среда;
+    # environment не участвует). Секрет уровня root-доступа, encrypted-at-rest, в Sentry
+    # scrubbed (denylist по подстроке api_key). env ADMIN_API_KEY.
+    admin_api_key: SecretStr | None = Field(
+        default=None,
+        description="Секрет админ-плоскости (X-Admin-Key). Пусто/None → плоскость отключена "
+        "(require_admin всегда 401). Constant-time сравнение. env ADMIN_API_KEY (ADR-021).",
+    )
+
     # --- Деплой сайтов ---
     apps_domain: str = Field(
         default="apps.localhost",

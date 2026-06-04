@@ -14,20 +14,15 @@ from fastapi import APIRouter, Header, Request, Response, status
 
 from app.api.dependencies import CurrentUser, SessionDep
 from app.api.errors import problem_responses, unauthorized
-from app.billing import entitlements, usage
 from app.billing.adapty_client import verify_webhook_signature
-from app.billing.subscription_state import (
-    DEFAULT_ACCESS_LEVEL,
-    STATUS_ACTIVE,
-    get_subscription,
-)
 from app.billing.webhook_handler import (
     WebhookProcessingError,
     process_webhook,
 )
 from app.core.config import get_settings
 from app.core.logging import get_logger
-from app.schemas.api import BillingMeResponse, BillingQuota
+from app.schemas.api import BillingMeResponse
+from app.services import billing_service
 
 logger = get_logger(__name__)
 
@@ -93,49 +88,16 @@ async def adapty_webhook(
     responses=problem_responses(401, 429),
 )
 async def billing_me(user: CurrentUser, session: SessionDep) -> BillingMeResponse:
-    """Возвращает текущий тариф и остаток квоты. Нет подписки → бесплатный тариф."""
-    # resolve_entitlement выполняет lazy-ресинк при протухании (fail-open на кэш).
-    ent = await entitlements.resolve_entitlement(session, user.id)
-    quota = await entitlements.get_plan_quota(session, ent.access_level)
+    """Возвращает текущий тариф и остаток квоты. Нет подписки → бесплатный тариф.
 
-    period = usage.current_period()
-    generations_used = await usage.get_usage(session, user.id, period)
-    edits_used = await usage.get_edit_usage(session, user.id, period)
-    active_jobs = await entitlements.count_active_jobs(session, user.id)
-    projects_used = await entitlements.count_projects(session, user.id)
-    max_concurrent = await entitlements.resolve_max_concurrent_jobs(session, user.id)
-
-    if quota is not None:
-        monthly_generations = quota.monthly_generations
-        max_projects = quota.max_projects
-        monthly_edits = quota.monthly_edits
-    else:
-        # plan_quotas не сидирован — деградируем к нулевому потолку (явный сигнал, не падаем).
-        monthly_generations = 0
-        max_projects = None
-        monthly_edits = None
-
-    # edits_remaining: None при безлимите (Pro, monthly_edits=NULL), иначе max(0, лимит-исп.).
-    edits_remaining = None if monthly_edits is None else max(0, monthly_edits - edits_used)
-
-    sub = await get_subscription(session, user.id)
-    access_level = sub.access_level if sub is not None else DEFAULT_ACCESS_LEVEL
-    sub_status = sub.status if sub is not None else STATUS_ACTIVE
-
+    Единый источник агрегатов — billing_service.build_billing_snapshot (учитывает бонус-кредиты:
+    bonus_generations_remaining + generations_remaining = плановый остаток + кредиты, ADR-021
+    §10.4). Тот же снимок переиспользует админ GET /admin/users/{user_id}.
+    """
+    snapshot = await billing_service.build_billing_snapshot(session, user)
     return BillingMeResponse(
-        access_level=access_level,
-        status=sub_status,
-        period=period,
-        quota=BillingQuota(
-            monthly_generations=monthly_generations,
-            generations_used=generations_used,
-            generations_remaining=max(0, monthly_generations - generations_used),
-            monthly_edits=monthly_edits,
-            edits_used=edits_used,
-            edits_remaining=edits_remaining,
-            max_concurrent_jobs=max_concurrent,
-            active_jobs=active_jobs,
-            max_projects=max_projects,
-            projects_used=projects_used,
-        ),
+        access_level=snapshot.access_level,
+        status=snapshot.status,
+        period=snapshot.period,
+        quota=snapshot.quota,
     )
