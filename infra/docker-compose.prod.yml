@@ -101,6 +101,10 @@ x-app-env: &app-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   # --- Auth ---
   SEED_API_KEY: ${SEED_API_KEY}
+  # ADR-021: секрет админ-плоскости (X-Admin-Key для /v1/admin/*: login-as,
+  # бонус-кредиты). Пусто/None -> require_admin всегда 401 (плоскость отключена).
+  # docs/07 env-контракт стр. «ADMIN_API_KEY», потребитель api.
+  ADMIN_API_KEY: ${ADMIN_API_KEY:-}
   # Apple Sign in (Sprint 3) — ожидаемый aud identity token (bundle/Services ID).
   APPLE_AUDIENCE: ${APPLE_AUDIENCE:-mba.gipsy.lovable}
   # --- Деплой сайтов / роутинг (PROD: path-based на corelysite.shop) ---
