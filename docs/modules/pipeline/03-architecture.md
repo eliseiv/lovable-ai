@@ -318,7 +318,20 @@ stateDiagram-v2
 
   > «Верни **СТРОГО raw JSON** требуемой структуры. **Без** markdown-фенсов (` ``` `/` ```json `), **без** пояснений/префиксов/прозы до или после JSON. Первый символ ответа — `{` или `[`, последний — `}` или `]`.»
 
-- Выходная структура каждого агента — прежняя (контракты не меняются): Agent 1 — `{ questions: string[] }`; Agent 2 — `spec_tz`-форма; Agent 3 — `agent_output` (`files[]`/`entry`/`build`); Agent 4 — `agent_output` + ветка `unrecoverable` полями JSON ([§A](#a-контракт-agent-4-fixer)).
+- Этот общий суффикс (`STRICT_JSON_SUFFIX`) фиксирует **только форму** ответа (raw JSON, без фенсов), но **НЕ** пинит **точные top-level имена ключей** структуры конкретного агента. Этого недостаточно: модель в текстовом режиме **угадывает** имя ключа-обёртки (live-E2E 2026-06-04: Agent 2 трижды вернул валидный JSON под `spec`/`specification` вместо требуемого `spec_markdown` → валидатор `data.get("spec_markdown")` → всегда `None` → schema-фейл «empty specification» → исчерпание ретраев → `FAILED(invalid_agent_output)`). Поэтому строгий суффикс **дополняется** per-agent декларацией точной схемы (§I.6).
+
+### I.1a Канонические output-схемы агентов — single source of truth (нормативно)
+
+Точные top-level имена ключей output-JSON **каждого** агента фиксируются здесь и являются **единственным источником истины**, по которому И системный промт агента (§I.6), И его валидатор в коде (`app/pipeline/agents/agentN.py`) обязаны совпадать. Расхождение промт↔валидатор по имени ключа = баг (как инцидент Agent 2). Канон выверен по фактическим валидаторам:
+
+| Агент | Валидатор (код) | Канонический top-level ключ(и) | Минимальный валидный объект |
+|---|---|---|---|
+| **Agent 1** (Interviewer) | `agent1.py::_validate_questions` → `data.get("questions")` | `questions` — непустой массив объектов `{position:int, text:string(непустой), kind:"free_text"\|"choice", options:[string,…] (только при kind=="choice")}` | `{"questions":[{"position":1,"text":"…","kind":"free_text"}]}` |
+| **Agent 2** (Spec Writer) | `agent2.py::_validate_spec` → `data.get("spec_markdown")` | **`spec_markdown`** — непустая строка с Markdown-текстом спецификации (НЕ `spec`, НЕ `specification`) | `{"spec_markdown":"# Спецификация\n…"}` |
+| **Agent 3** (Builder) | `agent3.py` → `validate_agent_output` (`schemas/agent_output.py`) | `files` (непустой массив `{path,encoding,content}`), `entry` (строка), `build` (объект `{command, output_dir?, tool?}`) — полная схема: §«Контракт output Agent 3» | `{"files":[…],"entry":"index.html","build":{"command":"npm ci && vite build","output_dir":"dist"}}` |
+| **Agent 4** (Fixer/Editor) | `agent4.py::_validate_agent4_output` → `validate_agent_output` ИЛИ `_parse_unrecoverable` | Ветка дерева: те же `files`/`entry`/`build`, что Agent 3. **ЛИБО** ветка сигнала: `unrecoverable` (`true`), `reason` (строка), `explanation` (строка) | дерево как Agent 3 **или** `{"unrecoverable":true,"reason":"…","explanation":"…"}` |
+
+> **Примечание по Agent 2 — устранение противоречия в теле промта.** Исторический промт `agent2_spec_writer.txt` предписывал «respond as GitHub-flavored Markdown text only. Do not wrap it in JSON» — это **прямо противоречит** `STRICT_JSON_SUFFIX` (raw JSON) и валидатору (`spec_markdown`). Это второй корень инцидента: тело промта и suffix давали модели взаимоисключающие инструкции. Канон выше — нормативный: Agent 2 **обязан** возвращать JSON-объект `{"spec_markdown": "<markdown-строка>"}`; противоречащая инструкция в теле промта удаляется (§I.6). Валидатор `_validate_spec` уже читает `spec_markdown` — приводить его НЕ нужно; к канону приводятся **промты**.
 
 > **Почему не tool-use / не `auto`.** Форсированный tool-use → HTTP 400 при thinking. `tool_choice={"type":"auto"}` API допускает, но не форсирует → модель может вернуть текст → всё равно нужен `extract_json` + развилка «tool vs text». Текстовый режим + `extract_json` проще и детерминирован по обработке. Подробности и отвергнутые варианты — [ADR-020 §Alternatives](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md#alternatives).
 
@@ -353,6 +366,16 @@ stateDiagram-v2
 
 Чтобы отказ диагностировался по `job_events`/логам **без ручного воспроизведения** (как было в инциденте: `agent1_failed` логировался без текста `ValueError` и без сырого ответа).
 
+### I.6 Per-agent декларация точной схемы в промте (обязательно — фикс инцидента Agent 2)
+
+`STRICT_JSON_SUFFIX` (§I.1) фиксирует только форму (raw JSON). Системный промт **каждого** агента **ОБЯЗАН** дополнительно декларировать **свою** точную output-схему из §I.1a:
+- **точные top-level имена ключей** (для Agent 2 — ровно `spec_markdown`; для Agent 1 — `questions`; для Agent 3/4 — `files`/`entry`/`build`, у Agent 4 — плюс ветка `unrecoverable`/`reason`/`explanation`);
+- **пример минимального валидного объекта** (колонка «Минимальный валидный объект» из §I.1a) — чтобы модель не угадывала ключ-обёртку.
+
+Тело промта **не должно содержать инструкций, противоречащих** канону §I.1a и `STRICT_JSON_SUFFIX`. В частности, из `agent2_spec_writer.txt` удаляется указание «respond as Markdown text only / do not wrap it in JSON»: Agent 2 возвращает `{"spec_markdown": "<markdown>"}`, где Markdown — **значение** строкового поля, а не формат всего ответа.
+
+Это требование действует для всех 4 агентов (`agent1_interviewer`, `agent2_spec_writer`, `agent3_builder`, `agent4_fixer`, `agent4_editor`), чтобы рассогласование ключ-промта ↔ ключ-валидатора не повторилось латентно ни в одном из них. STRICT_JSON_SUFFIX, `extract_json`, bounded retry, доменная валидация и диагностируемость (§I.2–I.4) при этом **не меняются**.
+
 ### I.5 Критерии приёмки (qa)
 
 - **unit (регрессия на fence, обязателен):** ответ модели в форме ` ```json {…} ``` ` (и ` ``` {…} ``` ` без tag) → `extract_json` извлекает валидную структуру **без** `ValueError`; шаг агента **не** уходит в `FAILED` (воспроизводит прод-инцидент run1/run4).
@@ -360,6 +383,9 @@ stateDiagram-v2
 - **unit (текстовый режим):** агент вызывается без `tools`/форс-`tool_choice`; структура читается из `block.text` через `extract_json`; system-промт содержит строгую инструкцию «raw JSON без фенсов» (§I.1).
 - **unit (bounded retry):** parse/schema-фейл ретраится до `AGENT_OUTPUT_MAX_RETRIES`; на исчерпании — `FAILED(invalid_agent_output)` (Agent 1/2) либо виток `agent_output_invalid`→FIXING/`invalid_agent_output` (Agent 3/4); каждый retry — отдельная запись `llm_usage`, budget/wall-clock-гард проверяется перед каждым вызовом.
 - **unit (диагностируемость):** при parse-фейле в `job_events.payload` присутствуют имя агента, текст ошибки и scrubbed усечённый raw-ответ (без секретов).
+- **contract (промт↔валидатор консистентность по single source, обязателен — фикс инцидента Agent 2, §I.1a/§I.6):** для **КАЖДОГО** из 4 агентов тест проверяет, что (а) системный промт агента **декларирует** канонический top-level ключ из §I.1a (Agent 1 — `questions`; Agent 2 — `spec_markdown`; Agent 3/4 — `files`/`entry`/`build`; Agent 4 — плюс `unrecoverable`) — например, искомый ключ присутствует в тексте промта; И (б) валидатор того же агента читает **тот же** ключ. Цель — ни один агент не может разойтись промт↔валидатор по имени ключа (как Agent 2: промт → `spec`/`specification`, валидатор → `spec_markdown`).
+- **contract (валидатор не падает «empty» на канонической форме, страховка):** для каждого агента — тест, что подача **канонической** минимальной формы из §I.1a (например `{"spec_markdown":"# x"}` в `_validate_spec`; `{"questions":[…]}` в `_validate_questions`; минимальное валидное дерево в `validate_agent_output`; `{"unrecoverable":true,…}` в `_validate_agent4_output`) проходит валидацию **без** schema-фейла. Воспроизводит и закрывает прод-инцидент: ранее `_validate_spec` падал «empty specification», т.к. промт не пинил `spec_markdown`.
+- **negative (Agent 2 — отсутствие противоречия в промте):** тест, что `agent2_spec_writer.txt` **не** содержит инструкции возвращать ответ как Markdown-текст / «do not wrap it in JSON» (устранённый второй корень §I.6).
 - Cross-ref [06-testing-strategy.md](../../06-testing-strategy.md).
 
 ## F. `failure_log` в S3

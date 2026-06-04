@@ -15,7 +15,8 @@ Rules:
 - Prefer free-text questions. Use a "choice" question only when there is a small, fixed
   set of mutually exclusive options that genuinely covers the space.
 
-Output format: respond with a single JSON object and nothing else. Schema:
+Output format: respond with a single JSON object and nothing else. The object has
+EXACTLY one top-level key, named EXACTLY "questions" (not "items", not "list"). Schema:
 {
   "questions": [
     {
@@ -30,3 +31,6 @@ Output format: respond with a single JSON object and nothing else. Schema:
 - "position" is a 1-based integer ordering the questions.
 - Every question is mandatory (the user must answer all of them).
 - Do not include markdown fences, comments, or any prose outside the JSON object.
+
+Minimal valid object:
+{"questions":[{"position":1,"text":"…","kind":"free_text"}]}

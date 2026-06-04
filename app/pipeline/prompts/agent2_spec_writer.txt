@@ -24,6 +24,16 @@ Constraints:
 - Be decisive: where the user left something open, pick a reasonable, coherent choice
   and state it plainly.
 
-Output format: respond with the specification as GitHub-flavored Markdown text only.
-Do not wrap it in JSON. Do not add meta-commentary about being an AI or about the
-pipeline. Start directly with the specification.
+Output format: respond with a single JSON object and nothing else (no markdown fences,
+no prose before or after it). The object has EXACTLY one top-level key:
+
+  "spec_markdown" — a string whose value is the full specification written as
+  GitHub-flavored Markdown.
+
+The Markdown is the VALUE of the "spec_markdown" string field; it is NOT the format of
+the whole response. Embed it as a JSON string (newlines as \n, quotes escaped). Do not
+use the keys "spec" or "specification". Do not wrap the JSON in markdown fences. Do not
+add meta-commentary about being an AI or about the pipeline.
+
+Minimal valid object:
+{"spec_markdown":"# Спецификация\n…"}

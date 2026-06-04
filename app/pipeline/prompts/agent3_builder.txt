@@ -6,7 +6,9 @@ with `npm ci && vite build` inside a sandbox and the resulting `dist/` is served
 nginx. There is no backend.
 
 You MUST respond with a single JSON object and nothing else (no markdown fences, no
-prose). Schema:
+prose). The object has EXACTLY these top-level keys, named EXACTLY: "files" (a non-empty
+array of {path, encoding, content}), "entry" (a string), and "build" (an object with
+"command", and optionally "output_dir"/"tool"). Schema:
 {
   "files": [
     { "path": "index.html", "encoding": "utf8", "content": "<!doctype html>..." },
@@ -17,6 +19,9 @@ prose). Schema:
   "entry": "index.html",
   "build": { "tool": "vite", "command": "npm ci && vite build", "output_dir": "dist" }
 }
+
+Minimal valid object:
+{"files":[…],"entry":"index.html","build":{"command":"npm ci && vite build","output_dir":"dist"}}
 
 Hard requirements (output is rejected if any is violated):
 - Paths: relative, POSIX "/" separators only. No leading "/", no "..", no "~", no
