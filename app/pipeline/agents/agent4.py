@@ -6,12 +6,13 @@
      джобы (текстовые файлы как {path, content}; бинарные ассеты — только {path, size});
   3. failure_log (хвост из S3, FIXER_LOG_TAIL_BYTES) + извлечённые error-строки.
 
-Выход (форсированный tool-use submit_project, ADR-020 §I.1; та же схема agent_output, что
-Agent 3, ПЛЮС ветка unrecoverable полями инструмента — §A): исправленное дерево (ValidatedTree),
-ЛИБО сигнал {unrecoverable: true, reason, explanation} → UnrecoverableSignal. Доменная валидация
-дерева — поверх tool-use (§I.1). Невалидный output после ретраев = fix-неудача (AgentOutputError,
-учёт в retry_count/no-progress, ADR-005), не падение таски. Bounded retry на parse/schema-фейл
-(AGENT_OUTPUT_MAX_RETRIES) — общий слой structured.py. Модель — AGENT4_MODEL (tiering).
+Выход (текстовый режим + строгий промт + extract_json, ADR-020 §I, revised; та же схема
+agent_output, что Agent 3, ПЛЮС ветка unrecoverable полями JSON — §A): исправленное дерево
+(ValidatedTree), ЛИБО сигнал {unrecoverable: true, reason, explanation} → UnrecoverableSignal.
+Доменная валидация дерева — поверх извлечённой структуры (§I.2). Невалидный output после ретраев
+= fix-неудача (AgentOutputError, учёт в retry_count/no-progress, ADR-005), не падение таски.
+Bounded retry на parse/schema-фейл (AGENT_OUTPUT_MAX_RETRIES) — общий слой structured.py.
+Модель — AGENT4_MODEL (tiering).
 """
 
 from __future__ import annotations
@@ -25,7 +26,6 @@ from app.core.config import Settings
 from app.core.logging import get_logger
 from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
 from app.pipeline.agents.structured import (
-    AGENT4_TOOL,
     DiagnosticsHook,
     GuardHook,
     UsageHook,
@@ -166,7 +166,7 @@ def _parse_unrecoverable(raw: dict[str, object]) -> UnrecoverableSignal | None:
 
 
 def _validate_agent4_output(raw: object, settings: Settings) -> _Agent4Output:
-    """Доменная валидация tool_use.input Agent 4 поверх tool-use (ADR-020 §I.1).
+    """Доменная валидация извлечённой структуры Agent 4 поверх extract_json (ADR-020 §I.2).
 
     Сигнал unrecoverable — легальный выход (дерево None), не ошибка. Иначе валидируем дерево
     тем же контрактом, что Agent 3 (AgentOutputError → schema-фейл, ретраится; на исчерпании
@@ -199,7 +199,8 @@ async def run_agent4(
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
 ) -> Agent4Result:
-    """Один шаг Fixer (форсированный tool-use + bounded retry + доменная валидация, ADR-020 §I).
+    """Один шаг Fixer (текстовый режим + строгий промт + extract_json + bounded retry +
+    доменная валидация, ADR-020 §I).
 
     Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4). Сигнал
     unrecoverable — легальный выход (дерево None). На исчерпании ретраев невалидный output →
@@ -276,7 +277,8 @@ async def _run_agent4(
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
 ) -> Agent4Result:
-    """Общий structured-вызов Agent 4 (fixer/editor): tool-use + retry + доменная валидация."""
+    """Общий structured-вызов Agent 4 (fixer/editor): текстовый режим + extract_json + retry +
+    доменная валидация."""
     client = ClaudeAgentClient(settings)
     result = await run_structured_agent(
         settings,
@@ -285,7 +287,6 @@ async def _run_agent4(
         model=settings.agent4_model,
         system_prompt=system_prompt,
         user_content=user_content,
-        tool=AGENT4_TOOL,
         validate=lambda raw: _validate_agent4_output(raw, settings),
         before_call=before_call,
         after_call=after_call,

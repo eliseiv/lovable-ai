@@ -33,7 +33,7 @@ Celery worker запускается двумя пулами: `-Q llm` (масш
 
 | Что | Версия | Обоснование |
 |---|---|---|
-| anthropic (SDK) | **0.40.x+** | 4 агента на Claude. Prompt caching для стабильных system-промтов (см. skill `claude-api`). **Structured-output всех 4 агентов — форсированный tool-use** (`tool_choice`/`input_schema`) + толерантный парсинг + bounded retry ([ADR-020](adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md), [pipeline §I](modules/pipeline/03-architecture.md#i-надёжный-structured-output-всех-4-агентов-tool-use--толерантный-парсинг--bounded-retry-adr-020)). Tool-use — **нативная возможность этого SDK; новая внешняя библиотека не требуется.** |
+| anthropic (SDK) | **0.40.x+** | 4 агента на Claude. Prompt caching для стабильных system-промтов (см. skill `claude-api`). **Structured-output всех 4 агентов — текстовый режим + `thinking=adaptive` + `extract_json` (толерантный парсинг) + строгий системный промт + bounded retry** ([ADR-020](adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md), [pipeline §I](modules/pipeline/03-architecture.md#i-надёжный-structured-output-всех-4-агентов)). **Форсированный `tool_choice` несовместим с thinking** (HTTP 400) — не используется. `extract_json` — чистый Python; новая внешняя библиотека не требуется. |
 | Модели | Opus / Sonnet per-agent в конфиге | Tiering: дешёвый Sonnet где можно, Opus где нужно качество. Конкретный маппинг агент→модель — в конфиге (`app/core/config`), не в коде агентов. |
 
 ## Хранилище объектов

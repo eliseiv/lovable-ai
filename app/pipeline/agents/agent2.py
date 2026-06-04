@@ -1,7 +1,8 @@
 """Agent 2 (Spec Writer): промт + ответы → финальная спека (ТЗ, Markdown).
 
 Output → generation_jobs.spec_tz (inline ≤ 16 KB) или spec_ref в S3. Structured-output
-через форсированный tool-use + bounded retry (ADR-020 §I, общий слой structured.py).
+через текстовый режим + строгий промт + extract_json + bounded retry (ADR-020 §I, revised;
+общий слой structured.py).
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from typing import Any
 from app.core.config import Settings
 from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
 from app.pipeline.agents.structured import (
-    AGENT2_TOOL,
     FAIL_CLASS_SCHEMA,
     DiagnosticsHook,
     GuardHook,
@@ -41,7 +41,7 @@ def _build_user_content(prompt: str, qa_pairs: list[tuple[str, str]]) -> str:
 
 
 def _validate_spec(data: Any) -> str:
-    """Доменная валидация структуры Agent 2 поверх tool-use (ADR-020 §I.1): непустая спека.
+    """Доменная валидация структуры Agent 2 поверх извлечённого JSON (ADR-020 §I.2): непустая спека.
 
     Нарушение → schema-фейл (re-семплируемый; на исчерпании — FAILED(invalid_agent_output)).
     """
@@ -62,7 +62,7 @@ async def run_agent2(
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
 ) -> Agent2Result:
-    """Один шаг Agent 2 (форсированный tool-use + bounded retry, ADR-020 §I).
+    """Один шаг Agent 2 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
 
     Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4).
     На исчерпании ретраев бросает StructuredOutputError → task → FAILED(invalid_agent_output).
@@ -75,7 +75,6 @@ async def run_agent2(
         model=settings.agent2_model,
         system_prompt=_SYSTEM_PROMPT,
         user_content=_build_user_content(prompt, qa_pairs),
-        tool=AGENT2_TOOL,
         validate=_validate_spec,
         before_call=before_call,
         after_call=after_call,

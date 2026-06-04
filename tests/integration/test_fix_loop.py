@@ -116,12 +116,11 @@ def _call(text: str) -> AgentCall:
 
 
 class _FakeClient:
-    """Фейк ClaudeAgentClient: форсированный tool-use (ADR-020 §I.1).
+    """Фейк ClaudeAgentClient: ТЕКСТОВЫЙ режим (ADR-020 §I.1 revised).
 
-    Возвращает заранее заданный JSON-текст (по очереди) как tool_input — модель
-    «заполняет аргументы инструмента» (structured-output читается из tool_use.input,
-    не из текста). Невалидный JSON в очереди → tool_input=None (граничный случай /
-    отказ tool-use), тогда structured-слой применяет толерантный парсинг к text (§I.2).
+    Возвращает заранее заданный текст (по очереди) как block.text — structured-слой извлекает
+    структуру через extract_json. Невалидный/не-JSON текст в очереди → parse-фейл в
+    structured-слое (re-семплируется). tool-use ОТОЗВАН (несовместим с thinking → HTTP 400).
     """
 
     _texts: list[str] = []
@@ -130,26 +129,16 @@ class _FakeClient:
     def __init__(self, settings) -> None:  # noqa: ANN001
         pass
 
-    async def run_agent_tool(  # noqa: ANN201
+    async def run_agent(  # noqa: ANN201
         self,
         *,
         model,
         system_prompt,
-        user_content,
-        tool_name,
-        input_schema,  # noqa: ANN001, ANN003
+        user_content,  # noqa: ANN001
     ):
-        from app.pipeline.agents.claude_client import AgentToolCall
-
         type(self).captured.append(user_content)
         text = type(self)._texts.pop(0) if type(self)._texts else "{}"
-        try:
-            tool_input = json.loads(text)
-            if not isinstance(tool_input, dict):
-                tool_input = None
-        except ValueError:
-            tool_input = None
-        return AgentToolCall(tool_input=tool_input, text=text, call=_call(text))
+        return _call(text)
 
 
 async def _purge(uid: str) -> None:

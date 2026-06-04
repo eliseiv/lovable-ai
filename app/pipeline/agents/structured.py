@@ -1,23 +1,24 @@
-"""Надёжный structured-output всех 4 агентов (ADR-020, docs pipeline §I).
+"""Надёжный structured-output всех 4 агентов (ADR-020, revised; docs pipeline §I).
 
 ЕДИНЫЙ слой для Agent 1/2/3/4 — НЕ дублируется в каждом агенте. Три части:
 
-(1) Форсированный tool-use — основной механизм (детерминизм, §I.1). Вызов
-    `ClaudeAgentClient.run_agent_tool` с tool_choice (forced) + input_schema на агента;
-    структура читается из `tool_use.input`, НЕ из текстового блока. Устраняет markdown-фенсы
-    как класс (прод-баг §I: ~40% ответов модели приходили в ```json…``` → строгий
-    json.loads(call.text) → ValueError → немедленный FAILED без ретрая).
-(2) Толерантный парсинг (§I.2, defence-in-depth) — `extract_json` на текстовый ответ, если
-    структура всё же пришла текстом (граничный случай / отказ tool-use / будущие версии SDK):
+(1) Текстовый режим + строгий системный промт — основной механизм (§I.1, revised). Вызов
+    `ClaudeAgentClient.run_agent` (`thinking=adaptive` + `output_config={effort}`, БЕЗ
+    `tools`/`tool_choice`); формат выхода форсируется строгим суффиксом системного промта
+    (`STRICT_JSON_SUFFIX` ниже — нормативный общий шаблон). Форсированный tool-use ОТОЗВАН:
+    несовместим с thinking → HTTP 400 (ADR-020 §Ограничение API, 100% отказ).
+(2) Толерантный парсинг (§I.2) — `extract_json` на текстовый ответ модели (`block.text`):
     снятие ```json/``` -фенсов + извлечение первого сбалансированного JSON перед json.loads.
+    Это ОСНОВНОЙ путь получения структуры (устраняет markdown-фенсы как класс — прод-баг §I:
+    ~40% ответов модели приходили в ```json…``` → строгий json.loads → ValueError → FAILED).
 (3) Bounded retry на parse/schema-фейл (§I.3) — `run_structured_agent` ретраит НОВЫЙ LLM-вызов
     того же агента до AGENT_OUTPUT_MAX_RETRIES раз ВНУТРИ шага агента (НЕ Celery-retry, НЕ
     FIXING). Перед КАЖДЫМ вызовом — guard-хук (budget/wall-clock §C(b)/(c) считают retry-вызовы);
     после КАЖДОГО вызова — usage-хук (запись llm_usage + spend). При каждом фейле — diag-хук
     (имя агента/attempt/класс/текст ошибки/scrubbed усечённый raw в job_events.payload, §I.4).
 
-Доменная валидация (особенно дерево Agent 3) — поверх tool-use, НЕ заменяется им (§I.1):
-вызывающий передаёт `validate`-колбэк, который применяет прежний валидатор к tool_input.
+Доменная валидация (особенно дерево Agent 3) — поверх извлечённой структуры, НЕ заменяется
+парсером (§I.2): вызывающий передаёт `validate`-колбэк, применяющий прежний валидатор.
 """
 
 from __future__ import annotations
@@ -30,120 +31,36 @@ from typing import Any
 from app.core.config import Settings
 from app.observability.sentry import scrub_text
 from app.observability.timing import timed_agent_call
-from app.pipeline.agents.claude_client import AgentCall, AgentToolCall, ClaudeAgentClient
+from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
 
 # Классы фейла structured-output (§I.4): parse — структура не извлеклась; schema — извлеклась,
-# но не прошла JSON-схему инструмента/доменную валидацию.
+# но не прошла доменную валидацию.
 FAIL_CLASS_PARSE = "parse_error"
 FAIL_CLASS_SCHEMA = "schema_error"
 
+# Строгая нормативная инструкция формата (ADR-020 §I.1, revised; docs pipeline §I.1).
+# ОБЯЗАТЕЛЬНА в системном промте КАЖДОГО из 4 агентов — единый общий шаблон, добавляется
+# через append_strict_json (не дублируется в каждом промт-файле). Текстовый режим без
+# форсирующего tool_choice → формат держится этим промтом + extract_json (§I.2).
+STRICT_JSON_SUFFIX = (
+    "\n\n"
+    "Return STRICTLY raw JSON of the required structure. NO markdown fences "
+    "(``` or ```json), NO explanations/prefixes/prose before or after the JSON. "
+    "The first character of your response must be { or [, and the last must be } or ]."
+)
 
-@dataclass(frozen=True)
-class AgentToolSpec:
-    """Спецификация инструмента structured-output одного агента (ADR-020 §I.1).
 
-    `tool_name` — имя форсируемого инструмента; `input_schema` — JSON-схема выхода агента
-    (транспорт структуры; полная доменная валидация — отдельным validate-колбэком).
+def append_strict_json(system_prompt: str) -> str:
+    """Добавляет нормативную строгую JSON-инструкцию (§I.1) к системному промту агента.
+
+    Единый источник формулировки — STRICT_JSON_SUFFIX. Применяется ко ВСЕМ 4 агентам
+    единообразно через общий слой (не дублируется в промт-файлах).
     """
-
-    tool_name: str
-    input_schema: dict[str, Any]
-
-
-# --- Tool-схемы на агента (§I.1). Транспорт структуры; доменная валидация — поверх. ---
-
-# Agent 1 (Interviewer) — submit_questions. questions[]: каждый — объект с обязательным text;
-# опц. position/kind(free_text|choice)/options[]. Доп. валидация контракта — в agent1._parse.
-AGENT1_TOOL = AgentToolSpec(
-    tool_name="submit_questions",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "questions": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "text": {"type": "string"},
-                        "position": {"type": "integer"},
-                        "kind": {"type": "string", "enum": ["free_text", "choice"]},
-                        "options": {"type": "array", "items": {"type": "string"}},
-                    },
-                    "required": ["text"],
-                },
-            }
-        },
-        "required": ["questions"],
-    },
-)
-
-# Agent 2 (Spec writer) — submit_spec. spec_markdown: финальная спека (spec_tz-форма, Markdown).
-AGENT2_TOOL = AgentToolSpec(
-    tool_name="submit_spec",
-    input_schema={
-        "type": "object",
-        "properties": {"spec_markdown": {"type": "string"}},
-        "required": ["spec_markdown"],
-    },
-)
-
-# Схема файла дерева (Agent 3/4): path/encoding/content. Доменные правила (traversal/allowlist/
-# лимиты/dotfiles) — НЕ выражаются JSON-схемой, проверяются validate_agent_output поверх (§I.1).
-_TREE_FILE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "path": {"type": "string"},
-        "encoding": {"type": "string", "enum": ["utf8", "base64"]},
-        "content": {"type": "string"},
-    },
-    "required": ["path", "encoding", "content"],
-}
-_BUILD_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "tool": {"type": "string"},
-        "command": {"type": "string"},
-        "output_dir": {"type": "string"},
-    },
-    "required": ["command"],
-}
-
-# Agent 3 (Builder) — submit_project: дерево agent_output (files[]/entry/build).
-AGENT3_TOOL = AgentToolSpec(
-    tool_name="submit_project",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "files": {"type": "array", "items": _TREE_FILE_SCHEMA},
-            "entry": {"type": "string"},
-            "build": _BUILD_SCHEMA,
-        },
-        "required": ["files", "entry", "build"],
-    },
-)
-
-# Agent 4 (Fixer/editor) — submit_project: та же схема agent_output ПЛЮС ветка unrecoverable
-# (§A) — «неисправимо» выражается полями ОДНОГО инструмента, tool_choice форсирует tool,
-# ветка выбирается полями (не отсутствием вызова). files/entry/build тут НЕ required: при
-# unrecoverable=true их нет; доменная валидация дерева применяется только когда не-unrecoverable.
-AGENT4_TOOL = AgentToolSpec(
-    tool_name="submit_project",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "files": {"type": "array", "items": _TREE_FILE_SCHEMA},
-            "entry": {"type": "string"},
-            "build": _BUILD_SCHEMA,
-            "unrecoverable": {"type": "boolean"},
-            "reason": {"type": "string"},
-            "explanation": {"type": "string"},
-        },
-    },
-)
+    return system_prompt + STRICT_JSON_SUFFIX
 
 
 def extract_json(text: str) -> Any:
-    """Толерантный парсинг текстового ответа модели (ADR-020 §I.2, defence-in-depth).
+    """Толерантный парсинг текстового ответа модели (ADR-020 §I.2, основной путь).
 
     Снимает обёртку ```json … ``` / ``` … ``` (любой/без language-tag) + извлекает ПЕРВЫЙ
     сбалансированный JSON-объект/массив (срезает ведущую/хвостовую прозу), затем json.loads.
@@ -236,21 +153,16 @@ UsageHook = Callable[[AgentCall], Awaitable[None]]
 DiagnosticsHook = Callable[..., Awaitable[None]]
 
 
-class _ToolUseUnavailable(StructuredOutputError):
-    """Внутренний маркер: модель не вернула tool_use-блок (отказ tool-use, граничный случай)."""
+def _extract_structure(call: AgentCall) -> Any:
+    """Извлекает структуру из текстового ответа модели толерантным парсером (§I.2).
 
-
-def _extract_structure(tool_call: AgentToolCall) -> Any:
-    """Извлекает структуру: основной путь tool_input (§I.1), fallback — толерантный парсинг
-    текста (§I.2). Бросает StructuredOutputError(parse_error), если оба не дали структуры."""
-    if tool_call.tool_input is not None:
-        return tool_call.tool_input
-    # Tool-use не сработал — defence-in-depth на текстовый ответ.
+    Бросает StructuredOutputError(parse_error), если валидный JSON извлечь не удалось.
+    """
     try:
-        return extract_json(tool_call.text)
+        return extract_json(call.text)
     except (ValueError, json.JSONDecodeError) as exc:
         raise StructuredOutputError(
-            f"tool_use absent and text is not valid JSON: {exc}",
+            f"model text is not valid JSON: {exc}",
             fail_class=FAIL_CLASS_PARSE,
         ) from exc
 
@@ -271,24 +183,27 @@ async def run_structured_agent[T](
     model: str,
     system_prompt: str,
     user_content: str,
-    tool: AgentToolSpec,
     validate: Callable[[Any], T],
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
     retry_nudge: str = (
-        "\n\nReturn the result STRICTLY by calling the provided tool with valid arguments."
+        "\n\nReturn the result STRICTLY as raw JSON — no markdown fences, no prose."
     ),
 ) -> StructuredResult[T]:
-    """Форсированный tool-use + толерантный парсинг + bounded retry (ADR-020 §I, единый слой).
+    """Текстовый режим + толерантный парсинг + bounded retry (ADR-020 §I, revised; единый слой).
 
-    Цикл (до AGENT_OUTPUT_MAX_RETRIES доп. попыток = до N+1 LLM-вызовов, §I.3):
+    Системный промт обязан нести строгую JSON-инструкцию — она добавляется здесь через
+    append_strict_json (§I.1, единый шаблон STRICT_JSON_SUFFIX). Вызов — ТЕКСТОВЫЙ
+    (`run_agent`, без `tools`/`tool_choice`): несовместимость форсированного tool_choice с
+    thinking (HTTP 400) исключена конструктивно. Цикл (до AGENT_OUTPUT_MAX_RETRIES доп. попыток
+    = до N+1 LLM-вызовов, §I.3):
       1. `before_call()` — budget/wall-clock-гард ПЕРЕД вызовом (считает каждый retry; бросок
          гарда прерывает шаг штатным FAILED(budget/wall_clock) — НЕ ловится здесь);
-      2. форсированный tool-use вызов (§I.1);
+      2. текстовый вызов агента (§I.1);
       3. `after_call(call)` — запись llm_usage + spend (ВСЕГДА, вызов оплачен — даже при фейле);
-      4. извлечь структуру: tool_input → fallback толерантный парсинг текста (§I.2);
-      5. `validate(structure)` — доменная валидация (§I.1, поверх tool-use);
+      4. извлечь структуру из `call.text` толерантным парсером `extract_json` (§I.2);
+      5. `validate(structure)` — доменная валидация (§I.2, поверх извлечённой структуры);
       6. успех → StructuredResult; parse/schema-фейл → диагностика (§I.4) + retry (re-sample);
          на исчерпании ретраев — бросить StructuredOutputError (вызывающий терминализует §I.3).
 
@@ -297,24 +212,23 @@ async def run_structured_agent[T](
     ретраев пробрасывается вызывающему для встраивания в семантику agent_output_invalid.
     """
     max_retries = settings.agent_output_max_retries
+    strict_system_prompt = append_strict_json(system_prompt)
     last_error: StructuredOutputError | None = None
 
     for attempt in range(max_retries + 1):
         await before_call()
         content = user_content if attempt == 0 else user_content + retry_nudge
         with timed_agent_call(agent, model):
-            tool_call = await client.run_agent_tool(
+            call = await client.run_agent(
                 model=model,
-                system_prompt=system_prompt,
+                system_prompt=strict_system_prompt,
                 user_content=content,
-                tool_name=tool.tool_name,
-                input_schema=tool.input_schema,
             )
         # Вызов оплачен — учитываем usage ВСЕГДА (включая последующий parse/schema-фейл, §I.3).
-        await after_call(tool_call.call)
+        await after_call(call)
 
         try:
-            structure = _extract_structure(tool_call)
+            structure = _extract_structure(call)
         except StructuredOutputError as exc:
             last_error = exc
             await _report(
@@ -324,7 +238,7 @@ async def run_structured_agent[T](
                 max_retries,
                 exc,
                 exc.fail_class,
-                tool_call.text,
+                call.text,
                 settings,
             )
             continue
@@ -340,12 +254,12 @@ async def run_structured_agent[T](
                 max_retries,
                 exc,
                 exc.fail_class,
-                tool_call.text,
+                call.text,
                 settings,
             )
             continue
         except ValueError as exc:
-            # Доменная валидация (AgentOutputError и пр.) — schema-фейл (§I.1 «поверх tool-use»).
+            # Доменная валидация (AgentOutputError и пр.) — schema-фейл (§I.2 «поверх структуры»).
             wrapped = StructuredOutputError(str(exc), fail_class=FAIL_CLASS_SCHEMA)
             wrapped.__cause__ = exc
             last_error = wrapped
@@ -356,14 +270,14 @@ async def run_structured_agent[T](
                 max_retries,
                 exc,
                 FAIL_CLASS_SCHEMA,
-                tool_call.text,
+                call.text,
                 settings,
             )
             # Сохраняем исходное доменное исключение для пробрасывания на исчерпании ретраев.
             last_error.__dict__["domain_exc"] = exc
             continue
 
-        return StructuredResult(value=value, call=tool_call.call)
+        return StructuredResult(value=value, call=call)
 
     # Ретраи исчерпаны: пробрасываем исходное доменное исключение, если было (для §I.3 Agent 3/4
     # — встраивание в agent_output_invalid), иначе StructuredOutputError (Agent 1/2 → §I.3).

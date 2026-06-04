@@ -53,7 +53,7 @@ stateDiagram-v2
   | AGENT4 | Fixer | **Sonnet** | `claude-sonnet-4-6` | `AGENT4_MODEL` |
 
   Нумерация `AGENTn` ↔ роль фиксирована таблицей §Агенты выше (Agent 1=Interviewer … Agent 4=Fixer) и не меняется. env-дефолты `config.py`/`07-deployment` приводятся к этим значениям в S6-калибровке model-tiering (требование к backend; если текущий дефолт отличается — это калибровочная правка, не новое решение).
-- **Structured-output всех 4 агентов — ЕДИНЫЙ НОРМАТИВНЫЙ МЕХАНИЗМ ([ADR-020](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md), общий слой `app/pipeline/agents/structured.py`, не дублировать в каждом агенте).** Каждый агент получает структуру **через форсированный tool-use** (`tool_choice={"type":"tool","name":...}`, схема выхода = `input_schema` инструмента), читается из `tool_use`-блока (`block.input`), **не** из текстового `block.text`. Совместимо с extended thinking `adaptive` (в отличие от assistant-prefill). Defence-in-depth: толерантный парсинг (снятие ` ```json…``` `-фенсов + извлечение первого сбалансированного JSON) на текстовый ответ, и **bounded retry** (`AGENT_OUTPUT_MAX_RETRIES`) на parse/schema-фейл перед терминалом. Полный исполняемый контракт — **§I** ниже. **Прод-триггер:** ~40% ответов модели приходили в markdown-фенсах → строгий `json.loads(call.text)` бросал `ValueError` → немедленный `FAILED` без ретрая (баг системный — все 4 агента). Доменная валидация дерева (§Контракт output Agent 3) **остаётся** поверх tool-use — tool-схема её не заменяет.
+- **Structured-output всех 4 агентов — ЕДИНЫЙ НОРМАТИВНЫЙ МЕХАНИЗМ ([ADR-020](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md), общий слой `app/pipeline/agents/structured.py`, не дублировать в каждом агенте).** Каждый агент вызывается в **текстовом режиме** (`thinking=adaptive` + `output_config={effort}`, **без** `tools`/форс-`tool_choice`); формат форсируется **строгим системным промтом** («raw JSON, без markdown-фенсов и прозы»); структура извлекается из `block.text` хелпером `extract_json` (снятие ` ```json…``` `-фенсов + первый сбалансированный JSON). **bounded retry** (`AGENT_OUTPUT_MAX_RETRIES`) на parse/schema-фейл перед терминалом. Полный исполняемый контракт — **§I** ниже. **Прод-триггеры:** (1) ~40% ответов модели приходили в markdown-фенсах → строгий `json.loads(call.text)` бросал `ValueError` → немедленный `FAILED` без ретрая; (2) **revision:** форсированный `tool_choice` несовместим с thinking (HTTP 400) → отозван. Доменная валидация дерева (§Контракт output Agent 3) **остаётся** поверх извлечённой структуры.
 - **Prompt caching:** стабильные system-промты кэшируются между агентами и fix-итерациями (Anthropic SDK; реализовать через skill `claude-api`).
 - **Cost-ledger:** каждый вызов → запись `llm_usage` (токены, cache hit/write, `cost_usd`); агрегат в `generation_jobs.spend_usd` (**Postgres — источник истины бюджета**, гард читает `spend_usd` из БД). Быстрый Redis-счётчик бюджета для снижения латентности гейта при масштабе — **опциональная оптимизация, целевой Sprint 6** (см. [TD-006](../../100-known-tech-debt.md#td-006), исполняемый контракт оптимизации — [observability §5.2](../observability/03-architecture.md#52-redis-budget-счётчик-td-006--опциональная-оптимизация-латентности-гейта)), в Sprint 2 не требуется. **Sprint 6 (observability):** `llm_usage` инструментируется метриками `lovable_job_cost_usd`/`lovable_llm_call_cost_usd_total`/`lovable_llm_tokens_total`/`lovable_llm_cache_hit_ratio`/`lovable_llm_call_latency_seconds` (нормативная таблица — [observability §2.2](../observability/03-architecture.md#22-cost--llm-cost-ledger-llm_usage)) — питают дашборд Cost и калибровку [TD-005](../../100-known-tech-debt.md#td-005)/[TD-006](../../100-known-tech-debt.md#td-006).
 
@@ -304,37 +304,39 @@ stateDiagram-v2
 
 **Критерий приёмки (qa):** unit — `publish_event` при инъекции `RuntimeError`/`RedisError`/`OSError` из Redis-клиента не пробрасывает и не откатывает уже-закоммиченный переход; integration — агент-таска при недоступном/сбойном publish всё равно доводит state до терминала (`FAILED(agent_unavailable)` при невалидном `ANTHROPIC_API_KEY`) и освобождает слот ([06-testing-strategy.md](../../06-testing-strategy.md)).
 
-## I. Надёжный structured-output всех 4 агентов: tool-use + толерантный парсинг + bounded retry ([ADR-020](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md))
+## I. Надёжный structured-output всех 4 агентов: текстовый режим + thinking + `extract_json` + строгий промт + bounded retry ([ADR-020](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md))
 
-> **Прод-фикс.** Happy-path E2E с реальным `ANTHROPIC_API_KEY` (5 прогонов Agent 1, `claude-sonnet-4-6`) показал: модель **интермиттентно** (≈40%) оборачивает JSON-ответ в ` ```json … ``` `. Строгий `json.loads(call.text)` без устойчивости к фенсам → `ValueError` → **немедленный** `FAILED(invalid_agent_output)` **без ретрая**. Тот же строгий парсинг — во всех 4 агентах → баг **системный**, отказ компаундится на каждом шаге. При extended thinking `adaptive` assistant-prefill несовместим, поэтому «попросили JSON в system-промте» не гарантирует чистый JSON. Контракт ниже — единый для всех 4 агентов (Agent 1/2/3/4), реализуется общим слоем (`app/pipeline/agents/structured.py`), **не** дублируется в каждом агенте.
+> **REVISION 2026-06-04.** Первоначальный механизм «форсированный tool-use» **отозван**: live-E2E (прямой `run_agent_tool`, реальный ключ) вскрыл, что Anthropic API отвечает **HTTP 400** «Thinking may not be enabled when tool_choice forces tool use» при `thinking=adaptive` (вкл. для всех агентов) + форсирующем `tool_choice` (`{"type":"tool",...}` или `{"type":"any"}`) → `FAILED(agent_unavailable)` на **100%** генераций. Нормативный механизм ниже — **текстовый режим + `extract_json` + строгий промт + bounded retry**, thinking сохранён. См. [ADR-020 §Ограничение API](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md#ограничение-api-нормативный-факт-thinking--форсированный-tool_choice).
 
-### I.1 Основной механизм — форсированный tool-use
+> **Прод-фикс (исходный).** Happy-path E2E (5 прогонов Agent 1, `claude-sonnet-4-6`): модель **интермиттентно** (≈40%) оборачивает JSON-ответ в ` ```json … ``` `. Строгий `json.loads(call.text)` без устойчивости к фенсам → `ValueError` → **немедленный** `FAILED(invalid_agent_output)` **без ретрая**. Контракт ниже — единый для всех 4 агентов (Agent 1/2/3/4), реализуется общим слоем (`app/pipeline/agents/structured.py`), **не** дублируется в каждом агенте.
 
-- Каждый агент вызывается с **одним инструментом**, чья `input_schema` = JSON-схема выхода этого агента, и `tool_choice={"type":"tool","name":"<agent_tool>"}` (форс именно этого инструмента). Структура читается из `tool_use`-блока (`block.input` — распарсенный SDK-объект), **не** из `block.text`.
-- Совместимо с extended thinking `adaptive` (в отличие от assistant-prefill). Снимает markdown-фенсы как класс: модель не пишет JSON в прозу.
+### I.1 Основной механизм — текстовый режим + строгий системный промт
 
-| Агент | Tool name | input_schema (транспорт структуры) |
-|---|---|---|
-| Agent 1 (Interviewer) | `submit_questions` | `{ questions: string[] }` |
-| Agent 2 (Spec writer) | `submit_spec` | схема спеки (`spec_tz`-форма) |
-| Agent 3 (Builder) | `submit_project` | схема `agent_output` (`files[]`/`entry`/`build`) |
-| Agent 4 (Fixer) | `submit_project` | та же `agent_output` + ветка `unrecoverable` полями инструмента (§A) |
+- Каждый агент вызывается в **обычном текстовом режиме**: `thinking={"type":"adaptive"}` + `output_config={"effort": AGENT_EFFORT}`, **без** `tools`/`tool_choice`. Структура читается из текстового ответа (`block.text`) через `extract_json` (§I.2).
+- **thinking (`adaptive`) сохраняется** для всех 4 агентов — он ценен для качества (Agent 2 — спека, Agent 3/4 — код). Форсирующий `tool_choice` **запрещён** при включённом thinking (HTTP 400, см. ADR-020 §Ограничение API).
+- Системный промт каждого агента **обязан** содержать строгую инструкцию формата (нормативный общий шаблон в `structured.py`):
 
-> **Доменная валидация дерева — поверх tool-use, НЕ заменяется им.** JSON-Schema инструмента выражает «получили JSON нужной формы», но **не** все правила §Контракт output Agent 3 (path-traversal, encoding, лимиты `MAX_FILES`/`MAX_FILE_BYTES`/`MAX_TREE_BYTES`, allowlist расширений, запрет dotfiles/симлинков). Прежний валидатор `agent_output` применяется к `block.input` агентов 3/4 **до** упаковки `source.tgz` — без изменений.
+  > «Верни **СТРОГО raw JSON** требуемой структуры. **Без** markdown-фенсов (` ``` `/` ```json `), **без** пояснений/префиксов/прозы до или после JSON. Первый символ ответа — `{` или `[`, последний — `}` или `]`.»
 
-### I.2 Defence-in-depth — толерантный парсинг (на текстовый ответ)
+- Выходная структура каждого агента — прежняя (контракты не меняются): Agent 1 — `{ questions: string[] }`; Agent 2 — `spec_tz`-форма; Agent 3 — `agent_output` (`files[]`/`entry`/`build`); Agent 4 — `agent_output` + ветка `unrecoverable` полями JSON ([§A](#a-контракт-agent-4-fixer)).
 
-Если структура всё же пришла текстом (граничные случаи / отказ tool-use / будущие версии SDK), общий хелпер **до** `json.loads`:
+> **Почему не tool-use / не `auto`.** Форсированный tool-use → HTTP 400 при thinking. `tool_choice={"type":"auto"}` API допускает, но не форсирует → модель может вернуть текст → всё равно нужен `extract_json` + развилка «tool vs text». Текстовый режим + `extract_json` проще и детерминирован по обработке. Подробности и отвергнутые варианты — [ADR-020 §Alternatives](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md#alternatives).
+
+### I.2 Извлечение структуры — `extract_json` (основной путь)
+
+Общий хелпер `extract_json` применяется к текстовому ответу модели для всех 4 агентов:
 1. снимает обёртку ` ```json … ``` ` / ` ``` … ``` ` (с любым/без language-tag);
 2. извлекает **первый сбалансированный** JSON-объект/массив (срезает ведущую/хвостовую прозу);
 3. затем `json.loads`.
 
-Минимально, версионно-устойчиво, без regex-парсинга всего тела. Применяется единообразно ко всем агентам.
+Минимально, версионно-устойчиво, без regex-парсинга всего тела. Применяется единообразно ко всем агентам. **Реализован, покрыт тестами.**
+
+> **Доменная валидация дерева — поверх извлечённой структуры, НЕ заменяется парсером.** `extract_json` выражает «получили JSON нужной формы», но **не** все правила §Контракт output Agent 3 (path-traversal, encoding, лимиты `MAX_FILES`/`MAX_FILE_BYTES`/`MAX_TREE_BYTES`, allowlist расширений, запрет dotfiles/симлинков). Прежний валидатор `agent_output` применяется к распарсенной структуре агентов 3/4 **до** упаковки `source.tgz` — без изменений.
 
 ### I.3 Bounded retry на parse/schema-фейл — re-семплирование, не мгновенный FAILED
 
-- Parse-фейл (структура не извлеклась) и schema-фейл (извлеклась, но не прошла JSON-схему инструмента или доменную валидацию) — **РЕ-СЕМПЛИРУЕМЫЙ** сбой формата ответа.
-- Шаг агента ретраит **новый LLM-вызов** того же агента до `AGENT_OUTPUT_MAX_RETRIES` раз (env, default **2** доп. попытки = до 3 вызовов суммарно) **внутри одного шага**, прежде чем уйти в терминал. Допустим лёгкий nudge «верни строго через инструмент».
+- Parse-фейл (структура не извлеклась через `extract_json`) и schema-фейл (извлеклась, но не прошла доменную валидацию) — **РЕ-СЕМПЛИРУЕМЫЙ** сбой формата ответа.
+- Шаг агента ретраит **новый LLM-вызов** того же агента до `AGENT_OUTPUT_MAX_RETRIES` раз (env, default **2** доп. попытки = до 3 вызовов суммарно) **внутри одного шага**, прежде чем уйти в терминал. Допустим лёгкий nudge «верни СТРОГО raw JSON без markdown-фенсов и прозы».
 - **Это НЕ Celery-`task.retry()` и НЕ вход в `FIXING`** — локальный re-sample вывода LLM, ортогональный retry-классификации ([ADR-006](../../adr/ADR-006-celery-retry-vs-domain-fixing.md)). Классификатор `app/workers/retry_policy.py` его не трогает.
 - **Исчерпание ретраев — без новых reason-кодов:**
   - **Agent 1/2** (нет fix-loop у interview/spec-фазы) → `FAILED(invalid_agent_output)` (существующий код).
@@ -353,8 +355,9 @@ stateDiagram-v2
 
 ### I.5 Критерии приёмки (qa)
 
-- **unit (регрессия на fence, обязателен):** ответ модели в форме ` ```json {…} ``` ` (и ` ``` {…} ``` ` без tag) → толерантный парсинг извлекает валидную структуру **без** `ValueError`; шаг агента **не** уходит в `FAILED` (воспроизводит прод-инцидент run1/run4).
-- **unit (tool-use):** агент вызывается с `tool_choice={"type":"tool",...}`; структура читается из `tool_use.input`; system-промт-«проза» не парсится как структура.
+- **unit (регрессия на fence, обязателен):** ответ модели в форме ` ```json {…} ``` ` (и ` ``` {…} ``` ` без tag) → `extract_json` извлекает валидную структуру **без** `ValueError`; шаг агента **не** уходит в `FAILED` (воспроизводит прод-инцидент run1/run4).
+- **contract (параметры запроса, обязателен — против регресса 100%-отказа):** запрос агента к Anthropic **НЕ** содержит форсирующего `tool_choice` (`{"type":"tool",...}`/`{"type":"any"}`) одновременно с включённым `thinking`. Тест проверяет собранный kwargs `messages.create` (а **не** слепой мок SDK): при `thinking=adaptive` либо `tools`/`tool_choice` отсутствуют, либо `tool_choice` не форсирует. Этот критерий гарантирует, что несовместимая комбинация (HTTP 400, [ADR-020 §Ограничение API](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md#ограничение-api-нормативный-факт-thinking--форсированный-tool_choice)) не вернётся незамеченной.
+- **unit (текстовый режим):** агент вызывается без `tools`/форс-`tool_choice`; структура читается из `block.text` через `extract_json`; system-промт содержит строгую инструкцию «raw JSON без фенсов» (§I.1).
 - **unit (bounded retry):** parse/schema-фейл ретраится до `AGENT_OUTPUT_MAX_RETRIES`; на исчерпании — `FAILED(invalid_agent_output)` (Agent 1/2) либо виток `agent_output_invalid`→FIXING/`invalid_agent_output` (Agent 3/4); каждый retry — отдельная запись `llm_usage`, budget/wall-clock-гард проверяется перед каждым вызовом.
 - **unit (диагностируемость):** при parse-фейле в `job_events.payload` присутствуют имя агента, текст ошибки и scrubbed усечённый raw-ответ (без секретов).
 - Cross-ref [06-testing-strategy.md](../../06-testing-strategy.md).

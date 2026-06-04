@@ -1,9 +1,10 @@
 """Unit: доменная валидация output Agent 1 в вопросы (docs/modules/pipeline/03-architecture.md).
 
-ADR-020 §I.1: структура приходит из форсированного tool-use (tool_input — уже распарсенный
-SDK-объект), поэтому доменный валидатор `_validate_questions` принимает dict (не JSON-строку);
-снятие фенсов/парсинг JSON — ответственность общего слоя structured.py (тестируется отдельно).
-Нарушение контракта questions → StructuredOutputError(schema_error) — re-семплируемый фейл.
+ADR-020 §I.1 (revised): структура извлекается из block.text общим слоем structured.py через
+extract_json (текстовый режим, tool-use отозван), поэтому доменный валидатор `_validate_questions`
+принимает уже распарсенный dict (не JSON-строку); снятие фенсов/парсинг JSON — ответственность
+общего слоя (тестируется отдельно). Нарушение контракта questions → StructuredOutputError(
+schema_error) — re-семплируемый фейл.
 """
 
 from __future__ import annotations

@@ -1,22 +1,29 @@
-"""Unit: надёжный structured-output всех 4 агентов (ADR-020, docs pipeline §I / §I.5).
+"""Unit: надёжный structured-output всех 4 агентов (ADR-020 revised, docs pipeline §I / §I.5).
+
+REVISED 2026-06-04 (ADR-020 revised): форсированный tool-use ОТОЗВАН (несовместим с
+thinking → HTTP 400, 100% отказ). Нормативный механизм — ТЕКСТОВЫЙ режим (`thinking=adaptive`
++ `output_config={effort}`, БЕЗ `tools`/`tool_choice`) + строгий системный промт + `extract_json`
+из `block.text` + bounded retry. Фейк-клиенты здесь возвращают ТЕКСТ (block.text); структура
+извлекается через extract_json (НЕ из tool_use.input).
 
 Покрывает критерии приёмки §I.5 + budget/wall-clock между ретраями (06-testing-strategy §Unit
 «Structured-output агентов»). Единый слой app/pipeline/agents/structured.py — тестируется напрямую
-(run_structured_agent / extract_json) + через обёртки агентов (agent3/agent4) с фейк tool-use
+(run_structured_agent / extract_json) + через обёртки агентов (agent3/agent4) с фейк текстовым
 клиентом (без сети). Хуки before_call/after_call/on_attempt_failure — как инъектирует task-слой.
 
 Сценарии (ТЗ §I.5 + budget/wall-clock):
   1. Регрессия на fence: ```json {…}``` и ``` {…}``` (без tag) → extract_json без ValueError;
      скобки {} внутри строковых литералов JSON не сбивают баланс.
-  2. Tool-use: структура из tool_use.input (не из текстового блока); проза в text не парсится.
+  2. Текстовый режим: структура из block.text через extract_json (НЕ из tool_use.input);
+     строгий JSON-суффикс добавлен к системному промту (append_strict_json).
   3. Bounded retry: parse/schema-фейл ретраится до AGENT_OUTPUT_MAX_RETRIES; каждый retry →
      отдельный after_call (llm_usage); before_call ПЕРЕД каждым вызовом включая ретраи.
   4. Budget/wall-clock между ретраями: PreCallGuardTripped перед retry-вызовом пробрасывается
      (НЕ проглатывается как schema-фейл).
   5. Диагностируемость: on_attempt_failure получает agent/attempt/max_attempts/fail_class/
      error/raw_tail; raw_tail усечён до AGENT_RAW_OUTPUT_LOG_BYTES и scrubbed (нет секретов).
-  6. Agent 4 unrecoverable через tool_input → UnrecoverableSignal (дерево None) без ошибки.
-  7. Доменная валидация поверх tool-use: валидный JSON-формы tool_input с traversal-деревом →
+  6. Agent 4 unrecoverable через JSON-поля block.text → UnrecoverableSignal (дерево None).
+  7. Доменная валидация поверх extract_json: валидный JSON-формы с traversal-деревом →
      schema-фейл, ретраится; на исчерпании = AgentOutputError (agent_output_invalid).
 """
 
@@ -30,12 +37,13 @@ import pytest
 from app.core.config import get_settings
 from app.observability.sentry import scrub_text
 from app.pipeline.agents import agent3, agent4
-from app.pipeline.agents.claude_client import AgentCall, AgentToolCall
+from app.pipeline.agents.claude_client import AgentCall
 from app.pipeline.agents.structured import (
-    AGENT1_TOOL,
     FAIL_CLASS_PARSE,
     FAIL_CLASS_SCHEMA,
+    STRICT_JSON_SUFFIX,
     StructuredOutputError,
+    append_strict_json,
     extract_json,
     run_structured_agent,
 )
@@ -47,7 +55,7 @@ from app.schemas.agent_output import AgentOutputError
 
 
 # --------------------------------------------------------------------------- #
-# Фейк-инфраструктура: tool-use клиент + хуки (как у task-слоя).
+# Фейк-инфраструктура: ТЕКСТОВЫЙ клиент (revised) + хуки (как у task-слоя).
 # --------------------------------------------------------------------------- #
 
 
@@ -63,41 +71,29 @@ def _call(text: str = "{}", *, model: str = "claude-sonnet-4-6") -> AgentCall:
     )
 
 
-class _Resp:
-    """Один запрограммированный ответ модели на форсированный tool-use вызов.
+class _FakeTextClient:
+    """Фейк ClaudeAgentClient.run_agent (ADR-020 §I.1 revised): запрограммированные ТЕКСТЫ.
 
-    tool_input — то, что вернётся в tool_use-блоке (None ⇒ tool-use «не сработал» → fallback
-    на толерантный парсинг text, §I.2). text — текстовый блок (для fallback/диагностики §I.4).
+    run_agent — единственный путь structured-output: возвращает AgentCall с .text (block.text);
+    структура извлекается structured-слоем через extract_json. tool-use ОТОЗВАН.
     """
 
-    def __init__(self, *, tool_input=None, text=""):  # noqa: ANN001
-        self.tool_input = tool_input
-        self.text = text
-
-
-class _FakeToolClient:
-    """Фейк ClaudeAgentClient.run_agent_tool (ADR-020 §I.1): запрограммированные ответы."""
-
-    def __init__(self, responses: list[_Resp]) -> None:
-        self._responses = list(responses)
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = list(texts)
         self.user_contents: list[str] = []
-        self.tool_names: list[str] = []
+        self.system_prompts: list[str] = []
 
-    async def run_agent_tool(  # noqa: ANN201
+    async def run_agent(  # noqa: ANN201
         self,
         *,
         model,
         system_prompt,
-        user_content,
-        tool_name,
-        input_schema,  # noqa: ANN001
+        user_content,  # noqa: ANN001
     ):
         self.user_contents.append(user_content)
-        self.tool_names.append(tool_name)
-        resp = self._responses.pop(0) if self._responses else _Resp(tool_input={})
-        return AgentToolCall(
-            tool_input=resp.tool_input, text=resp.text, call=_call(resp.text, model=model)
-        )
+        self.system_prompts.append(system_prompt)
+        text = self._texts.pop(0) if self._texts else "{}"
+        return _call(text, model=model)
 
 
 class _Hooks:
@@ -124,7 +120,7 @@ class _Hooks:
         self.failures.append(kw)
 
 
-async def _run(settings, client, *, tool=AGENT1_TOOL, validate, hooks):  # noqa: ANN001, ANN202
+async def _run(settings, client, *, validate, hooks):  # noqa: ANN001, ANN202
     return await run_structured_agent(
         settings,
         client,
@@ -132,7 +128,6 @@ async def _run(settings, client, *, tool=AGENT1_TOOL, validate, hooks):  # noqa:
         model="claude-sonnet-4-6",
         system_prompt="sys",
         user_content="user",
-        tool=tool,
         validate=validate,
         before_call=hooks.before_call,
         after_call=hooks.after_call,
@@ -186,12 +181,10 @@ def test_extract_json_no_balanced_json_raises():
         extract_json("just prose, no json here")
 
 
-async def test_fence_text_fallback_does_not_fail_agent_step(settings):
-    """tool-use «не сработал» (tool_input=None), но модель вернула ```json {…}``` в тексте →
-    толерантный парсинг (§I.2) извлекает структуру, шаг агента НЕ уходит в FAILED (run1/run4)."""
-    client = _FakeToolClient(
-        [_Resp(tool_input=None, text='```json\n{"questions": [{"text": "Q?"}]}\n```')]
-    )
+async def test_fence_text_does_not_fail_agent_step(settings):
+    """Модель вернула ```json {…}``` в тексте (прод-инцидент run1/run4) → толерантный парсинг
+    (§I.2) извлекает структуру из block.text, шаг агента НЕ уходит в FAILED."""
+    client = _FakeTextClient(['```json\n{"questions": [{"text": "Q?"}]}\n```'])
     hooks = _Hooks()
     result = await _run(settings, client, validate=lambda d: d["questions"], hooks=hooks)
     assert result.value == [{"text": "Q?"}]
@@ -199,37 +192,33 @@ async def test_fence_text_fallback_does_not_fail_agent_step(settings):
 
 
 # --------------------------------------------------------------------------- #
-# (2) Tool-use — структура из tool_use.input; проза в text НЕ парсится как структура.
+# (2) Текстовый режим — структура из block.text; строгий JSON-суффикс в system-промте.
 # --------------------------------------------------------------------------- #
 
 
-async def test_tool_input_is_primary_source_not_text(settings):
-    """Структура читается из tool_use.input. Текстовый блок (даже если содержит другой JSON)
-    НЕ парсится — основной путь детерминирован (§I.1)."""
-    client = _FakeToolClient(
-        [
-            _Resp(
-                tool_input={"questions": [{"text": "from_tool"}]},
-                text='{"questions": [{"text": "from_text_prose"}]}',
-            )
-        ]
-    )
+async def test_structure_read_from_block_text_via_extract_json(settings):
+    """Структура читается из текстового ответа (block.text) хелпером extract_json (§I.1 revised).
+    Ведущая проза перед JSON срезается — основной путь детерминирован толерантным парсером."""
+    client = _FakeTextClient(['Sure! Here:\n{"questions": [{"text": "from_text"}]}'])
     hooks = _Hooks()
     result = await _run(settings, client, validate=lambda d: d["questions"], hooks=hooks)
-    assert result.value == [{"text": "from_tool"}]  # из tool_input, НЕ из text
+    assert result.value == [{"text": "from_text"}]
 
 
-async def test_tool_choice_forced_tool_name_passed(settings):
-    """Агент вызывается форсированным tool-use: имя инструмента из tool-схемы агента."""
-    client = _FakeToolClient([_Resp(tool_input={"questions": [{"text": "Q"}]})])
+async def test_strict_json_suffix_appended_to_system_prompt(settings):
+    """Системный промт агента несёт строгую «raw JSON без фенсов»-инструкцию (§I.1): она
+    добавляется общим слоем через append_strict_json (STRICT_JSON_SUFFIX), не дублируется."""
+    client = _FakeTextClient(['{"questions": [{"text": "Q"}]}'])
     hooks = _Hooks()
-    await _run(settings, client, tool=AGENT1_TOOL, validate=lambda d: d["questions"], hooks=hooks)
-    assert client.tool_names == [AGENT1_TOOL.tool_name]
+    await _run(settings, client, validate=lambda d: d["questions"], hooks=hooks)
+    assert client.system_prompts == [append_strict_json("sys")]
+    assert client.system_prompts[0].endswith(STRICT_JSON_SUFFIX)
+    assert "raw JSON" in client.system_prompts[0]
 
 
-async def test_prose_only_text_without_tool_input_is_parse_fail(settings):
-    """Только проза (нет tool_input, нет JSON в тексте) → parse-фейл (re-семплируемый), не молча."""
-    client = _FakeToolClient([_Resp(tool_input=None, text="I think you want a landing page.")] * 3)
+async def test_prose_only_text_is_parse_fail(settings):
+    """Только проза (нет JSON в тексте) → parse-фейл (re-семплируемый), не молча."""
+    client = _FakeTextClient(["I think you want a landing page."] * 3)
     hooks = _Hooks()
     with pytest.raises(StructuredOutputError) as ei:
         await _run(settings, client, validate=lambda d: d, hooks=hooks)
@@ -249,9 +238,7 @@ async def test_retry_succeeds_on_second_attempt(settings):
             raise StructuredOutputError("missing questions", fail_class=FAIL_CLASS_SCHEMA)
         return d["questions"]
 
-    client = _FakeToolClient(
-        [_Resp(tool_input={"questions": []}), _Resp(tool_input={"questions": [{"text": "Q"}]})]
-    )
+    client = _FakeTextClient(['{"questions": []}', '{"questions": [{"text": "Q"}]}'])
     hooks = _Hooks()
     result = await _run(settings, client, validate=_validate, hooks=hooks)
     assert result.value == [{"text": "Q"}]
@@ -267,7 +254,7 @@ async def test_retry_exhausted_raises_structured_output_error(settings):
     def _validate(d):  # noqa: ANN001, ANN202
         raise StructuredOutputError("always bad", fail_class=FAIL_CLASS_SCHEMA)
 
-    client = _FakeToolClient([_Resp(tool_input={"x": 1})] * n)
+    client = _FakeTextClient(['{"x": 1}'] * n)
     hooks = _Hooks()
     with pytest.raises(StructuredOutputError):
         await _run(settings, client, validate=_validate, hooks=hooks)
@@ -284,7 +271,7 @@ async def test_guard_checked_before_every_call_including_retries(settings):
     def _validate(d):  # noqa: ANN001, ANN202
         raise StructuredOutputError("bad", fail_class=FAIL_CLASS_PARSE)
 
-    client = _FakeToolClient([_Resp(tool_input=None, text="prose")] * n)
+    client = _FakeTextClient(["prose"] * n)
     hooks = _Hooks()
     with pytest.raises(StructuredOutputError):
         await _run(settings, client, validate=_validate, hooks=hooks)
@@ -304,7 +291,7 @@ async def test_pre_call_guard_trip_propagates_not_swallowed(settings):
         raise StructuredOutputError("schema bad", fail_class=FAIL_CLASS_SCHEMA)
 
     # 1-й вызов проходит guard и фейлит по schema; 2-й before_call бросает guard.
-    client = _FakeToolClient([_Resp(tool_input={"x": 1})] * 3)
+    client = _FakeTextClient(['{"x": 1}'] * 3)
     hooks = _Hooks(guard_raises_on=2)
     with pytest.raises(PreCallGuardTripped) as ei:
         await _run(settings, client, validate=_validate, hooks=hooks)
@@ -316,7 +303,7 @@ async def test_pre_call_guard_trip_propagates_not_swallowed(settings):
 
 async def test_pre_call_guard_trip_on_first_call_no_llm(settings):
     """Guard исчерпан ДО первого вызова → ни одного after_call (kill перед LLM, §C(b))."""
-    client = _FakeToolClient([_Resp(tool_input={"x": 1})])
+    client = _FakeTextClient(['{"x": 1}'])
     hooks = _Hooks(guard_raises_on=1)
     with pytest.raises(PreCallGuardTripped):
         await _run(settings, client, validate=lambda d: d, hooks=hooks)
@@ -332,7 +319,7 @@ async def test_diagnostics_payload_has_required_fields(settings):
     def _validate(d):  # noqa: ANN001, ANN202
         raise StructuredOutputError("missing 'files'", fail_class=FAIL_CLASS_SCHEMA)
 
-    client = _FakeToolClient([_Resp(tool_input={"x": 1}, text="raw model text")])
+    client = _FakeTextClient(['{"x": 1, "marker": "raw model text"}'])
     hooks = _Hooks()
     with pytest.raises(StructuredOutputError):
         await _run(settings, client, validate=_validate, hooks=hooks)
@@ -353,7 +340,9 @@ async def test_diagnostics_raw_tail_truncated_to_log_bytes(settings, monkeypatch
     def _validate(d):  # noqa: ANN001, ANN202
         raise StructuredOutputError("bad", fail_class=FAIL_CLASS_SCHEMA)
 
-    client = _FakeToolClient([_Resp(tool_input={"x": 1}, text=huge)])
+    # raw-текст = огромная проза (парсится? нет → parse-фейл; но raw_tail диагностируется в любом
+    # случае). Делаем валидный JSON, чтобы дойти до schema-validate, но с огромным «хвостом».
+    client = _FakeTextClient(['{"x": 1}' + " " + huge])
     hooks = _Hooks()
     with pytest.raises(StructuredOutputError):
         await _run(settings, client, validate=_validate, hooks=hooks)
@@ -363,12 +352,12 @@ async def test_diagnostics_raw_tail_truncated_to_log_bytes(settings, monkeypatch
 async def test_diagnostics_raw_tail_scrubbed_no_secrets(settings):
     """raw_tail scrubbed: секреты (Bearer/lv_-ключ) не утекают в job_events.payload (§I.4)."""
     # Тест-данные для проверки scrubbing — не настоящие секреты (S105 false-positive).
-    secret_raw = "leaked Bearer sk-ant-supersecret and key lv_pubid_topsecretpart in output"  # noqa: S105, E501
+    secret_raw = '{"x":1} leaked Bearer sk-ant-supersecret and key lv_pubid_topsecretpart'  # noqa: S105, E501
 
     def _validate(d):  # noqa: ANN001, ANN202
         raise StructuredOutputError("bad", fail_class=FAIL_CLASS_SCHEMA)
 
-    client = _FakeToolClient([_Resp(tool_input={"x": 1}, text=secret_raw)])
+    client = _FakeTextClient([secret_raw])
     hooks = _Hooks()
     with pytest.raises(StructuredOutputError):
         await _run(settings, client, validate=_validate, hooks=hooks)
@@ -382,7 +371,7 @@ async def test_diagnostics_raw_tail_scrubbed_no_secrets(settings):
 
 
 # --------------------------------------------------------------------------- #
-# (6) Agent 4 unrecoverable через tool_input → UnrecoverableSignal (дерево None), без ошибки.
+# (6) Agent 4 unrecoverable через JSON-поля block.text → UnrecoverableSignal (дерево None).
 # --------------------------------------------------------------------------- #
 
 
@@ -412,13 +401,11 @@ async def _noop_fail(**kw) -> None:  # noqa: ANN003
     return None
 
 
-async def test_agent4_unrecoverable_via_tool_input(settings, monkeypatch):
-    """Agent 4 unrecoverable выражается полями ОДНОГО инструмента (§A): дерево None, не ошибка
-    валидации. tool_choice форсирует tool, ветка выбирается полями (unrecoverable=true)."""
-    signal = {"unrecoverable": True, "reason": "irreparable", "explanation": "give up"}
-    monkeypatch.setattr(
-        agent4, "ClaudeAgentClient", lambda s: _FakeToolClient([_Resp(tool_input=signal)])
-    )
+async def test_agent4_unrecoverable_via_json_text(settings, monkeypatch):
+    """Agent 4 unrecoverable выражается полями JSON в block.text (§A): дерево None, не ошибка
+    валидации. Текстовый режим (revised) — структура из extract_json(block.text)."""
+    signal = json.dumps({"unrecoverable": True, "reason": "irreparable", "explanation": "give up"})
+    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeTextClient([signal]))
     result = await agent4.run_agent4(
         settings,
         spec_markdown="# Spec",
@@ -435,23 +422,25 @@ async def test_agent4_unrecoverable_via_tool_input(settings, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# (7) Доменная валидация поверх tool-use — traversal/dotfile/over-limit → schema-фейл, ретрай.
+# (7) Доменная валидация поверх extract_json — traversal/dotfile/over-limit → schema-фейл, ретрай.
 # --------------------------------------------------------------------------- #
 
 
-def _tree_with_path(path: str) -> dict:
+def _tree_with_path(path: str) -> str:
     pkg = json.dumps(
         {"name": "s", "scripts": {"build": "vite build"}, "devDependencies": {"vite": "^5"}}
     )
-    return {
-        "files": [
-            {"path": "package.json", "encoding": "utf8", "content": pkg},
-            {"path": "index.html", "encoding": "utf8", "content": "<html></html>"},
-            {"path": path, "encoding": "utf8", "content": "x"},
-        ],
-        "entry": "index.html",
-        "build": {"command": "npm ci && vite build"},
-    }
+    return json.dumps(
+        {
+            "files": [
+                {"path": "package.json", "encoding": "utf8", "content": pkg},
+                {"path": "index.html", "encoding": "utf8", "content": "<html></html>"},
+                {"path": path, "encoding": "utf8", "content": "x"},
+            ],
+            "entry": "index.html",
+            "build": {"command": "npm ci && vite build"},
+        }
+    )
 
 
 @pytest.mark.parametrize(
@@ -462,14 +451,14 @@ def _tree_with_path(path: str) -> dict:
         "/etc/passwd",  # абсолютный путь
     ],
 )
-async def test_agent3_domain_validation_over_tool_use_retries_then_raises(
+async def test_agent3_domain_validation_over_extract_json_retries_then_raises(
     settings, monkeypatch, bad_path
 ):
-    """Валидный JSON-формы tool_input, но дерево нарушает доменные правила (§Контракт Agent 3:
-    traversal/dotfile/абсолютный путь) → schema-фейл ПОВЕРХ tool-use (tool-схема их не выражает),
-    ретраится; на исчерпании = AgentOutputError (agent_output_invalid, §I.3)."""
+    """Валидный JSON-формы (извлекается extract_json), но дерево нарушает доменные правила
+    (§Контракт Agent 3: traversal/dotfile/абсолютный путь) → schema-фейл ПОВЕРХ извлечённой
+    структуры, ретраится; на исчерпании = AgentOutputError (agent_output_invalid, §I.3)."""
     n = settings.agent_output_max_retries + 1
-    client = _FakeToolClient([_Resp(tool_input=_tree_with_path(bad_path))] * n)
+    client = _FakeTextClient([_tree_with_path(bad_path)] * n)
     monkeypatch.setattr(agent3, "ClaudeAgentClient", lambda s: client)
 
     after_calls = []
@@ -497,17 +486,19 @@ async def test_agent3_over_limit_tree_is_schema_fail(settings, monkeypatch):
     pkg = json.dumps(
         {"name": "s", "scripts": {"build": "vite build"}, "devDependencies": {"vite": "^5"}}
     )
-    oversized = {
-        "files": [
-            {"path": "package.json", "encoding": "utf8", "content": pkg},
-            {"path": "index.html", "encoding": "utf8", "content": "<html></html>"},
-            {"path": "big.js", "encoding": "utf8", "content": "y" * 5000},
-        ],
-        "entry": "index.html",
-        "build": {"command": "npm ci && vite build"},
-    }
+    oversized = json.dumps(
+        {
+            "files": [
+                {"path": "package.json", "encoding": "utf8", "content": pkg},
+                {"path": "index.html", "encoding": "utf8", "content": "<html></html>"},
+                {"path": "big.js", "encoding": "utf8", "content": "y" * 5000},
+            ],
+            "entry": "index.html",
+            "build": {"command": "npm ci && vite build"},
+        }
+    )
     n = settings.agent_output_max_retries + 1
-    client = _FakeToolClient([_Resp(tool_input=oversized)] * n)
+    client = _FakeTextClient([oversized] * n)
     monkeypatch.setattr(agent3, "ClaudeAgentClient", lambda s: client)
     failures = []
 

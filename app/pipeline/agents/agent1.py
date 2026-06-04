@@ -1,7 +1,8 @@
 """Agent 1 (Interviewer): промт → список уточняющих вопросов.
 
 Output → таблица questions (docs/modules/pipeline/03-architecture.md). Structured-output
-через форсированный tool-use + bounded retry (ADR-020 §I, общий слой structured.py).
+через текстовый режим + строгий промт + extract_json + bounded retry (ADR-020 §I, revised;
+общий слой structured.py).
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from typing import Any
 from app.core.config import Settings
 from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
 from app.pipeline.agents.structured import (
-    AGENT1_TOOL,
     FAIL_CLASS_SCHEMA,
     DiagnosticsHook,
     GuardHook,
@@ -40,9 +40,9 @@ class Agent1Result:
 
 
 def _validate_questions(data: Any) -> list[ParsedQuestion]:
-    """Доменная валидация структуры Agent 1 поверх tool-use (ADR-020 §I.1).
+    """Доменная валидация структуры Agent 1 поверх извлечённого JSON (ADR-020 §I.2).
 
-    tool-use гарантирует JSON-форму; здесь — доменные правила контракта questions (непустой
+    extract_json гарантирует JSON-форму; здесь — доменные правила контракта questions (непустой
     список, обязательный непустой text, корректный kind/options). Нарушение → schema-фейл
     (re-семплируемый, ретраится; на исчерпании — FAILED(invalid_agent_output), §I.3).
     """
@@ -89,7 +89,7 @@ async def run_agent1(
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
 ) -> Agent1Result:
-    """Один шаг Agent 1 (форсированный tool-use + bounded retry, ADR-020 §I).
+    """Один шаг Agent 1 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
 
     before_call/after_call/on_attempt_failure инъектируются task-слоем (budget/wall-clock-гард
     перед каждым вызовом; запись llm_usage после каждого; диагностика parse/schema-фейла §I.4).
@@ -103,7 +103,6 @@ async def run_agent1(
         model=settings.agent1_model,
         system_prompt=_SYSTEM_PROMPT,
         user_content=f"User website idea:\n\n{prompt}",
-        tool=AGENT1_TOOL,
         validate=_validate_questions,
         before_call=before_call,
         after_call=after_call,

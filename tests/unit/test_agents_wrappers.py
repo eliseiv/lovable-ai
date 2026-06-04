@@ -1,9 +1,10 @@
-"""Unit: обёртки агентов 2/3 поверх structured-слоя (ADR-020 §I) — фейк tool-use, без сети.
+"""Unit: обёртки агентов 2/3 поверх structured-слоя (ADR-020 revised §I) — фейк текст, без сети.
 
-Agent 2/3 получают структуру форсированным tool-use (structured.run_structured_agent):
-структура читается из tool_use.input (фейк-клиент возвращает её), доменная валидация —
-поверх tool-use. Хуки before_call/after_call/on_attempt_failure инъектируются (здесь — no-op
-с учётом числа вызовов/usage), как это делает task-слой.
+REVISED: tool-use ОТОЗВАН. Agent 2/3 получают структуру ТЕКСТОВЫМ режимом
+(structured.run_structured_agent → ClaudeAgentClient.run_agent): структура извлекается из
+block.text через extract_json, доменная валидация — поверх извлечённой структуры. Хуки
+before_call/after_call/on_attempt_failure инъектируются (здесь — no-op с учётом числа
+вызовов/usage), как это делает task-слой.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import pytest
 
 from app.core.config import get_settings
 from app.pipeline.agents import agent2, agent3
-from app.pipeline.agents.claude_client import AgentCall, AgentToolCall
+from app.pipeline.agents.claude_client import AgentCall
 from app.schemas.agent_output import AgentOutputError
 
 pytestmark = pytest.mark.asyncio
@@ -33,32 +34,28 @@ def _call(text):  # noqa: ANN001, ANN201
     )
 
 
-class _FakeToolClient:
-    """Фейк ClaudeAgentClient.run_agent_tool: структура из tool_input (ADR-020 §I.1).
+class _FakeTextClient:
+    """Фейк ClaudeAgentClient.run_agent (ADR-020 §I.1 revised): структура из block.text.
 
-    Очередь dict-ответов; невалидный/строковый ответ → tool_input=None (текстовый fallback).
+    Очередь ответов; dict → сериализуется в JSON-текст (как модель в текстовом режиме);
+    строка → подаётся как есть (для невалидного/не-JSON текста).
     """
 
     def __init__(self, responses):  # noqa: ANN001
         self._responses = list(responses)
         self.calls = 0
 
-    async def run_agent_tool(  # noqa: ANN201
+    async def run_agent(  # noqa: ANN201
         self,
         *,
         model,
         system_prompt,
-        user_content,
-        tool_name,
-        input_schema,  # noqa: ANN001
+        user_content,  # noqa: ANN001
     ):
         self.calls += 1
         resp = self._responses.pop(0) if self._responses else {}
-        if isinstance(resp, dict):
-            tool_input, text = resp, json.dumps(resp)
-        else:
-            tool_input, text = None, str(resp)
-        return AgentToolCall(tool_input=tool_input, text=text, call=_call(text))
+        text = json.dumps(resp) if isinstance(resp, dict) else str(resp)
+        return _call(text)
 
 
 def _hooks():  # noqa: ANN202
@@ -83,13 +80,13 @@ def settings():  # noqa: ANN201
 
 
 def _wire2(monkeypatch, responses):  # noqa: ANN001, ANN202
-    client = _FakeToolClient(responses)
+    client = _FakeTextClient(responses)
     monkeypatch.setattr(agent2, "ClaudeAgentClient", lambda s: client)
     return client
 
 
 def _wire3(monkeypatch, responses):  # noqa: ANN001, ANN202
-    client = _FakeToolClient(responses)
+    client = _FakeTextClient(responses)
     monkeypatch.setattr(agent3, "ClaudeAgentClient", lambda s: client)
     return client
 

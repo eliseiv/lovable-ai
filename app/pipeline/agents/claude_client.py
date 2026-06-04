@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Any, cast
 
 from anthropic import AsyncAnthropic
-from anthropic.types import OutputConfigParam, ToolChoiceToolParam, ToolParam
+from anthropic.types import OutputConfigParam
 
 from app.core.config import Settings
 from app.workers.retry_policy import LLMCredentialError
@@ -50,21 +50,6 @@ class AgentCall:
     cost_usd: Decimal
 
 
-@dataclass(frozen=True)
-class AgentToolCall:
-    """Результат форсированного tool-use вызова агента (ADR-020 §I.1, skill claude-api).
-
-    `tool_input` — распарсенный SDK-объект из `tool_use`-блока (`block.input`), основной
-    канал структуры. None, если модель не вернула tool_use-блок (граничный случай / отказ
-    tool-use) — тогда defence-in-depth применяет толерантный парсинг к `text`. `text` —
-    собранные текстовые блоки (для fallback-парсинга и scrubbed-диагностики §I.4).
-    """
-
-    tool_input: dict[str, Any] | None
-    text: str
-    call: AgentCall
-
-
 def _compute_cost(
     model: str,
     input_tokens: int,
@@ -99,12 +84,15 @@ class ClaudeAgentClient:
         system_prompt: str,
         user_content: str,
     ) -> AgentCall:
-        """Один свободно-текстовый вызов агента (без tool-use): стабильный system кэшируется,
+        """Один текстовый вызов агента (ADR-020 §I.1, revised): стабильный system кэшируется,
         user — волатильная часть. Стримим (длинный вывод) + собираем финальное сообщение —
         защита от HTTP-таймаута при больших max_tokens (skill claude-api).
 
-        ADR-020: основной путь structured-output агентов — `run_agent_tool` (форсированный
-        tool-use). `run_agent` оставлен для не-структурированных вызовов и как транспорт-основа.
+        ЕДИНЫЙ нормативный путь structured-output всех 4 агентов (ADR-020, revised 2026-06-04):
+        ТЕКСТОВЫЙ режим — `thinking=adaptive` + `output_config={effort}`, БЕЗ `tools`/`tool_choice`.
+        Форсированный tool-use ОТОЗВАН: несовместим с thinking → HTTP 400 «Thinking may not be
+        enabled when tool_choice forces tool use» → 100% отказ (ADR-020 §Ограничение API).
+        Структура извлекается из `block.text` хелпером `extract_json` (structured.py §I.2).
         """
         message = await self._stream_final_message(
             model=model,
@@ -114,61 +102,18 @@ class ClaudeAgentClient:
         text = "".join(block.text for block in message.content if block.type == "text")
         return self._build_call(model, message, text)
 
-    async def run_agent_tool(
-        self,
-        *,
-        model: str,
-        system_prompt: str,
-        user_content: str,
-        tool_name: str,
-        input_schema: dict[str, Any],
-    ) -> AgentToolCall:
-        """Форсированный tool-use вызов агента (ADR-020 §I.1, skill claude-api).
-
-        Подаётся ОДИН инструмент со схемой выхода агента (`input_schema`) и
-        `tool_choice={"type":"tool","name":tool_name}` — модель ОБЯЗАНА заполнить аргументы
-        этого инструмента. Структуру читаем из `tool_use`-блока (`block.input` — распарсенный
-        SDK-объект), НЕ из текста: это устраняет markdown-фенсы как класс (прод-баг §I).
-        Совместимо с extended thinking `adaptive` (в отличие от assistant-prefill).
-
-        `output_config` несёт `effort` (НЕ `format`) — `effort` совместим с forced tool_choice;
-        adaptive thinking остаётся включён. Стримим + `get_final_message()` (HTTP-таймаут-guard
-        при больших max_tokens). Возвращает tool_input (None при отсутствии tool_use-блока) +
-        text (fallback-парсинг/диагностика) + учёт стоимости (AgentCall).
-        """
-        tool: ToolParam = {
-            "name": tool_name,
-            "description": f"Submit the structured result for {tool_name}.",
-            "input_schema": cast(Any, input_schema),
-        }
-        tool_choice: ToolChoiceToolParam = {"type": "tool", "name": tool_name}
-        message = await self._stream_final_message(
-            model=model,
-            system_prompt=system_prompt,
-            user_content=user_content,
-            tools=[tool],
-            tool_choice=tool_choice,
-        )
-        text = "".join(block.text for block in message.content if block.type == "text")
-        tool_input: dict[str, Any] | None = None
-        for block in message.content:
-            if block.type == "tool_use" and block.name == tool_name:
-                raw_input = block.input
-                tool_input = raw_input if isinstance(raw_input, dict) else None
-                break
-        call = self._build_call(model, message, text)
-        return AgentToolCall(tool_input=tool_input, text=text, call=call)
-
     async def _stream_final_message(
         self,
         *,
         model: str,
         system_prompt: str,
         user_content: str,
-        tools: list[ToolParam] | None = None,
-        tool_choice: ToolChoiceToolParam | None = None,
     ) -> Any:
-        """Общий транспорт: stream + get_final_message для свободного и tool-use вызова.
+        """Транспорт: stream + get_final_message для текстового вызова агента.
+
+        Собранные kwargs `messages.stream` НЕ содержат `tools`/`tool_choice` (ADR-020 §I.1,
+        revised) — несовместимы с `thinking=adaptive` (HTTP 400). Только `thinking=adaptive` +
+        `output_config={effort}`; формат выхода форсируется строгим системным промтом.
 
         ADR-019 §Fix round 3 (подстраховка, §G): единственная идентифицируемая точка обращения
         к Anthropic SDK. При невалидном (но непустом — пустой отсекается preflight'ом §G)
@@ -192,10 +137,6 @@ class ClaudeAgentClient:
             ],
             "messages": [{"role": "user", "content": user_content}],
         }
-        if tools is not None:
-            kwargs["tools"] = tools
-        if tool_choice is not None:
-            kwargs["tool_choice"] = tool_choice
         try:
             async with self._client.messages.stream(**kwargs) as stream:
                 return await stream.get_final_message()

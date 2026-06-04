@@ -156,33 +156,24 @@ def _call(text: str) -> AgentCall:
 
 
 class _FakeClient:
-    """Фейк ClaudeAgentClient.run_agent_tool (ADR-020 §I.1): структура из tool_input.
+    """Фейк ClaudeAgentClient.run_agent (ADR-020 §I.1 revised): структура из block.text.
 
-    Невалидный JSON → tool_input=None (текстовый fallback / отказ tool-use, §I.2).
+    Возвращает заданный текст; structured-слой извлекает структуру через extract_json. Не-JSON
+    текст → parse-фейл в structured-слое (§I.2).
     """
 
     def __init__(self, text: str) -> None:
         self._text = text
 
-    async def run_agent_tool(  # noqa: ANN201
+    async def run_agent(  # noqa: ANN201
         self,
         *,
         model,
         system_prompt,
-        user_content,
-        tool_name,
-        input_schema,  # noqa: ANN001
+        user_content,  # noqa: ANN001
     ):
-        from app.pipeline.agents.claude_client import AgentToolCall
-
         self.captured_user_content = user_content
-        try:
-            tool_input = json.loads(self._text)
-            if not isinstance(tool_input, dict):
-                tool_input = None
-        except ValueError:
-            tool_input = None
-        return AgentToolCall(tool_input=tool_input, text=self._text, call=_call(self._text))
+        return _call(self._text)
 
 
 async def _noop_before() -> None:
@@ -283,7 +274,7 @@ async def test_run_agent4_invalid_patch_raises_after_retries_usage_recorded(monk
 
 
 async def test_run_agent4_non_json_output_raises(monkeypatch):
-    """Чистый parse-фейл (tool_input=None И текст не JSON) → StructuredOutputError(parse_error)
+    """Чистый parse-фейл (block.text не содержит JSON) → StructuredOutputError(parse_error)
     после ретраев (нет домен-исключения для проброса). task → agent_output_invalid."""
     from app.pipeline.agents.structured import StructuredOutputError
 
