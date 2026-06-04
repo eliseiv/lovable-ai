@@ -26,14 +26,26 @@ CIDR/metadata — дополняющий слой (здесь продублир
 
 | Назначение | Политика |
 |---|---|
-| `registry.npmjs.org`, `*.npmjs.org` (CDN) | ALLOW (только из build-egress подсети) |
+| `registry.npmjs.org`, `*.npmjs.org` (CDN) | ALLOW (только из build-egress подсети `src 172.16.0.0/12`) |
 | `169.254.169.254` (cloud-metadata) | DENY (раньше allow — анти-DNS-rebind) |
-| private CIDR (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16) | DENY |
+| private CIDR (10/8, 172.16/12, 192.168/16, 127/8, 169.254/16) | DENY (это `dst`-фильтр адресата, не `src`) |
 | всё прочее | DENY (default-deny `http_access deny all`) |
 
 Хосты allowlist в `squid.conf` (`acl npm_registry dstdomain ...`) должны
 соответствовать `NPM_REGISTRY_ALLOWLIST` из `.env` (дефолт `registry.npmjs.org`).
 При расширении allowlist — менять обе точки синхронно.
+
+**Src-ACL build-клиентов (`acl build_clients src 172.16.0.0/12`) — мульти-инстанс.**
+Покрывает весь Docker-bridge диапазон RFC1918, поэтому допускает build-контейнеры
+**любого** инстанса (его `BUILD_EGRESS_SUBNET` — напр. `172.31` corelysite, `172.30`
+nexoraweb — ⊂ `172.16/12`) **без** правки конфига/envsubst. Это defence-in-depth
+поверх **первичной** сетевой изоляции (proxy слушает 3128 только в `build_egress`,
+наружу порт не публикуется → достучаться могут лишь build-контейнеры данного
+инстанса). Нормативное обоснование и обратная совместимость —
+[`ADR-010 §C-2`](../../docs/adr/ADR-010-build-sandbox-rootless-egress.md) и
+[`docs/07-deployment.md → egress-proxy ACL build-клиентов`](../../docs/07-deployment.md).
+`src`-ACL (источник) ≠ `dst to_private 172.16/12` (адресат, анти-SSRF) — это
+разные оси, расширение `src` не ослабляет `dst`-фильтр.
 
 ## Сеть
 
