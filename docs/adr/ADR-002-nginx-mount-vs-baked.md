@@ -14,6 +14,8 @@
 
 **Generic `nginx:alpine` + примонтированный статик-каталог** (`/srv/sites/{pid}/`), `docker run` с Traefik-лейблами. Без сборки и пуша per-site образа, без registry.
 
+> **Провижининг host-каталога `SITES_HOST_ROOT` + path-consistency (прод-фикс 2026-06-04).** В prod nginx-сайт деплоится вложенным `docker run -v {sites_host_root}/{pid}:/usr/share/nginx/html:ro` через rootless-демон — bind-source резолвится относительно ФС хоста демона, не worker-контейнера. Поэтому host-каталог `SITES_HOST_ROOT` обязан быть bind-смонтирован в worker по **идентичному абсолютному пути** (`-v ${SITES_HOST_ROOT}:${SITES_HOST_ROOT}`), создан **до** старта worker с ownership «worker uid 10001 пишет `dist/` / nginx читает (`:ro`)». Топология провижининга — [07-deployment.md → Провижининг build-workspace](../07-deployment.md#провижининг-build-workspace-и-sites-каталога-host-bind-path-consistency--прод-фикс-2026-06-04).
+
 ## Consequences
 
 **Плюсы:** быстрый деплой (нет docker build + push); не нужен registry; меньше места; rollback ревизии = смена примонтированного каталога; единый базовый образ кэшируется.

@@ -448,6 +448,20 @@ services:
       # провижит devops/пользователь (Apple Developer AuthKey.p8); в git НЕ
       # коммитится. Нет файла + APNS_AUTH_KEY пуст -> notify.apns_push no-op.
       - ${APNS_AUTH_KEY_HOST_PATH:-./secrets/apns}:/secrets/apns:ro
+      # build-workspace + sites host-bind по ИДЕНТИЧНОМУ абсолютному пути
+      # (path-consistency для вложенного rootless `docker run -v`).
+      # docs/07-deployment.md → "Провижининг build-workspace и sites-каталога
+      # (host-bind, path-consistency)" → инвариант path-consistency + §Топология
+      # BUILDS_ROOT/SITES_HOST_ROOT (строки 246/256: -v ${BUILDS_ROOT}:${BUILDS_ROOT},
+      # -v ${SITES_HOST_ROOT}:${SITES_HOST_ROOT}; НЕ named volume — нужен реальный
+      # host-путь, видимый rootless-демону по тому же абсолютному пути). Host-каталоги
+      # провижатся ДО старта worker в deploy-job CI (механизм 1, docs/07 §264).
+      # worker (uid 10001) пишет {BUILDS_ROOT}/{job_id} (распаковка source.tgz, dist/)
+      # и {SITES_HOST_ROOT}/{pid} (статика); rootless-демон монтирует те же пути во
+      # вложенный build/nginx-контейнер. Фикс прод-инцидента [Errno 13] Permission
+      # denied: '/var/builds' (2026-06-04).
+      - ${BUILDS_ROOT:-/var/builds}:${BUILDS_ROOT:-/var/builds}
+      - ${SITES_HOST_ROOT:-/srv/sites}:${SITES_HOST_ROOT:-/srv/sites}
     command:
       - "celery"
       - "-A"

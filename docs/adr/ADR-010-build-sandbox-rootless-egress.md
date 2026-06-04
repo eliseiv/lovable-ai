@@ -59,6 +59,8 @@ Docker **не** имеет токена `seccomp=default`: допустимы т
 
 Workspace (`{builds_root}/{job_id}`) — эфемерный, очищается после сборки (успех/фейл), с дисковой квотой. Это сохраняет инварианты S1 (cleanup `/var/builds/{job_id}`), усиливая runtime и сеть.
 
+> **Провижининг host-каталога `BUILDS_ROOT` + path-consistency (прод-фикс 2026-06-04).** Bind-source `-v {builds_root}/{job_id}:/workspace` резолвит **rootless-демон относительно ФС хоста**, где он работает, а не ФС worker-контейнера. Поэтому host-каталог `BUILDS_ROOT` обязан существовать **до** старта worker, быть bind-смонтирован в worker по **идентичному абсолютному пути** (`-v ${BUILDS_ROOT}:${BUILDS_ROOT}`, не именованный volume) и иметь ownership «worker uid 10001 пишет / rootless-демон читает». Нормативная топология провижининга (где живёт, кто создаёт, права) — [07-deployment.md → Провижининг build-workspace](../07-deployment.md#провижининг-build-workspace-и-sites-каталога-host-bind-path-consistency--прод-фикс-2026-06-04). Прод-инцидент: первый реальный build упал на `[Errno 13] Permission denied: '/var/builds'` — каталог отсутствовал и не провижился.
+
 ### C. Egress-allowlist (только npm-registry)
 
 - Build-контейнер подключается к **отдельной Docker-сети** (`BUILD_EGRESS_NETWORK`, в dev `internal: true`), из которой **нет прямого выхода в интернет и нет доступа к внутренней сети** (Postgres/Redis/MinIO/Traefik) и к cloud-metadata (`169.254.169.254`) / private CIDR. **Следствие:** прямого сетевого маршрута к npm-registry у build-контейнера НЕТ — он обязан ходить туда **только** через egress-proxy.

@@ -214,5 +214,23 @@ jobs:
             set -e
             cd /opt/corelysite
             git pull --ff-only
+            # Провижининг host-каталогов build-workspace + sites ДО старта worker
+            # (docs/07-deployment.md → "Провижининг build-workspace и sites-каталога"
+            # → §"Шаг провижининга host-каталогов", механизм 1 host-провизион в
+            # deploy-процедуре, рекомендованный для shared single-host). Идемпотентно
+            # (mkdir -p + chown повторно безопасны). deploy идёт по SSH под root ->
+            # chown допустим. Ownership 10001:10001 = worker uid `app` (docs/07 §246/247:
+            # worker uid 10001 пишет {BUILDS_ROOT}/{job_id} и {SITES_HOST_ROOT}/{pid});
+            # chmod 0755 даёт o+rx -> rootless-демон/nginx-контейнер читают/монтируют
+            # ({SITES_HOST_ROOT} читается nginx :ro, docs/07 §257). Пути берутся из
+            # .env с дефолтами /var/builds /srv/sites -> совпадают символ-в-символ с
+            # host-bind worker в compose (path-consistency, инвариант docs/07).
+            # Фикс прод-инцидента [Errno 13] Permission denied: '/var/builds'.
+            set -a; . ./.env; set +a
+            BUILDS_DIR="${BUILDS_ROOT:-/var/builds}"
+            SITES_DIR="${SITES_HOST_ROOT:-/srv/sites}"
+            mkdir -p "$BUILDS_DIR" "$SITES_DIR"
+            chown 10001:10001 "$BUILDS_DIR" "$SITES_DIR"
+            chmod 0755 "$BUILDS_DIR" "$SITES_DIR"
             docker compose -f infra/docker-compose.prod.yml --env-file .env up -d --build
             docker compose -f infra/docker-compose.prod.yml --env-file .env ps
