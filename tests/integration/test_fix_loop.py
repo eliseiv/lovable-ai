@@ -198,7 +198,9 @@ async def fixing_job(autonomous_db):  # noqa: ANN001, ANN201
         revision_no=1,
         exit_code=2,
     )
-    log_ref = s3.build_log_key(jid)
+    # ADR-022: per-attempt ключ дискриминирован retry_count (джоба создаётся с retry_count=0,
+    # см. ниже) → build.0.log. Прежняя одно-арг сигнатура build_log_key(jid) удалена.
+    log_ref = s3.build_log_key(jid, 0)
     storage.objects[log_ref] = build_log.encode("utf-8")
     # source.tgz по детерминированному ключу джобы (нет ревизии-кандидата ещё).
     storage.objects[s3.source_key(jid)] = _src_tgz()
@@ -417,7 +419,7 @@ async def test_no_progress_same_signature_second_event_fails(fixing_job, monkeyp
     # уже видел её на прошлом витке), оставив failure_event_pending=True (новое событие).
     from app.pipeline.failure_signature import compute_failure_signature
 
-    current_log = storage.objects[s3.build_log_key(jid)].decode()
+    current_log = storage.objects[s3.build_log_key(jid, 0)].decode()
     sig = compute_failure_signature(current_log)
     async with session_scope() as s:
         job = await s.get(GenerationJob, jid)
@@ -447,7 +449,7 @@ async def test_crash_resume_same_signature_no_pending_calls_agent4(fixing_job, m
 
     from app.pipeline.failure_signature import compute_failure_signature
 
-    current_log = storage.objects[s3.build_log_key(jid)].decode()
+    current_log = storage.objects[s3.build_log_key(jid, 0)].decode()
     sig = compute_failure_signature(current_log)
     async with session_scope() as s:
         job = await s.get(GenerationJob, jid)

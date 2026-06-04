@@ -3,8 +3,9 @@
 Реальный Postgres. Внешние границы (docker/health/S3/build) — моки.
 
 Покрывает:
-- build-fail (task_build_request) → FIXING: failure_log в logs/{job_id}/build.log с
-  машинной шапкой (§F), failure_log_ref записан, failure_event_pending=True;
+- build-fail (task_build_request) → FIXING: failure_log в logs/{job_id}/build.{n}.log
+  (per-attempt, ADR-022) с машинной шапкой (§F), failure_log_ref записан,
+  failure_event_pending=True;
 - deploy-fail (docker run) → FIXING с failure_class=deploy_error (НЕ health_timeout);
 - health-fail (timeout) → FIXING с failure_class=health_timeout;
 - health 5xx/4xx классификация;
@@ -210,10 +211,11 @@ async def test_build_fail_enters_fixing_writes_failure_log(job_in_state, monkeyp
     async with session_scope() as s:
         job = await s.get(GenerationJob, jid)
         assert job.state == JobState.FIXING
-        assert job.failure_log_ref == s3.build_log_key(jid)
+        # ADR-022: build-фейл витка retry_count=0 → per-attempt ключ build.0.log.
+        assert job.failure_log_ref == s3.build_log_key(jid, 0)
         assert job.failure_event_pending is True
     # failure_log в правильном ключе с машинной шапкой (§F).
-    log = storage.objects[s3.build_log_key(jid)].decode()
+    log = storage.objects[s3.build_log_key(jid, 0)].decode()
     parsed = parse_failure_log(log)
     assert parsed.failure_class == "build_error"
 
@@ -251,7 +253,7 @@ async def test_npm_install_error_classified(job_in_state, monkeypatch):
 
     await tasks._build_request(jid)
 
-    log = storage.objects[s3.build_log_key(jid)].decode()
+    log = storage.objects[s3.build_log_key(jid, 0)].decode()
     assert parse_failure_log(log).failure_class == "npm_install_error"
 
 
@@ -288,7 +290,9 @@ async def test_deploy_fail_classified_deploy_error_not_health(job_in_state, monk
     async with session_scope() as s:
         job = await s.get(GenerationJob, jid)
         assert job.state == JobState.FIXING
-    log = storage.objects[s3.build_log_key(jid)].decode()
+    # ADR-022: deploy-фейл → per-attempt ключ deploy.{n}.log (НЕ build.{n}.log), чтобы
+    # не затереть build-лог успешной сборки того же витка retry_count=0.
+    log = storage.objects[s3.deploy_log_key(jid, 0)].decode()
     assert parse_failure_log(log).failure_class == "deploy_error"  # НЕ health_timeout
     assert order == ["teardown", "enter_fixing"]  # teardown ДО FIXING
 
@@ -317,7 +321,8 @@ async def _run_health_fail(job_in_state, monkeypatch, detail: str):  # noqa: ANN
     monkeypatch.setattr(tasks.health, "wait_until_live", _fail_health)
 
     await tasks._deploy(jid)
-    log = storage.objects[s3.build_log_key(jid)].decode()
+    # ADR-022: health-фейл (health_timeout/health_5xx/health_4xx) → deploy.{n}.log.
+    log = storage.objects[s3.deploy_log_key(jid, 0)].decode()
     async with session_scope() as s:
         job = await s.get(GenerationJob, jid)
         state = job.state

@@ -2,8 +2,9 @@
 
 Доменный фейл (build-fail / health-fail / invalid-agent-output) после deploy-teardown
 уводит джобу в FIXING (а НЕ в FAILED, как в Sprint 1). Сюда вынесена общая логика:
-  - собрать failure_log с машинной шапкой (§F) и записать в S3 (logs/{job_id}/build.log,
-    перезапись последним фейлом — §F);
+  - собрать failure_log с машинной шапкой (§F) и записать в S3 per-attempt ключом по
+    стадии (ADR-022, deploy §F-1): build/npm-фейл → logs/{job_id}/build.{retry_count}.log;
+    deploy/health-фейл → logs/{job_id}/deploy.{retry_count}.log;
   - обновить generation_jobs.failure_log_ref;
   - транзакционно перевести state DEPLOYING → FIXING (+ job_events build_failed) и
     диспетчеризовать task_fix.
@@ -57,7 +58,13 @@ async def enter_fixing(
     """Записывает failure_log в S3 и переводит джобу DEPLOYING → FIXING (+ dispatch task_fix).
 
     failure_class — машинный класс фейла (§F): build_error / npm_install_error /
-    health_timeout / health_5xx / health_4xx / agent_output_invalid.
+    health_timeout / health_5xx / health_4xx.
+
+    Per-attempt ключ по стадии failure_class (ADR-022, deploy §F-1): build/npm-фейл →
+    build_log_key (build.{retry_count}.log); deploy/health-фейл → deploy_log_key
+    (deploy.{retry_count}.log). Раздельные имена-стадии при одном retry_count исключают
+    затирание лога успешной сборки того же витка deploy-фейлом. Дискриминатор —
+    монотонный job.retry_count.
     """
     log = build_failure_log(
         failure_class=failure_class,
@@ -66,7 +73,11 @@ async def enter_fixing(
         exit_code=exit_code,
         extra_header={"job_id": job.id},
     )
-    log_ref = await storage.put_text(s3.build_log_key(job.id), log, "text/plain")
+    if failure_class in ("build_error", "npm_install_error"):
+        log_key = s3.build_log_key(job.id, job.retry_count)
+    else:
+        log_key = s3.deploy_log_key(job.id, job.retry_count)
+    log_ref = await storage.put_text(log_key, log, "text/plain")
     job.failure_log_ref = log_ref
     # Новый failure-event: гард no-progress (§C(d)) отличит реальный повтор от
     # crash-resume того же события. Сбросит флаг сам гард при проверке.

@@ -432,6 +432,41 @@ async def test_gc_s3_prefix_does_not_capture_sibling_job(gc_project, monkeypatch
     assert f"sources/{job_live}/source.tgz" not in storage.objects
 
 
+# --- B/#10: project.gc дочищает per-attempt логи build.{n}/deploy.{n}/agent.{n} ---
+
+
+async def test_gc_sweeps_per_attempt_logs_under_logs_prefix(gc_project, monkeypatch):
+    """ADR-022 §Ретеншн: все per-attempt логи (build.{n}/deploy.{n}/agent.{n}) под
+    logs/{job_id}/ подчищаются тем же batch-delete по префиксу logs/{job_id}/ в project.gc —
+    отдельной очистки не требуется (prefix-захват по logs/{job_id}/)."""
+    from app.deploy.project_gc import _run_gc
+
+    ctx = gc_project
+    pid, job_live, job_inflight = ctx["pid"], ctx["job_live"], ctx["job_inflight"]
+
+    storage = _FakeStorage()
+    # Сидируем per-attempt логи нескольких витков для обоих job_id под logs/{job_id}/.
+    for jid in (job_live, job_inflight):
+        for n in (0, 1, 2):
+            storage.objects[f"logs/{jid}/build.{n}.log"] = b"build log"
+            storage.objects[f"logs/{jid}/deploy.{n}.log"] = b"deploy log"
+            storage.objects[f"logs/{jid}/agent.{n}.log"] = b"agent log"
+    seeded = dict(storage.objects)
+    assert seeded, "должны быть засеяны per-attempt логи"
+
+    _wire_gc(monkeypatch, storage)
+    await _run_gc(pid)
+
+    # Все per-attempt логи обоих job_id снесены (под захваченным префиксом logs/{job_id}/).
+    for key in seeded:
+        assert key not in storage.objects, f"per-attempt лог {key} должен быть удалён project.gc"
+    assert storage.objects == {}
+    # Префикс logs/{job_id}/ участвовал в batch-delete для каждого job_id.
+    deleted_prefixes = {c[0] for c in storage.delete_prefix_calls}
+    for jid in (job_live, job_inflight):
+        assert f"logs/{jid}/" in deleted_prefixes
+
+
 # --- Идемпотентность / crash-resume -------------------------------------------
 
 

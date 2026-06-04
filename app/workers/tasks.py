@@ -439,7 +439,9 @@ async def _build_request(job_id: str) -> None:
             return
 
         dist_ref = await storage.put_bytes(s3.dist_key(job_id), dist_tgz, "application/gzip")
-        log_ref = await storage.put_text(s3.build_log_key(job_id), build_log, "text/plain")
+        log_ref = await storage.put_text(
+            s3.build_log_key(job_id, job.retry_count), build_log, "text/plain"
+        )
         await record_event(
             session,
             job.id,
@@ -519,7 +521,7 @@ async def _deploy(job_id: str) -> None:
             subdomain=subdomain,
             live_url=url,
             dist_artifact_ref=s3.dist_key(job_id),
-            build_log_ref=s3.build_log_key(job_id),
+            build_log_ref=s3.build_log_key(job_id, job.retry_count),
             container_id=None,
             status="building",
         )
@@ -1084,7 +1086,11 @@ async def _handle_invalid_patch(
         revision_no=revision.revision_no if revision is not None else None,
         extra_header={"job_id": job.id},
     )
-    log_ref = await storage.put_text(s3.build_log_key(job.id), log, "text/plain")
+    # ADR-022: agent_output_invalid → отдельный per-attempt ключ agent.{retry_count}.log
+    # (НЕ build_log_key). _handle_invalid_patch не инкрементирует retry_count, поэтому
+    # пишется тем же N, что и build/deploy-фейл витка; отдельное имя-стадии исключает
+    # затирание их логов того же витка.
+    log_ref = await storage.put_text(s3.agent_log_key(job.id, job.retry_count), log, "text/plain")
     job.failure_log_ref = log_ref
     # Новый failure-event (невалидный патч): помечаем для гарда no-progress (§C(d)),
     # чтобы повтор той же agent_output_invalid-сигнатуры на новом витке ловился, а

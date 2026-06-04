@@ -62,33 +62,34 @@ class S3Storage:
         return await self.put_bytes(key, text.encode("utf-8"), content_type)
 
     async def delete_prefix(self, prefix: str, *, batch_size: int) -> int:
-        """Batch-delete всех объектов под key-префиксом. Возвращает число удалённых ключей.
+        """Per-object delete всех объектов под key-префиксом. Возвращает число удалённых ключей.
 
         Используется project.gc (ADR-011): снос всех S3-артефактов проекта по префиксам
-        sources/dist/logs/specs всех его job_id. Идемпотентно: отсутствие объектов под
-        префиксом → 0 (повторный GC — no-op). Пагинация list_objects_v2 + delete_objects
-        батчами batch_size (S3 DeleteObjects лимит — 1000 ключей за запрос).
+        sources/dist/logs/specs всех его job_id (включая per-attempt build/deploy/agent-логи
+        ADR-022 под logs/{job_id}/). Идемпотентно: отсутствие объектов под префиксом → 0
+        (повторный GC — no-op).
+
+        Удаление — per-object `delete_object` в цикле (НЕ batch `delete_objects`): MinIO
+        требует Content-MD5 на batch DeleteObjects, которого boto3 в текущей конфигурации не
+        шлёт (botocore ClientError 'MissingContentMD5' → project.gc падал, S3-артефакты не
+        дочищались). Single `delete_object` Content-MD5 не требует и совместим и с MinIO, и с
+        S3. Объёмы GC умеренные (единицы–десятки объектов на job: sources/dist/spec + per-
+        attempt логи, ограниченные max_fix_attempts), так что per-object delete приемлем.
+
+        `batch_size` ограничивает размер страницы list_objects_v2 (MaxKeys) — паджинация
+        листинга, не гранулярность удаления. Идемпотентность сохранена: delete_object на
+        отсутствующий ключ S3/MinIO трактуют как успех (повторный GC безопасен).
         """
         deleted = 0
+        bucket = self._settings.s3_bucket
         async with self._session.client(**self._client_kwargs()) as client:
             paginator = client.get_paginator("list_objects_v2")
-            batch: list[dict[str, str]] = []
-            async for page in paginator.paginate(Bucket=self._settings.s3_bucket, Prefix=prefix):
+            async for page in paginator.paginate(
+                Bucket=bucket, Prefix=prefix, PaginationConfig={"PageSize": batch_size}
+            ):
                 for obj in page.get("Contents", []):
-                    batch.append({"Key": obj["Key"]})
-                    if len(batch) >= batch_size:
-                        await client.delete_objects(
-                            Bucket=self._settings.s3_bucket,
-                            Delete={"Objects": batch, "Quiet": True},
-                        )
-                        deleted += len(batch)
-                        batch = []
-            if batch:
-                await client.delete_objects(
-                    Bucket=self._settings.s3_bucket,
-                    Delete={"Objects": batch, "Quiet": True},
-                )
-                deleted += len(batch)
+                    await client.delete_object(Bucket=bucket, Key=obj["Key"])
+                    deleted += 1
         return deleted
 
 
@@ -107,8 +108,31 @@ def dist_key(job_id: str) -> str:
     return f"dist/{job_id}/dist.tgz"
 
 
-def build_log_key(job_id: str) -> str:
-    return f"logs/{job_id}/build.log"
+def build_log_key(job_id: str, retry_count: int) -> str:
+    """Per-attempt build-лог (ADR-022): успех и build_error/npm_install_error витка.
+
+    Дискриминатор — монотонный generation_jobs.retry_count (0 на первой сборке,
+    +1 на входе FIXING→BUILDING). Уникальный ключ на попытку → ранний лог не затирается.
+    """
+    return f"logs/{job_id}/build.{retry_count}.log"
+
+
+def deploy_log_key(job_id: str, retry_count: int) -> str:
+    """Per-attempt deploy/health-лог (ADR-022): deploy_error/health_* витка.
+
+    Отдельное имя-стадии при том же retry_count, что и build.{n}: deploy-фейл витка N
+    не затирает лог успешной сборки того же витка (build.{n}.log).
+    """
+    return f"logs/{job_id}/deploy.{retry_count}.log"
+
+
+def agent_log_key(job_id: str, retry_count: int) -> str:
+    """Per-attempt agent-reject-лог (ADR-022): agent_output_invalid витка.
+
+    _handle_invalid_patch НЕ инкрементирует retry_count → пишется с тем же N, что и
+    build/deploy-фейл витка. Отдельное имя-стадии исключает затирание их логов.
+    """
+    return f"logs/{job_id}/agent.{retry_count}.log"
 
 
 def spec_key(job_id: str) -> str:
