@@ -171,13 +171,29 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # deploy — ТОЛЬКО на зелёном (needs: [lint, type-check, test]) и ТОЛЬКО на
-  # push в main (не на PR). SSH -> /opt/corelysite -> git pull -> compose up
-  # (docs/07 стр. 242, ADR-018). Чужие /opt/music-backend, /opt/edge не трогаются.
+  # push в main (не на PR). Деплоит ВСЕ прод-инстансы из нормативного списка
+  # (docs/07 §"deploy деплоит ВСЕ прод-инстансы", Q-DEPLOY-4 resolved, ADR-018).
   #
-  # Идемпотентность: повторный прогон безопасен (git pull + compose up -d --build —
-  # пересборка изменённых образов, рестарт только изменившихся контейнеров; migrate
-  # one-shot гейт alembic upgrade head — idempotent). Rollback — см. infra/README.md
-  # (git checkout предыдущего тега/SHA на сервере + повторный compose up).
+  # Нормативный список инстансов {dir, project} (docs/07 таблица инстансов):
+  #   corelysite  -> /opt/corelysite  -p corelysite
+  #   nexoraweb   -> /opt/nexoraweb   -p nexoraweb
+  # Инстансы держатся МАССИВОМ (INSTANCES ниже): третий инстанс = +1 строка,
+  # без правки логики деплоя (требование расширяемости, docs/07 §315/§432).
+  # Чужие /opt/music-backend, /opt/edge НЕ трогаются (ADR-018: изоляция).
+  #
+  # Изоляция отказа (docs/07 §331-335): инстансы деплоятся ПОСЛЕДОВАТЕЛЬНО в
+  # порядке списка (corelysite первым). Деплой каждого инстанса — fail-fast
+  # (set -e -> любая команда инстанса падает -> job падает). Провал одного
+  # инстанса НЕ откатывает и НЕ трогает соседа: corelysite (первый) к моменту
+  # отказа nexoraweb уже задеплоен и не трогается; compose up идемпотентен ->
+  # повторный прогон до-деплоит упавший инстанс, не трогая успешный. Реализация —
+  # один SSH-step с последовательным bash-циклом (docs/07 §335 вариант (а)).
+  #
+  # Идемпотентность: повторный прогон безопасен (git pull --ff-only + compose up
+  # -d --build — пересборка изменённых образов, рестарт только изменившихся
+  # контейнеров; migrate one-shot гейт alembic upgrade head — idempotent).
+  # Rollback — см. infra/README.md (git checkout предыдущего тега/SHA на сервере
+  # + повторный compose up).
   # ---------------------------------------------------------------------------
   deploy:
     needs: [lint, type-check, test]
@@ -192,45 +208,70 @@ jobs:
       # SSH-деплой через запиненный appleboy/ssh-action. Приватный ключ —
       # ТОЛЬКО из GitHub Secrets (SSH_PRIVATE_KEY); публичный — в authorized_keys
       # deploy-пользователя на сервере (провизия владельца, не в git; docs/05 Секреты).
-      - name: Deploy over SSH (compose up on /opt/corelysite)
+      # Один SSH-step деплоит ВСЕ инстансы из списка на том же хосте (один
+      # SSH_HOST/SSH_USER/SSH_PRIVATE_KEY, docs/07 §313).
+      - name: Deploy over SSH (compose up on all prod instances)
         uses: appleboy/ssh-action@2ead5e36573f08b82fbfce1504f1a4b05a647c6f # v1.2.2
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # set -e: любой шаг падает -> деплой падает (не «частично применился»).
-          # Чужие каталоги /opt/music-backend, /opt/edge НЕ трогаются — работаем
-          # строго в /opt/corelysite (ADR-018: изоляция от чужих сервисов).
-          # migrate-сервис (alembic upgrade head) — гейт ВНУТРИ compose up:
-          # depends_on api/worker/beat ждут service_completed_successfully migrate,
-          # т.е. миграции применяются ДО старта нового кода приложения.
-          # --env-file .env: project-directory compose = каталог compose-файла
-          # (infra/), поэтому без явного --env-file compose ищет infra/.env, а
-          # реальный .env лежит в /opt/corelysite/.env -> все ${VAR} blank,
-          # ${ROOTLESS_DOCKER_SOCK} пустой -> volume ":/var/run/docker.sock"
-          # невалиден (empty section) -> exit 1. Явный --env-file .env (как в
-          # ручном деплое) подхватывает /opt/corelysite/.env. docs/07 §CI/CD, ADR-018.
+          # set -e: любая команда инстанса падает -> деплой падает (не «частично
+          # применился»). Цикл по нормативному списку {dir, project}: для каждого
+          # инстанса выполняется ТОЧНАЯ per-инстанс команда docs/07 §322-329:
+          #   cd /opt/<dir> && git pull --ff-only && docker compose -p <project> \
+          #     -f infra/docker-compose.prod.yml --env-file .env up -d --build
+          # -p <project> ОБЯЗАТЕЛЕН для каждого (для nexoraweb — иначе project-name
+          # взялся бы из `name: corelysite` и клон перезатёр бы ресурсы corelysite,
+          # docs/07 §327; для corelysite -p явный для единообразия со списком,
+          # docs/07 §326). git pull --ff-only (не голый git pull): расходящаяся
+          # история на сервере -> fail инстанса, не молчаливый merge-commit (§328).
+          # --env-file .env обязателен для КАЖДОГО инстанса: project-directory
+          # compose = каталог compose-файла (infra/), поэтому без явного --env-file
+          # compose ищет infra/.env, а реальный .env лежит в /opt/<dir>/.env -> все
+          # ${VAR} blank, ${ROOTLESS_DOCKER_SOCK} пустой -> volume
+          # ":/var/run/docker.sock" невалиден -> exit 1. Явный --env-file .env
+          # (относительный к cd /opt/<dir>) подхватывает /opt/<dir>/.env (§329).
+          # migrate-сервис (alembic upgrade head) — гейт ВНУТРИ compose up каждого
+          # инстанса: depends_on api/worker/beat ждут service_completed_successfully
+          # migrate против СВОЕГО Postgres-тома (изолирован project-name), т.е.
+          # миграции инстанса применяются ДО старта его кода (docs/07 §330).
           script: |
             set -e
-            cd /opt/corelysite
-            git pull --ff-only
-            # Провижининг host-каталогов build-workspace + sites ДО старта worker
-            # (docs/07-deployment.md → "Провижининг build-workspace и sites-каталога"
-            # → §"Шаг провижининга host-каталогов", механизм 1 host-провизион в
-            # deploy-процедуре, рекомендованный для shared single-host). Идемпотентно
-            # (mkdir -p + chown повторно безопасны). deploy идёт по SSH под root ->
-            # chown допустим. Ownership 10001:10001 = worker uid `app` (docs/07 §246/247:
-            # worker uid 10001 пишет {BUILDS_ROOT}/{job_id} и {SITES_HOST_ROOT}/{pid});
-            # chmod 0755 даёт o+rx -> rootless-демон/nginx-контейнер читают/монтируют
-            # ({SITES_HOST_ROOT} читается nginx :ro, docs/07 §257). Пути берутся из
-            # .env с дефолтами /var/builds /srv/sites -> совпадают символ-в-символ с
-            # host-bind worker в compose (path-consistency, инвариант docs/07).
-            # Фикс прод-инцидента [Errno 13] Permission denied: '/var/builds'.
-            set -a; . ./.env; set +a
-            BUILDS_DIR="${BUILDS_ROOT:-/var/builds}"
-            SITES_DIR="${SITES_HOST_ROOT:-/srv/sites}"
-            mkdir -p "$BUILDS_DIR" "$SITES_DIR"
-            chown 10001:10001 "$BUILDS_DIR" "$SITES_DIR"
-            chmod 0755 "$BUILDS_DIR" "$SITES_DIR"
-            docker compose -f infra/docker-compose.prod.yml --env-file .env up -d --build
-            docker compose -f infra/docker-compose.prod.yml --env-file .env ps
+            # Нормативный список инстансов {dir, project} (docs/07 таблица).
+            # Порядок: corelysite первым (приоритет доставки в основной прод,
+            # docs/07 §334). Расширение: третий инстанс = +1 строка "dir:project".
+            INSTANCES="corelysite:corelysite nexoraweb:nexoraweb"
+            for entry in $INSTANCES; do
+              dir="${entry%%:*}"
+              project="${entry##*:}"
+              echo "==> Deploying instance '${project}' in /opt/${dir}"
+              cd "/opt/${dir}"
+              git pull --ff-only
+              # Сброс per-инстанс env-ключей провижининга перед загрузкой .env
+              # текущего инстанса: иначе экспортированные значения предыдущего
+              # инстанса (set -a) утекли бы в следующую итерацию, если ключ
+              # отсутствует в .env инстанса. nexoraweb обязан задать свои
+              # BUILDS_ROOT/SITES_HOST_ROOT (docs/07 §380/381); сброс гарантирует
+              # корректный дефолт ":-" при отсутствии ключа, без утечки соседа.
+              unset BUILDS_ROOT SITES_HOST_ROOT
+              # Провижининг host-каталогов build-workspace + sites ДО старта worker
+              # (docs/07 → "Провижининг build-workspace и sites-каталога", §395 для
+              # клона: СВОИМИ путями каждого инстанса по тому же инварианту
+              # path-consistency). Пути берутся из .env ИНСТАНСА (BUILDS_ROOT /
+              # SITES_HOST_ROOT) -> для corelysite /var/builds /srv/sites, для
+              # nexoraweb /var/builds-nexora /srv/sites-nexora (docs/07 §380/381) ->
+              # каталоги инстансов НЕ пересекаются. Идемпотентно (mkdir -p + chown
+              # повторно безопасны). deploy по SSH под root -> chown допустим.
+              # Ownership 10001:10001 = worker uid `app` (docs/07 §246/247); chmod
+              # 0755 -> o+rx, rootless-демон/nginx читают/монтируют (§257).
+              # Фикс прод-инцидента [Errno 13] Permission denied: '/var/builds'.
+              set -a; . ./.env; set +a
+              BUILDS_DIR="${BUILDS_ROOT:-/var/builds}"
+              SITES_DIR="${SITES_HOST_ROOT:-/srv/sites}"
+              mkdir -p "$BUILDS_DIR" "$SITES_DIR"
+              chown 10001:10001 "$BUILDS_DIR" "$SITES_DIR"
+              chmod 0755 "$BUILDS_DIR" "$SITES_DIR"
+              docker compose -p "${project}" -f infra/docker-compose.prod.yml --env-file .env up -d --build
+              docker compose -p "${project}" -f infra/docker-compose.prod.yml --env-file .env ps
+            done
