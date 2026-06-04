@@ -8,9 +8,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 
 from app.api.errors import (
     ProblemException,
@@ -99,7 +101,12 @@ app = FastAPI(
     version="1.0.0",
     description=_API_DESCRIPTION,
     openapi_tags=_OPENAPI_TAGS,
-    servers=[{"url": "https://corelysite.shop/v1", "description": "Продакшен"}],
+    # Базовый URL = ОРИГИН текущего инстанса БЕЗ суффикса (доменные роутеры уже несут
+    # префикс /v1, поэтому путь в схеме = `/v1/...`; добавлять `/v1` в server.url нельзя —
+    # иначе Swagger «Try it out» бьёт в `/v1/v1/...`). Берётся из APPS_DOMAIN, поэтому на
+    # каждом инстансе указывает на СВОЙ хост (corelysite.shop / nexoraweb.shop) → запрос
+    # из Swagger идёт same-origin (нет cross-origin/CORS «TypeError: Load failed»).
+    servers=[{"url": f"https://{settings.apps_domain}", "description": "Текущий инстанс"}],
     lifespan=_lifespan,
 )
 
@@ -154,3 +161,37 @@ app.include_router(jobs.router, prefix="/v1")
 app.include_router(billing.router, prefix="/v1")
 # Sprint 5: регистрация APNs устройств (ADR-013).
 app.include_router(devices.router, prefix="/v1")
+
+
+def _custom_openapi() -> dict[str, Any]:
+    """OpenAPI с HTTP-Bearer security-схемой (B.6).
+
+    FastAPI не выводит securityScheme автоматически (auth — кастомная dependency, не
+    `Security(...)`), поэтому кнопка Authorize в Swagger UI ничего не привязывала к запросам.
+    Объявляем `BearerAuth` (http/bearer) и глобальное `security`, чтобы введённый в Authorize
+    ключ уходил как `Authorization: Bearer <api-key>` на «Try it out». Эндпоинты без Bearer
+    (`/auth/apple`, webhook) принимают лишний заголовок безвредно.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=_OPENAPI_TAGS,
+        servers=app.servers,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "description": "API-ключ `lv_<key_id>_<secret>` из `POST /v1/auth/apple`.",
+        }
+    }
+    schema["security"] = [{"BearerAuth": []}]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _custom_openapi  # type: ignore[method-assign]
