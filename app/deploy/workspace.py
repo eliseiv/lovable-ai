@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,8 +31,23 @@ assert _BUILD_MANIFEST_NAME in RESERVED_SERVICE_FILENAMES
 
 # Канонические дефолты контракта (docs/modules/pipeline/03-architecture.md):
 # build.command / build.output_dir Vite-статики.
-_DEFAULT_BUILD_COMMAND = "npm ci && vite build"
+#
+# `npm install`, НЕ `npm ci`: `npm ci` детерминированно падает (EUSAGE) без
+# существующего package-lock.json, а сгенерированное Agent 3 дерево lockfile НЕ
+# содержит (LLM не может надёжно собрать валидный package-lock.json). `npm install`
+# ставит зависимости по package.json и сам генерирует lock. См. _normalize_build_command.
+_DEFAULT_BUILD_COMMAND = "npm install && vite build"
 _DEFAULT_BUILD_OUTPUT_DIR = "dist"
+
+# Любой `npm ci` в команде сборки заменяется на `npm install` (lockfile отсутствует —
+# `npm ci` упал бы до vite build, форсируя fix-loop). Матч по токену (граница слова),
+# чтобы не задеть прочие подстроки.
+_NPM_CI_RE = re.compile(r"\bnpm ci\b")
+
+
+def _normalize_build_command(command: str) -> str:
+    """Нормализует команду сборки: `npm ci` → `npm install` (lockfile отсутствует)."""
+    return _NPM_CI_RE.sub("npm install", command)
 
 
 @dataclass(frozen=True)
@@ -121,7 +137,7 @@ def read_build_manifest(data: bytes) -> BuildManifest:
         command = _DEFAULT_BUILD_COMMAND
     if not isinstance(output_dir, str) or not output_dir:
         output_dir = _DEFAULT_BUILD_OUTPUT_DIR
-    return BuildManifest(command=command, output_dir=output_dir)
+    return BuildManifest(command=_normalize_build_command(command), output_dir=output_dir)
 
 
 def _first_regular_member(tar: tarfile.TarFile, name: str) -> tarfile.TarInfo | None:
