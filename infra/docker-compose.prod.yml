@@ -559,13 +559,17 @@ networks:
   # параметризованы — инстансы НЕ делят egress-границу build-песочницы. Дефолты =
   # текущие corelysite-значения. BUILD_EGRESS_NETWORK (x-app-env) и name: сети
   # build_egress обязаны совпадать символ-в-символ (общий дефолт corelysite_build_egress).
+  # Subnet тоже параметризован: статический IPAM-пул нельзя делить между
+  # инстансами на одном хосте (Docker: "Pool overlaps with other one on this
+  # address space"). Дефолт = текущий corelysite-пул 172.31.0.0/16 (backward-compat);
+  # клон задаёт свободный пул через BUILD_EGRESS_SUBNET в своём .env.
   build_egress:
     name: ${BUILD_EGRESS_NETWORK:-corelysite_build_egress}
     driver: bridge
     internal: true
     ipam:
       config:
-        - subnet: 172.31.0.0/16
+        - subnet: ${BUILD_EGRESS_SUBNET:-172.31.0.0/16}
   # egress_uplink — обычный bridge, даёт ТОЛЬКО egress-proxy выход к npm-registry.
   # EGRESS_UPLINK_NETWORK — compose-only ключ (docs/07 env-контракт), приложение не читает.
   egress_uplink:
