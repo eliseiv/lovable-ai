@@ -50,6 +50,11 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")
 # (get_settings().adapty_webhook_secret) — значения согласованы по построению.
 os.environ.setdefault("ADAPTY_WEBHOOK_SECRET", "qa-test-adapty-webhook-secret")
 os.environ.setdefault("ADAPTY_API_KEY", "qa-test-adapty-api-key")
+# ADR-021 админ-плоскость: секрет X-Admin-Key для require_admin. Детерминированно задаём
+# непустой ключ (плоскость ВКЛЮЧЕНА в тестах) — тесты валидного доступа подают этот ключ,
+# негативные кейсы подают неверный/пустой. Тест «плоскость отключена при пустом ADMIN_API_KEY»
+# переопределяет admin_api_key=None на settings через monkeypatch (см. test_admin_*).
+os.environ.setdefault("ADMIN_API_KEY", "qa-test-admin-secret")
 # Sprint 5 (ADR-012/013) — детерминированные SSE_*/APNS_* (правило qa.md: conftest
 # самодостаточен, env-зависимые тесты не наследуют значения окружения неявно).
 # SSE: малые интервалы/лимиты, чтобы heartbeat/лимит стримов тестировались быстро и
@@ -153,6 +158,15 @@ async def other_user(session: AsyncSession) -> User:
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
     return {"Authorization": f"Bearer {TEST_API_KEY}"}
+
+
+ADMIN_API_KEY = "qa-test-admin-secret"
+
+
+@pytest.fixture
+def admin_headers() -> dict[str, str]:
+    """Валидный заголовок X-Admin-Key (совпадает с ADMIN_API_KEY в env-дефолтах conftest)."""
+    return {"X-Admin-Key": ADMIN_API_KEY}
 
 
 @pytest_asyncio.fixture

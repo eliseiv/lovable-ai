@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     Enum,
     ForeignKey,
@@ -62,6 +63,16 @@ class User(Base):
 
     projects: Mapped[list[Project]] = relationship(back_populates="user")
     api_tokens: Mapped[list[ApiToken]] = relationship(back_populates="user")
+
+    __table_args__ = (
+        # ADR-021 инвариант >= 0 на уровне БД (defense-in-depth). Прикладной WHERE-гард
+        # (admin_service._apply_balance_delta, usage._try_decrement_credit) уже не даёт
+        # уйти в минус; CHECK страхует любой будущий код-путь от нарушения инварианта.
+        CheckConstraint(
+            "bonus_generations_balance >= 0",
+            name="ck_users_bonus_generations_balance_nonneg",
+        ),
+    )
 
 
 class ApiToken(Base):

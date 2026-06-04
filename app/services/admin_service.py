@@ -13,8 +13,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -145,14 +146,6 @@ async def grant_credits(
                 bonus_generations_balance=user.bonus_generations_balance,
             )
 
-    new_balance = user.bonus_generations_balance + amount
-    # Инвариант >= 0: отрицательная коррекция не уводит баланс в минус (409, rollback).
-    if new_balance < 0:
-        raise conflict(
-            f"Correction would make balance negative "
-            f"(current={user.bonus_generations_balance}, amount={amount})."
-        )
-
     grant = CreditGrant(
         id=new_credit_grant_id(),
         user_id=user_id,
@@ -162,7 +155,22 @@ async def grant_credits(
         created_by="admin",
     )
     session.add(grant)
-    user.bonus_generations_balance = new_balance
+    # Относительный атомарный UPDATE (единый стиль с usage._try_decrement_credit) вместо
+    # абсолютной записи: read-modify-write на не-залоченной строке терял конкурентный
+    # декремент со старта генерации (SET balance = balance - 1) при READ COMMITTED —
+    # абсолютное значение перезатирало списание (over-credit). Здесь СУБД сама применяет
+    # дельту к текущему значению строки. WHERE balance + amount >= 0 энфорсит инвариант
+    # >= 0 атомарно: отрицательная коррекция, уводящая в минус, 0 строк не затрагивает.
+    new_balance = await _apply_balance_delta(session, user_id, amount)
+    if new_balance is None:
+        # rowcount=0 → инвариант нарушен (amount<0 увёл бы баланс < 0). Строку НЕ пишем.
+        # Снимаем значение ДО rollback: после rollback инстанс `user` expired, а его
+        # lazy-атрибут в sync f-string запустил бы async load → MissingGreenlet → 500.
+        current = user.bonus_generations_balance
+        await session.rollback()
+        raise conflict(
+            f"Correction would make balance negative (current={current}, amount={amount})."
+        )
     try:
         await session.commit()
     except IntegrityError:
@@ -188,6 +196,28 @@ async def grant_credits(
         amount_applied=amount,
         bonus_generations_balance=new_balance,
     )
+
+
+async def _apply_balance_delta(session: AsyncSession, user_id: str, amount: int) -> int | None:
+    """Атомарно применяет дельту к users.bonus_generations_balance, держа инвариант >= 0.
+
+    Относительный UPDATE (SET balance = balance + :amount WHERE balance + :amount >= 0) —
+    конкурентно-безопасен: СУБД применяет дельту к актуальному значению строки, без
+    read-modify-write на стороне Python (иначе конкурентный декремент списания терялся бы).
+    RETURNING отдаёт пост-апдейтный баланс. None, если 0 строк затронуто (инвариант нарушен
+    — баланс ушёл бы < 0); вызывающий трактует это как 409 и откатывает транзакцию.
+    """
+    result: CursorResult[Any] = await session.execute(  # type: ignore[assignment]
+        update(User)
+        .where(
+            User.id == user_id,
+            User.bonus_generations_balance + amount >= 0,
+        )
+        .values(bonus_generations_balance=User.bonus_generations_balance + amount)
+        .returning(User.bonus_generations_balance)
+    )
+    row = result.fetchone()
+    return None if row is None else int(row[0])
 
 
 async def _find_grant_by_idempotency(

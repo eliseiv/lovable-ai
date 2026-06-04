@@ -34,6 +34,13 @@ def upgrade() -> None:
             server_default=sa.text("0"),
         ),
     )
+    # Инвариант >= 0 на уровне БД (ADR-021, defense-in-depth): страхует баланс от ухода
+    # в минус помимо прикладного WHERE-гарда относительных UPDATE (грант/списание).
+    op.create_check_constraint(
+        "ck_users_bonus_generations_balance_nonneg",
+        "users",
+        "bonus_generations_balance >= 0",
+    )
 
     # 2. Append-only ledger начислений/коррекций (аудит + идемпотентность).
     op.create_table(
@@ -68,4 +75,5 @@ def downgrade() -> None:
     op.drop_index("uq_credit_grants_user_idempotency", table_name="credit_grants")
     op.drop_index("ix_credit_grants_user_id", table_name="credit_grants")
     op.drop_table("credit_grants")
+    op.drop_constraint("ck_users_bonus_generations_balance_nonneg", "users", type_="check")
     op.drop_column("users", "bonus_generations_balance")
