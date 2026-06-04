@@ -66,8 +66,9 @@
 | `--cap-drop ALL` | — | arbitrary-exec |
 | `--security-opt no-new-privileges` | — | privilege-escalation |
 | `--read-only` + `--tmpfs /tmp` | — | resource-exhaustion / tamper |
-| `-v {workspace}:/workspace` | rw, единственная writable | изоляция FS |
+| `-v {workspace}:/workspace` | rw, единственная writable на диске | изоляция FS (исходники + `node_modules` + `dist` + tool-cache) |
 | `--user {non-root UID}` | напр. `10001:10001` | arbitrary-exec |
+| `-e HOME=/workspace/.home` `-e npm_config_cache=/workspace/.npm` `-e XDG_CACHE_HOME=/workspace/.cache` `-e XDG_CONFIG_HOME=/workspace/.config` | writable HOME/cache в `/workspace` | **обязательно** под `--read-only`+non-root: иначе npm/vite пишут в `/.npm` (HOME=`/`) на read-only rootfs → ENOENT, build падает до `vite build`. Кэш на диск-workspace (не tmpfs `/tmp`), эфемерен. См. [ADR-010 §B-2/§B-3](adr/ADR-010-build-sandbox-rootless-egress.md) |
 | `--cpus` / `--memory` / `--pids-limit` | `BUILD_CPU_LIMIT`/`BUILD_MEM_LIMIT`/`BUILD_PIDS_LIMIT` | resource-exhaustion |
 | `--security-opt seccomp={BUILD_SECCOMP_PROFILE}` | **условно** (см. ниже) | syscall-фильтр |
 | `--network {BUILD_EGRESS_NETWORK}` | egress-allowlist сеть | egress/SSRF/supply-chain |

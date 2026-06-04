@@ -8,6 +8,11 @@ non-root UID, seccomp-фильтр syscalls, ресурс-лимиты `--cpus`/
 изоляция в egress-сети `--network {BUILD_EGRESS_NETWORK}` (egress только к npm-registry
 через egress-proxy, ADR-010 §C). Запуск через rootless Docker-демон (BUILD_SANDBOX_RUNTIME,
 ADR-010 §A); `runsc` — опциональный gVisor поверх. Никогда на хосте воркера.
+
+Под `--read-only` + non-root инструментам (npm/vite/esbuild) задаётся писучий HOME и
+cache/config-директории внутри уже-RW `/workspace` через env `HOME`/`npm_config_cache`/
+`XDG_CACHE_HOME`/`XDG_CONFIG_HOME` (ADR-010 §B-2) — иначе npm пишет в `/.npm` (HOME=`/`)
+на read-only rootfs → ENOENT, сборка падает до vite build.
 """
 
 from __future__ import annotations
@@ -31,6 +36,16 @@ _SANDBOX_UID = "10001:10001"
 # Runtime, при котором gVisor (runsc) накладывается как docker --runtime (ADR-010 §A /
 # Alternatives). Дефолтный rootless — это конфигурация демона, не флаг argv.
 _GVISOR_RUNTIME = "runsc"
+
+# Писучие HOME + tool-cache/config внутри уже-RW /workspace (= {builds_root}/{job_id}) под
+# --read-only rootfs + non-root (ADR-010 §B-2). Константы путей ВНУТРИ контейнера (не env
+# хоста, не Settings): перенаправляют npm/vite/esbuild с read-only `/.npm` (HOME=`/`) на
+# диск-workspace. Каталоги создают сами инструменты (mkdir при первом запуске); доп.
+# mount/tmpfs не нужен — /workspace уже writable.
+_BUILD_HOME = "/workspace/.home"
+_BUILD_NPM_CACHE = "/workspace/.npm"
+_BUILD_XDG_CACHE = "/workspace/.cache"
+_BUILD_XDG_CONFIG = "/workspace/.config"
 
 
 @dataclass(frozen=True)
@@ -59,8 +74,11 @@ def _build_argv(settings: Settings, workspace: Path, command: str) -> list[str]:
     из Settings (BUILD_CPU/MEM/PIDS) и изоляцией в egress-сети (BUILD_EGRESS_NETWORK) —
     исходящий трафик только к npm-registry через egress-proxy (ADR-010 §C). При непустой
     egress-сети инжектится proxy-транспорт http_proxy/https_proxy=BUILD_EGRESS_PROXY_URL
-    (ADR-010 §C-1) — единственный маршрут npm ci к registry в internal-сети. При
-    BUILD_SANDBOX_RUNTIME=runsc накладывается gVisor через `--runtime runsc`.
+    (ADR-010 §C-1) — единственный маршрут npm ci к registry в internal-сети. Под --read-only
+    rootfs всегда инжектятся писучие HOME+cache/config в уже-RW /workspace через env
+    HOME/npm_config_cache/XDG_CACHE_HOME/XDG_CONFIG_HOME (ADR-010 §B-2) — иначе npm пишет в
+    `/.npm` на read-only rootfs → ENOENT. При BUILD_SANDBOX_RUNTIME=runsc накладывается gVisor
+    через `--runtime runsc`.
     """
     argv = ["docker", "run", "--rm"]
 
@@ -116,6 +134,18 @@ def _build_argv(settings: Settings, workspace: Path, command: str) -> list[str]:
         # Proxy-транспорт к registry (ADR-010 §C-1): http_proxy/https_proxy из Settings при
         # непустой egress-сети. Без него npm ci не имеет маршрута в internal build-сети.
         *proxy_opt,
+        # --- Писучий HOME + tool-cache/config в уже-RW /workspace (ADR-010 §B-2) ---
+        # Безусловно (read-only rootfs всегда активен): перенаправляет npm/vite/esbuild с
+        # read-only `/.npm` (HOME=`/`) на диск-workspace. Значения — константы пути ВНУТРИ
+        # контейнера; каталоги инструменты создают сами, доп. mount/tmpfs не нужен.
+        "-e",
+        f"HOME={_BUILD_HOME}",
+        "-e",
+        f"npm_config_cache={_BUILD_NPM_CACHE}",
+        "-e",
+        f"XDG_CACHE_HOME={_BUILD_XDG_CACHE}",
+        "-e",
+        f"XDG_CONFIG_HOME={_BUILD_XDG_CONFIG}",
         # --- Non-root внутри контейнера (поверх user-namespace remap rootless) ---
         "--user",
         _SANDBOX_UID,
