@@ -49,6 +49,12 @@ from app.pipeline.agents.agent2 import run_agent2
 from app.pipeline.agents.agent3 import run_agent3
 from app.pipeline.agents.agent4 import run_agent4, run_agent4_editor
 from app.pipeline.agents.claude_client import AgentCall
+from app.pipeline.agents.structured import (
+    DiagnosticsHook,
+    GuardHook,
+    StructuredOutputError,
+    UsageHook,
+)
 from app.pipeline.cost import record_usage
 from app.pipeline.dispatcher import dispatch_for_state
 from app.pipeline.events import fail_job, load_job, record_event, transition
@@ -59,7 +65,12 @@ from app.pipeline.failure_signature import (
 )
 from app.pipeline.fixing import enter_fixing, latest_revision_for_job
 from app.pipeline.graceful_fail import run_agent_task
-from app.pipeline.guards import as_decimal, check_fix_guards
+from app.pipeline.guards import (
+    PreCallGuardTripped,
+    as_decimal,
+    check_fix_guards,
+    check_pre_call_guards,
+)
 from app.schemas.agent_output import AgentOutputError
 from app.storage import s3
 from app.storage.s3 import S3Storage, get_storage
@@ -80,6 +91,68 @@ _RETRY_KWARGS: dict[str, object] = {
     "retry_jitter": True,
     "max_retries": MAX_RETRIES,
 }
+
+
+# --- Structured-output хуки агентов (ADR-020 §I): guard перед вызовом / usage после / диаг ---
+
+
+def _make_agent_hooks(
+    session: AsyncSession, job: GenerationJob, agent: str
+) -> tuple[GuardHook, UsageHook, DiagnosticsHook]:
+    """Строит before_call/after_call/on_attempt_failure для structured-агента (ADR-020 §I).
+
+    before_call: budget/wall-clock-гард §C(b)/(c) ПЕРЕД КАЖДЫМ LLM-вызовом (включая retry —
+    §I.3: ретраи не обходят бюджет). Бросок PreCallGuardTripped прерывает шаг → task
+    терминализует FAILED(reason). after_call: запись llm_usage + spend ПОСЛЕ КАЖДОГО вызова
+    (включая retry) + commit, чтобы следующий before_call увидел накопленный spend (Postgres —
+    источник истины бюджета §C(b)). on_attempt_failure: диагностика parse/schema-фейла (§I.4) —
+    лог + job_events.payload (имя агента/attempt/класс/текст ошибки/scrubbed усечённый raw).
+    """
+
+    async def before_call() -> None:
+        check_pre_call_guards(job)
+
+    async def after_call(call: AgentCall) -> None:
+        await record_usage(session, job, agent, call)
+        # Коммит, чтобы накопленный spend дошёл до budget-гарда следующего retry-вызова §I.3.
+        await session.commit()
+
+    async def on_attempt_failure(
+        *,
+        agent: str,
+        attempt: int,
+        max_attempts: int,
+        error_text: str,
+        fail_class: str,
+        raw_tail: str,
+    ) -> None:
+        logger.warning(
+            "agent_output_invalid_attempt",
+            extra={
+                "job_id": job.id,
+                "agent": agent,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "fail_class": fail_class,
+                "error": error_text,
+            },
+        )
+        await record_event(
+            session,
+            job.id,
+            "agent_output_invalid",
+            payload={
+                "agent": agent,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "fail_class": fail_class,
+                "error": error_text,
+                "raw_tail": raw_tail,
+            },
+        )
+        await session.commit()
+
+    return before_call, after_call, on_attempt_failure
 
 
 # --- task_interview (CREATED → INTERVIEWING → AWAITING_CLARIFICATION) ---
@@ -110,9 +183,23 @@ async def _interview(job_id: str) -> None:
         # project гарантированно жив и не None — проверено _abort_if_project_deleted выше.
         project = await session.get(Project, job.project_id)
         assert project is not None
+        # ADR-020 §I: usage пишется хуком after_call ПОСЛЕ каждого LLM-вызова (включая retry).
+        before_call, after_call, on_fail = _make_agent_hooks(session, job, "agent1")
         try:
-            result = await run_agent1(settings, project.prompt)
-        except (ValueError, AgentOutputError) as exc:
+            result = await run_agent1(
+                settings,
+                project.prompt,
+                before_call=before_call,
+                after_call=after_call,
+                on_attempt_failure=on_fail,
+            )
+        except PreCallGuardTripped as exc:
+            # Budget/wall-clock §C(b)/(c) исчерпан перед/между retry-вызовами (ADR-020 §I.3).
+            await fail_job(session, job, failure_reason=exc.reason)
+            logger.warning("agent1_guard", extra={"job_id": job_id, "reason": exc.reason})
+            return
+        except (StructuredOutputError, ValueError, AgentOutputError) as exc:
+            # Ретраи structured-output исчерпаны → FAILED(invalid_agent_output) (§I.3, Agent 1).
             await fail_job(
                 session,
                 job,
@@ -122,7 +209,6 @@ async def _interview(job_id: str) -> None:
             logger.warning("agent1_failed", extra={"job_id": job_id, "error": str(exc)})
             return
 
-        await record_usage(session, job, "agent1", result.call)
         for q in result.questions:
             session.add(
                 Question(
@@ -181,10 +267,22 @@ async def _spec(job_id: str) -> None:
         await record_event(session, job.id, "agent_started", payload={"agent": "agent2"})
         await session.commit()
 
-        # Agent 2: спека.
+        # Agent 2: спека. usage пишется хуком after_call (ADR-020 §I) — без отдельного record.
+        a2_before, a2_after, a2_fail = _make_agent_hooks(session, job, "agent2")
         try:
-            spec_result = await run_agent2(settings, project.prompt, qa_pairs)
-        except (ValueError, AgentOutputError) as exc:
+            spec_result = await run_agent2(
+                settings,
+                project.prompt,
+                qa_pairs,
+                before_call=a2_before,
+                after_call=a2_after,
+                on_attempt_failure=a2_fail,
+            )
+        except PreCallGuardTripped as exc:
+            await fail_job(session, job, failure_reason=exc.reason)
+            logger.warning("agent2_guard", extra={"job_id": job_id, "reason": exc.reason})
+            return
+        except (StructuredOutputError, ValueError, AgentOutputError) as exc:
             await fail_job(
                 session,
                 job,
@@ -193,7 +291,6 @@ async def _spec(job_id: str) -> None:
             )
             logger.warning("agent2_failed", extra={"job_id": job_id, "error": str(exc)})
             return
-        await record_usage(session, job, "agent2", spec_result.call)
 
         spec_md = spec_result.spec_markdown
         if len(spec_md.encode("utf-8")) <= settings.spec_inline_max_bytes:
@@ -208,12 +305,23 @@ async def _spec(job_id: str) -> None:
         # Agent 3: дерево файлов (валидируется строго).
         await record_event(session, job.id, "agent_started", payload={"agent": "agent3"})
         await session.commit()
+        # usage пишется хуком after_call ПОСЛЕ каждого вызова (включая retry), ADR-020 §I.3 —
+        # даже когда финальный output невалиден (вызовы оплачены). Доменная валидация дерева —
+        # поверх tool-use (§I.1): на исчерпании ретраев → AgentOutputError.
+        a3_before, a3_after, a3_fail = _make_agent_hooks(session, job, "agent3")
         try:
-            build_result = await run_agent3(settings, spec_md)
+            build_result = await run_agent3(
+                settings,
+                spec_md,
+                before_call=a3_before,
+                after_call=a3_after,
+                on_attempt_failure=a3_fail,
+            )
+        except PreCallGuardTripped as exc:
+            await fail_job(session, job, failure_reason=exc.reason)
+            logger.warning("agent3_guard", extra={"job_id": job_id, "reason": exc.reason})
+            return
         except AgentOutputError as exc:
-            # Вызов Claude уже оплачен — учитываем usage даже при невалидном output.
-            if isinstance(exc.call, AgentCall):
-                await record_usage(session, job, "agent3", exc.call)
             await fail_job(
                 session,
                 job,
@@ -222,7 +330,7 @@ async def _spec(job_id: str) -> None:
             )
             logger.warning("agent3_invalid", extra={"job_id": job_id, "error": str(exc)})
             return
-        except ValueError as exc:
+        except (StructuredOutputError, ValueError) as exc:
             await fail_job(
                 session,
                 job,
@@ -231,7 +339,6 @@ async def _spec(job_id: str) -> None:
             )
             logger.warning("agent3_failed", extra={"job_id": job_id, "error": str(exc)})
             return
-        await record_usage(session, job, "agent3", build_result.call)
 
         # Упаковка source.tgz → S3.
         source_tgz = workspace.pack_source_tgz(build_result.tree)
@@ -590,8 +697,11 @@ async def _fix(job_id: str) -> None:
         await record_event(session, job.id, "agent_started", payload={"agent": "agent4"})
         await session.commit()
 
-        # 4. Вызвать Agent 4. Невалидный патч = fix-неудача (AgentOutputError) — учёт в
-        #    retry_count/no-progress: запись llm_usage + повторный вход в FIXING.
+        # 4. Вызвать Agent 4. usage пишется хуком after_call ПОСЛЕ каждого вызова (включая
+        #    retry, ADR-020 §I.3). Невалидный патч после ретраев = fix-неудача (AgentOutputError)
+        #    — повторный вход в FIXING (учёт в retry_count/no-progress, §A). budget/wall-clock
+        #    проверяются перед КАЖДЫМ retry-вызовом (§I.3): исчерпание → штатный FAILED(reason).
+        a4_before, a4_after, a4_fail = _make_agent_hooks(session, job, "agent4")
         try:
             result = await run_agent4(
                 settings,
@@ -599,15 +709,20 @@ async def _fix(job_id: str) -> None:
                 source_tgz=source_tgz,
                 failure_class=parsed.failure_class,
                 failure_log=failure_log,
+                before_call=a4_before,
+                after_call=a4_after,
+                on_attempt_failure=a4_fail,
             )
-        except AgentOutputError as exc:
-            if isinstance(exc.call, AgentCall):
-                await record_usage(session, job, "agent4", exc.call)
+        except PreCallGuardTripped as exc:
+            await _finalize_fix_failure(
+                session, job, failure_reason=exc.reason, signature=signature
+            )
+            logger.warning("agent4_guard", extra={"job_id": job_id, "reason": exc.reason})
+            return
+        except (AgentOutputError, StructuredOutputError) as exc:
             await _handle_invalid_patch(session, storage, job, exc, revision)
             logger.warning("agent4_invalid", extra={"job_id": job_id, "error": str(exc)})
             return
-
-        await record_usage(session, job, "agent4", result.call)
 
         # 5a. Сигнал unrecoverable → для generation FIXING→FAILED(fixer_gave_up); для edit —
         #     авто-rollback на прежнюю good-ревизию, FAILED(edit_failed_rolled_back) (ADR-014 §C).
@@ -703,22 +818,28 @@ async def _edit(job_id: str) -> None:
         spec_md = await _load_spec(session, storage, job)
         source_tgz = await storage.get_bytes(base_revision.source_artifact_ref)
 
+        # usage пишется хуком after_call ПОСЛЕ каждого вызова (включая retry), ADR-020 §I.3.
+        ed_before, ed_after, ed_fail = _make_agent_hooks(session, job, "agent4")
         try:
             result = await run_agent4_editor(
                 settings,
                 spec_markdown=spec_md,
                 source_tgz=source_tgz,
                 instruction=instruction,
+                before_call=ed_before,
+                after_call=ed_after,
+                on_attempt_failure=ed_fail,
             )
-        except AgentOutputError as exc:
-            if isinstance(exc.call, AgentCall):
-                await record_usage(session, job, "agent4", exc.call)
-            # Невалидный output editor на старте edit → авто-rollback (правка не применена).
+        except PreCallGuardTripped as exc:
+            # Budget/wall-clock исчерпан перед/между retry-вызовами editor → авто-rollback.
+            await _auto_rollback_edit(session, job, project, base_revision)
+            logger.warning("edit_guard", extra={"job_id": job_id, "reason": exc.reason})
+            return
+        except (AgentOutputError, StructuredOutputError) as exc:
+            # Невалидный output editor после ретраев → авто-rollback (правка не применена).
             await _auto_rollback_edit(session, job, project, base_revision)
             logger.warning("edit_invalid_output", extra={"job_id": job_id, "error": str(exc)})
             return
-
-        await record_usage(session, job, "agent4", result.call)
 
         if result.unrecoverable is not None:
             # Editor явно «неисправимо» → авто-rollback, сайт остаётся LIVE на прежней ревизии.
@@ -941,7 +1062,7 @@ async def _handle_invalid_patch(
     session: AsyncSession,
     storage: S3Storage,
     job: GenerationJob,
-    exc: AgentOutputError,
+    exc: AgentOutputError | StructuredOutputError,
     revision: Revision | None,
 ) -> None:
     """Невалидный патч Agent 4 — fix-неудача (docs §A): перезаписать failure_log
@@ -950,11 +1071,16 @@ async def _handle_invalid_patch(
     Так следующий виток task_fix проверит гарды по новой сигнатуре. Если на этом
     витке исчерпан hard cap (retry_count) — гард переведёт в FAILED(build_unrecoverable);
     специфичный invalid_agent_output фиксируется через failure_class лога.
+
+    ADR-020 §I.3: после исчерпания structured-output ретраев Agent 4 пробрасывает либо
+    доменный AgentOutputError (с .signature), либо StructuredOutputError (чистый parse-фейл
+    без tool_use/JSON — .signature нет). Оба = виток класса agent_output_invalid.
     """
+    rule = getattr(exc, "signature", "agent_output_invalid")
     # Перезаписываем источник истины для сигнатуры новым классом agent_output_invalid.
     log = build_failure_log(
         failure_class="agent_output_invalid",
-        body=f"agent4 patch rejected: {exc} (rule={exc.signature})",
+        body=f"agent4 patch rejected: {exc} (rule={rule})",
         revision_no=revision.revision_no if revision is not None else None,
         extra_header={"job_id": job.id},
     )
@@ -968,7 +1094,7 @@ async def _handle_invalid_patch(
         session,
         job.id,
         "fix_rejected",
-        payload={"rule": exc.signature, "failure_log_ref": log_ref},
+        payload={"rule": rule, "failure_log_ref": log_ref},
     )
     # Остаёмся в FIXING и переставляем task_fix: новый виток проверит гарды (no-progress
     # по обновлённой сигнатуре, hard cap). Идемпотентно: state уже FIXING.

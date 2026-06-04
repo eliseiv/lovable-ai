@@ -53,6 +53,7 @@ stateDiagram-v2
   | AGENT4 | Fixer | **Sonnet** | `claude-sonnet-4-6` | `AGENT4_MODEL` |
 
   Нумерация `AGENTn` ↔ роль фиксирована таблицей §Агенты выше (Agent 1=Interviewer … Agent 4=Fixer) и не меняется. env-дефолты `config.py`/`07-deployment` приводятся к этим значениям в S6-калибровке model-tiering (требование к backend; если текущий дефолт отличается — это калибровочная правка, не новое решение).
+- **Structured-output всех 4 агентов — ЕДИНЫЙ НОРМАТИВНЫЙ МЕХАНИЗМ ([ADR-020](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md), общий слой `app/pipeline/agents/structured.py`, не дублировать в каждом агенте).** Каждый агент получает структуру **через форсированный tool-use** (`tool_choice={"type":"tool","name":...}`, схема выхода = `input_schema` инструмента), читается из `tool_use`-блока (`block.input`), **не** из текстового `block.text`. Совместимо с extended thinking `adaptive` (в отличие от assistant-prefill). Defence-in-depth: толерантный парсинг (снятие ` ```json…``` `-фенсов + извлечение первого сбалансированного JSON) на текстовый ответ, и **bounded retry** (`AGENT_OUTPUT_MAX_RETRIES`) на parse/schema-фейл перед терминалом. Полный исполняемый контракт — **§I** ниже. **Прод-триггер:** ~40% ответов модели приходили в markdown-фенсах → строгий `json.loads(call.text)` бросал `ValueError` → немедленный `FAILED` без ретрая (баг системный — все 4 агента). Доменная валидация дерева (§Контракт output Agent 3) **остаётся** поверх tool-use — tool-схема её не заменяет.
 - **Prompt caching:** стабильные system-промты кэшируются между агентами и fix-итерациями (Anthropic SDK; реализовать через skill `claude-api`).
 - **Cost-ledger:** каждый вызов → запись `llm_usage` (токены, cache hit/write, `cost_usd`); агрегат в `generation_jobs.spend_usd` (**Postgres — источник истины бюджета**, гард читает `spend_usd` из БД). Быстрый Redis-счётчик бюджета для снижения латентности гейта при масштабе — **опциональная оптимизация, целевой Sprint 6** (см. [TD-006](../../100-known-tech-debt.md#td-006), исполняемый контракт оптимизации — [observability §5.2](../observability/03-architecture.md#52-redis-budget-счётчик-td-006--опциональная-оптимизация-латентности-гейта)), в Sprint 2 не требуется. **Sprint 6 (observability):** `llm_usage` инструментируется метриками `lovable_job_cost_usd`/`lovable_llm_call_cost_usd_total`/`lovable_llm_tokens_total`/`lovable_llm_cache_hit_ratio`/`lovable_llm_call_latency_seconds` (нормативная таблица — [observability §2.2](../observability/03-architecture.md#22-cost--llm-cost-ledger-llm_usage)) — питают дашборд Cost и калибровку [TD-005](../../100-known-tech-debt.md#td-005)/[TD-006](../../100-known-tech-debt.md#td-006).
 
@@ -302,6 +303,61 @@ stateDiagram-v2
 - **Согласованность с §G/§E2:** благодаря best-effort publish граceful-fail шага агента (§G, переход в `FAILED(agent_unavailable)` при пустом/невалидном `ANTHROPIC_API_KEY`) и reconciler-fail-stuck (§E2 ветвь 2, `FAILED(stuck_timeout)`) **надёжно терминализируют джобу и освобождают concurrency-слот** — сбой publish их больше не срывает.
 
 **Критерий приёмки (qa):** unit — `publish_event` при инъекции `RuntimeError`/`RedisError`/`OSError` из Redis-клиента не пробрасывает и не откатывает уже-закоммиченный переход; integration — агент-таска при недоступном/сбойном publish всё равно доводит state до терминала (`FAILED(agent_unavailable)` при невалидном `ANTHROPIC_API_KEY`) и освобождает слот ([06-testing-strategy.md](../../06-testing-strategy.md)).
+
+## I. Надёжный structured-output всех 4 агентов: tool-use + толерантный парсинг + bounded retry ([ADR-020](../../adr/ADR-020-agent-structured-output-tool-use-tolerant-parse-retry.md))
+
+> **Прод-фикс.** Happy-path E2E с реальным `ANTHROPIC_API_KEY` (5 прогонов Agent 1, `claude-sonnet-4-6`) показал: модель **интермиттентно** (≈40%) оборачивает JSON-ответ в ` ```json … ``` `. Строгий `json.loads(call.text)` без устойчивости к фенсам → `ValueError` → **немедленный** `FAILED(invalid_agent_output)` **без ретрая**. Тот же строгий парсинг — во всех 4 агентах → баг **системный**, отказ компаундится на каждом шаге. При extended thinking `adaptive` assistant-prefill несовместим, поэтому «попросили JSON в system-промте» не гарантирует чистый JSON. Контракт ниже — единый для всех 4 агентов (Agent 1/2/3/4), реализуется общим слоем (`app/pipeline/agents/structured.py`), **не** дублируется в каждом агенте.
+
+### I.1 Основной механизм — форсированный tool-use
+
+- Каждый агент вызывается с **одним инструментом**, чья `input_schema` = JSON-схема выхода этого агента, и `tool_choice={"type":"tool","name":"<agent_tool>"}` (форс именно этого инструмента). Структура читается из `tool_use`-блока (`block.input` — распарсенный SDK-объект), **не** из `block.text`.
+- Совместимо с extended thinking `adaptive` (в отличие от assistant-prefill). Снимает markdown-фенсы как класс: модель не пишет JSON в прозу.
+
+| Агент | Tool name | input_schema (транспорт структуры) |
+|---|---|---|
+| Agent 1 (Interviewer) | `submit_questions` | `{ questions: string[] }` |
+| Agent 2 (Spec writer) | `submit_spec` | схема спеки (`spec_tz`-форма) |
+| Agent 3 (Builder) | `submit_project` | схема `agent_output` (`files[]`/`entry`/`build`) |
+| Agent 4 (Fixer) | `submit_project` | та же `agent_output` + ветка `unrecoverable` полями инструмента (§A) |
+
+> **Доменная валидация дерева — поверх tool-use, НЕ заменяется им.** JSON-Schema инструмента выражает «получили JSON нужной формы», но **не** все правила §Контракт output Agent 3 (path-traversal, encoding, лимиты `MAX_FILES`/`MAX_FILE_BYTES`/`MAX_TREE_BYTES`, allowlist расширений, запрет dotfiles/симлинков). Прежний валидатор `agent_output` применяется к `block.input` агентов 3/4 **до** упаковки `source.tgz` — без изменений.
+
+### I.2 Defence-in-depth — толерантный парсинг (на текстовый ответ)
+
+Если структура всё же пришла текстом (граничные случаи / отказ tool-use / будущие версии SDK), общий хелпер **до** `json.loads`:
+1. снимает обёртку ` ```json … ``` ` / ` ``` … ``` ` (с любым/без language-tag);
+2. извлекает **первый сбалансированный** JSON-объект/массив (срезает ведущую/хвостовую прозу);
+3. затем `json.loads`.
+
+Минимально, версионно-устойчиво, без regex-парсинга всего тела. Применяется единообразно ко всем агентам.
+
+### I.3 Bounded retry на parse/schema-фейл — re-семплирование, не мгновенный FAILED
+
+- Parse-фейл (структура не извлеклась) и schema-фейл (извлеклась, но не прошла JSON-схему инструмента или доменную валидацию) — **РЕ-СЕМПЛИРУЕМЫЙ** сбой формата ответа.
+- Шаг агента ретраит **новый LLM-вызов** того же агента до `AGENT_OUTPUT_MAX_RETRIES` раз (env, default **2** доп. попытки = до 3 вызовов суммарно) **внутри одного шага**, прежде чем уйти в терминал. Допустим лёгкий nudge «верни строго через инструмент».
+- **Это НЕ Celery-`task.retry()` и НЕ вход в `FIXING`** — локальный re-sample вывода LLM, ортогональный retry-классификации ([ADR-006](../../adr/ADR-006-celery-retry-vs-domain-fixing.md)). Классификатор `app/workers/retry_policy.py` его не трогает.
+- **Исчерпание ретраев — без новых reason-кодов:**
+  - **Agent 1/2** (нет fix-loop у interview/spec-фазы) → `FAILED(invalid_agent_output)` (существующий код).
+  - **Agent 3/4** — встраивается в существующую семантику: непарсящийся/невалидный output после ретраев = виток класса `agent_output_invalid` (§A «Переиспользование Agent 4», §C(d)) → при наличии fix-budget идёт в `FIXING`; при исчерпании fix-budget → `FAILED(invalid_agent_output)`. Семантика `agent_output_invalid`/`invalid_agent_output` ([ADR-005](../../adr/ADR-005-no-progress-failure-signature.md)/§C) **не меняется** — parse-фейл просто включается в тот же класс **после** локальных ретраев.
+- **Cost/wall-clock-гарды считают retry-вызовы.** Каждый retry — LLM-вызов → запись `llm_usage` + инкремент `spend_usd`; budget-гард §C(b) и wall-clock §C(c) проверяются **перед каждым** вызовом (включая retry). Ретраи **не** обходят бюджет; достижение `budget_usd`/`wall_clock_deadline` посреди ретраев → штатный `FAILED(budget_exhausted)`/`FAILED(wall_clock_exceeded)`.
+
+### I.4 Диагностируемость (обязательно)
+
+При каждом parse/schema-фейле (на каждой попытке, до терминализации) агент логирует и сохраняет в `job_events.payload`:
+- имя агента + номер попытки (`attempt`/`AGENT_OUTPUT_MAX_RETRIES`);
+- **текст ошибки валидации** (что именно не прошло);
+- **усечённый сырой ответ модели** — первые `AGENT_RAW_OUTPUT_LOG_BYTES` символов (env, default 2048), **scrubbed** (без секретов, по правилам [observability §4](../observability/03-architecture.md#4-sentry));
+- класс фейла (`parse_error` / `schema_error`).
+
+Чтобы отказ диагностировался по `job_events`/логам **без ручного воспроизведения** (как было в инциденте: `agent1_failed` логировался без текста `ValueError` и без сырого ответа).
+
+### I.5 Критерии приёмки (qa)
+
+- **unit (регрессия на fence, обязателен):** ответ модели в форме ` ```json {…} ``` ` (и ` ``` {…} ``` ` без tag) → толерантный парсинг извлекает валидную структуру **без** `ValueError`; шаг агента **не** уходит в `FAILED` (воспроизводит прод-инцидент run1/run4).
+- **unit (tool-use):** агент вызывается с `tool_choice={"type":"tool",...}`; структура читается из `tool_use.input`; system-промт-«проза» не парсится как структура.
+- **unit (bounded retry):** parse/schema-фейл ретраится до `AGENT_OUTPUT_MAX_RETRIES`; на исчерпании — `FAILED(invalid_agent_output)` (Agent 1/2) либо виток `agent_output_invalid`→FIXING/`invalid_agent_output` (Agent 3/4); каждый retry — отдельная запись `llm_usage`, budget/wall-clock-гард проверяется перед каждым вызовом.
+- **unit (диагностируемость):** при parse-фейле в `job_events.payload` присутствуют имя агента, текст ошибки и scrubbed усечённый raw-ответ (без секретов).
+- Cross-ref [06-testing-strategy.md](../../06-testing-strategy.md).
 
 ## F. `failure_log` в S3
 

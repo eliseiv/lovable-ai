@@ -188,21 +188,35 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
     # dispatch — no-op: мы вручную ведём состояния, чтобы прогон был детерминирован.
     monkeypatch.setattr(tasks, "dispatch_for_state", lambda *a, **k: None)
 
-    # Agent 1/2/3 — фейки (без Claude).
-    async def _fake_agent1(settings, prompt):  # noqa: ANN001, ANN202
+    # Agent 1/2/3 — фейки (без Claude). ADR-020 §I: обёртки агентов теперь принимают
+    # инъектируемые хуки (before_call/after_call/on_attempt_failure) от task-слоя. usage
+    # пишется хуком after_call ПОСЛЕ вызова (а не task'ом из result.call) — фейк вызывает
+    # before_call (budget/wall-clock-гард) + after_call(call) (cost-ledger), как реальный агент.
+    async def _fake_agent1(settings, prompt, *, before_call, after_call, on_attempt_failure):  # noqa: ANN001, ANN202
+        await before_call()
+        call = _call()
+        await after_call(call)
         return Agent1Result(
             questions=[
                 ParsedQuestion(position=1, text="Brand colors?", kind="free_text", options=None),
                 ParsedQuestion(position=2, text="Sections?", kind="free_text", options=None),
             ],
-            call=_call(),
+            call=call,
         )
 
-    async def _fake_agent2(settings, prompt, qa_pairs):  # noqa: ANN001, ANN202
-        return Agent2Result(spec_markdown="# Spec\nCoffee shop landing.", call=_call())
+    async def _fake_agent2(
+        settings, prompt, qa_pairs, *, before_call, after_call, on_attempt_failure
+    ):  # noqa: ANN001, ANN202, E501
+        await before_call()
+        call = _call()
+        await after_call(call)
+        return Agent2Result(spec_markdown="# Spec\nCoffee shop landing.", call=call)
 
-    async def _fake_agent3(settings, spec):  # noqa: ANN001, ANN202
-        return Agent3Result(tree=_validated_tree(), call=_call(model="claude-sonnet-4-6"))
+    async def _fake_agent3(settings, spec, *, before_call, after_call, on_attempt_failure):  # noqa: ANN001, ANN202
+        await before_call()
+        call = _call(model="claude-sonnet-4-6")
+        await after_call(call)
+        return Agent3Result(tree=_validated_tree(), call=call)
 
     monkeypatch.setattr(tasks, "run_agent1", _fake_agent1)
     monkeypatch.setattr(tasks, "run_agent2", _fake_agent2)

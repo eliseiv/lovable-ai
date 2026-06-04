@@ -73,6 +73,15 @@ def _scrub_string(value: str) -> str:
     return _APNS_TOKEN_RE.sub(lambda m: _mask_hex(m.group(0)), masked)
 
 
+def scrub_text(value: str) -> str:
+    """Публичный scrubber строки: маскирует token-паттерны (Bearer/lv_/PEM/apns_token), §4.
+
+    Переиспользуется вне Sentry-пути — например, для усечённого сырого ответа модели в
+    диагностике structured-output (ADR-020 §I.4): сырой текст не должен утечь с секретами в
+    логи/job_events. Единый нормативный набор паттернов (05-security → Секреты)."""
+    return _scrub_string(value)
+
+
 def _mask_hex(token: str) -> str:
     """Маскирует длинный hex-токен (apns_token и пр.): last 6, остальное звёздочки."""
     if len(token) <= 6:

@@ -1,23 +1,27 @@
-"""Agent 3 (Builder): спека → дерево файлов статик-сайта (JSON).
+"""Agent 3 (Builder): спека → дерево файлов статик-сайта.
 
-Output ВАЛИДИРУЕТСЯ строго по схеме (app.schemas.agent_output) ДО упаковки source.tgz.
-Невалид → AgentOutputError → FAILED(invalid_agent_output).
+Structured-output через форсированный tool-use + bounded retry (ADR-020 §I, общий слой
+structured.py): структура читается из tool_use.input (не из текста), parse/schema-фейл
+ретраится до AGENT_OUTPUT_MAX_RETRIES. Доменная валидация дерева (app.schemas.agent_output)
+применяется ПОВЕРХ tool-use (§I.1) ДО упаковки source.tgz. На исчерпании ретраев невалидный
+output → AgentOutputError → встраивается в семантику agent_output_invalid (§I.3).
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
 from app.core.config import Settings
-from app.observability.timing import timed_agent_call
 from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
-from app.pipeline.prompts import load_prompt
-from app.schemas.agent_output import (
-    AgentOutputError,
-    ValidatedTree,
-    validate_agent_output,
+from app.pipeline.agents.structured import (
+    AGENT3_TOOL,
+    DiagnosticsHook,
+    GuardHook,
+    UsageHook,
+    run_structured_agent,
 )
+from app.pipeline.prompts import load_prompt
+from app.schemas.agent_output import ValidatedTree, validate_agent_output
 
 _SYSTEM_PROMPT = load_prompt("agent3_builder")
 
@@ -28,26 +32,33 @@ class Agent3Result:
     call: AgentCall
 
 
-async def run_agent3(settings: Settings, spec_markdown: str) -> Agent3Result:
+async def run_agent3(
+    settings: Settings,
+    spec_markdown: str,
+    *,
+    before_call: GuardHook,
+    after_call: UsageHook,
+    on_attempt_failure: DiagnosticsHook,
+) -> Agent3Result:
+    """Один шаг Agent 3 (форсированный tool-use + bounded retry + доменная валидация, ADR-020 §I).
+
+    Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4).
+    validate_agent_output применяется к tool_use.input ПОВЕРХ tool-use (§I.1): tool-схема даёт
+    JSON-форму, валидатор — доменную безопасность дерева (traversal/encoding/лимиты/allowlist).
+    На исчерпании ретраев бросает AgentOutputError → task → agent_output_invalid-семантика (§I.3).
+    """
     client = ClaudeAgentClient(settings)
-    with timed_agent_call("agent3", settings.agent3_model):
-        call = await client.run_agent(
-            model=settings.agent3_model,
-            system_prompt=_SYSTEM_PROMPT,
-            user_content=f"Specification:\n\n{spec_markdown}\n\nProduce the file tree JSON.",
-        )
-    try:
-        raw = json.loads(call.text)
-    except json.JSONDecodeError as exc:
-        raise AgentOutputError(
-            "agent3 output is not valid JSON",
-            signature="agent3_not_json",
-            call=call,
-        ) from exc
-    try:
-        tree = validate_agent_output(raw, settings)
-    except AgentOutputError as exc:
-        # Прокидываем call наверх, чтобы записать llm_usage даже при невалид-output.
-        exc.call = call
-        raise
-    return Agent3Result(tree=tree, call=call)
+    result = await run_structured_agent(
+        settings,
+        client,
+        agent="agent3",
+        model=settings.agent3_model,
+        system_prompt=_SYSTEM_PROMPT,
+        user_content=f"Specification:\n\n{spec_markdown}\n\nProduce the project file tree.",
+        tool=AGENT3_TOOL,
+        validate=lambda raw: validate_agent_output(raw, settings),
+        before_call=before_call,
+        after_call=after_call,
+        on_attempt_failure=on_attempt_failure,
+    )
+    return Agent3Result(tree=result.value, call=result.call)

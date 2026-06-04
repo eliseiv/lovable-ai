@@ -156,12 +156,45 @@ def _call(text: str) -> AgentCall:
 
 
 class _FakeClient:
+    """Фейк ClaudeAgentClient.run_agent_tool (ADR-020 §I.1): структура из tool_input.
+
+    Невалидный JSON → tool_input=None (текстовый fallback / отказ tool-use, §I.2).
+    """
+
     def __init__(self, text: str) -> None:
         self._text = text
 
-    async def run_agent(self, *, model, system_prompt, user_content):  # noqa: ANN001, ANN003, ANN202
+    async def run_agent_tool(  # noqa: ANN201
+        self,
+        *,
+        model,
+        system_prompt,
+        user_content,
+        tool_name,
+        input_schema,  # noqa: ANN001
+    ):
+        from app.pipeline.agents.claude_client import AgentToolCall
+
         self.captured_user_content = user_content
-        return _call(self._text)
+        try:
+            tool_input = json.loads(self._text)
+            if not isinstance(tool_input, dict):
+                tool_input = None
+        except ValueError:
+            tool_input = None
+        return AgentToolCall(tool_input=tool_input, text=self._text, call=_call(self._text))
+
+
+async def _noop_before() -> None:
+    return None
+
+
+async def _noop_after(call) -> None:  # noqa: ANN001
+    return None
+
+
+async def _noop_fail(**kw) -> None:  # noqa: ANN003
+    return None
 
 
 def _valid_tree_json() -> str:
@@ -190,6 +223,9 @@ async def test_run_agent4_valid_patch_returns_tree(monkeypatch):
         source_tgz=src,
         failure_class="build_error",
         failure_log="error TS2304",
+        before_call=_noop_before,
+        after_call=_noop_after,
+        on_attempt_failure=_noop_fail,
     )
     assert result.tree is not None
     assert result.unrecoverable is None
@@ -209,33 +245,28 @@ async def test_run_agent4_unrecoverable_signal(monkeypatch):
         source_tgz=src,
         failure_class="build_error",
         failure_log="log",
+        before_call=_noop_before,
+        after_call=_noop_after,
+        on_attempt_failure=_noop_fail,
     )
     assert result.tree is None
     assert result.unrecoverable is not None
     assert result.unrecoverable.reason == "irreparable"
 
 
-async def test_run_agent4_invalid_patch_raises_with_call(monkeypatch):
-    """Невалидный патч = AgentOutputError с прикреплённым call (для llm_usage)."""
+async def test_run_agent4_invalid_patch_raises_after_retries_usage_recorded(monkeypatch):
+    """Невалидный патч (пустой files) — доменный schema-фейл: ретраится до исчерпания, затем
+    AgentOutputError. usage пишется хуком after_call ПОСЛЕ КАЖДОГО вызова (ADR-020 §I.3,
+    вызов оплачен даже при невалидном output) — не через exc.call."""
     settings = get_settings()
     bad = json.dumps({"files": [], "entry": "x", "build": {"command": "vite build"}})
     monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient(bad))
     src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
-    with pytest.raises(AgentOutputError) as exc_info:
-        await run_agent4(
-            settings,
-            spec_markdown="# Spec",
-            source_tgz=src,
-            failure_class="build_error",
-            failure_log="log",
-        )
-    assert exc_info.value.call is not None
+    after_calls = []
 
+    async def _after(call):  # noqa: ANN001, ANN202
+        after_calls.append(call)
 
-async def test_run_agent4_non_json_output_raises(monkeypatch):
-    settings = get_settings()
-    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient("not json at all"))
-    src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
     with pytest.raises(AgentOutputError):
         await run_agent4(
             settings,
@@ -243,4 +274,30 @@ async def test_run_agent4_non_json_output_raises(monkeypatch):
             source_tgz=src,
             failure_class="build_error",
             failure_log="log",
+            before_call=_noop_before,
+            after_call=_after,
+            on_attempt_failure=_noop_fail,
+        )
+    # N = 1 + AGENT_OUTPUT_MAX_RETRIES вызовов, каждый оплачен (usage записан).
+    assert len(after_calls) == settings.agent_output_max_retries + 1
+
+
+async def test_run_agent4_non_json_output_raises(monkeypatch):
+    """Чистый parse-фейл (tool_input=None И текст не JSON) → StructuredOutputError(parse_error)
+    после ретраев (нет домен-исключения для проброса). task → agent_output_invalid."""
+    from app.pipeline.agents.structured import StructuredOutputError
+
+    settings = get_settings()
+    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient("not json at all"))
+    src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
+    with pytest.raises((AgentOutputError, StructuredOutputError)):
+        await run_agent4(
+            settings,
+            spec_markdown="# Spec",
+            source_tgz=src,
+            failure_class="build_error",
+            failure_log="log",
+            before_call=_noop_before,
+            after_call=_noop_after,
+            on_attempt_failure=_noop_fail,
         )

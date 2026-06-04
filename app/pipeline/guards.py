@@ -38,6 +38,37 @@ REASON_WALL_CLOCK_EXCEEDED = "wall_clock_exceeded"
 REASON_NO_PROGRESS = "no_progress"
 
 
+class PreCallGuardTripped(RuntimeError):
+    """Budget/wall-clock-гард сработал ПЕРЕД LLM-вызовом агента (docs §C(b)/(c), ADR-020 §I.3).
+
+    Поднимается из before_call-хука structured-агента (проверка перед КАЖДЫМ вызовом, включая
+    retry-вызовы — §I.3: ретраи не обходят бюджет). НЕ подкласс ValueError, чтобы retry-loop
+    structured.py его НЕ проглотил как schema-фейл — он прерывает шаг агента, и task-слой
+    терминализует джобу штатным FAILED(reason). `reason` ∈ {budget_exhausted, wall_clock_exceeded}.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def check_pre_call_guards(job: GenerationJob, *, now: datetime | None = None) -> None:
+    """Budget/wall-clock-гард перед КАЖДЫМ LLM-вызовом агента (docs §C(b)/(c), ADR-020 §I.3).
+
+    Проверяет spend_usd vs budget_usd (b) и now() vs wall_clock_deadline (c) — те же гарды §C,
+    что на входе в FIXING, но применённые перед любым агент-вызовом (включая retry-вызовы
+    structured-output: ретраи стоят денег → каждый retry → llm_usage + spend, проверка перед
+    каждым). Бросает PreCallGuardTripped(reason) при исчерпании; иначе no-op. retry_count (a) и
+    no-progress (d) тут НЕ проверяются — они привязаны к FIXING-витку, а не к одиночному вызову.
+    """
+    current = now or datetime.now(UTC)
+    if _as_decimal(job.spend_usd) >= _as_decimal(job.budget_usd):
+        raise PreCallGuardTripped(REASON_BUDGET_EXHAUSTED)
+    deadline = job.wall_clock_deadline
+    if deadline is not None and current >= _aware(deadline):
+        raise PreCallGuardTripped(REASON_WALL_CLOCK_EXCEEDED)
+
+
 @dataclass(frozen=True)
 class GuardResult:
     """Итог проверки гардов. ok=False → джоба должна уйти в FAILED(reason)."""

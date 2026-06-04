@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import cast
+from typing import Any, cast
 
 from anthropic import AsyncAnthropic
-from anthropic.types import OutputConfigParam
+from anthropic.types import OutputConfigParam, ToolChoiceToolParam, ToolParam
 
 from app.core.config import Settings
 from app.workers.retry_policy import LLMCredentialError
@@ -50,6 +50,21 @@ class AgentCall:
     cost_usd: Decimal
 
 
+@dataclass(frozen=True)
+class AgentToolCall:
+    """Результат форсированного tool-use вызова агента (ADR-020 §I.1, skill claude-api).
+
+    `tool_input` — распарсенный SDK-объект из `tool_use`-блока (`block.input`), основной
+    канал структуры. None, если модель не вернула tool_use-блок (граничный случай / отказ
+    tool-use) — тогда defence-in-depth применяет толерантный парсинг к `text`. `text` —
+    собранные текстовые блоки (для fallback-парсинга и scrubbed-диагностики §I.4).
+    """
+
+    tool_input: dict[str, Any] | None
+    text: str
+    call: AgentCall
+
+
 def _compute_cost(
     model: str,
     input_tokens: int,
@@ -84,42 +99,113 @@ class ClaudeAgentClient:
         system_prompt: str,
         user_content: str,
     ) -> AgentCall:
-        """Один вызов агента: стабильный system кэшируется, user — волатильная часть.
-
-        Стримим (длинный вывод Agent 3) и собираем финальное сообщение —
+        """Один свободно-текстовый вызов агента (без tool-use): стабильный system кэшируется,
+        user — волатильная часть. Стримим (длинный вывод) + собираем финальное сообщение —
         защита от HTTP-таймаута при больших max_tokens (skill claude-api).
 
-        ADR-019 §Fix round 3 (подстраховка, §G): `run_agent` — единственная идентифицируемая
-        точка обращения к Anthropic SDK (фабрика вызова агента). При невалидном (но непустом —
-        пустой отсекается preflight'ом §G) credential SDK бросает ВСТРОЕННЫЙ stdlib-`TypeError`
-        на client-side auth-resolution (`_validate_headers`) ДО HTTP-запроса. Перехватываем
-        РОВНО здесь (узкий, version-agnostic матч по классу в точке SDK-вызова, а НЕ по подстроке
-        сообщения через весь стек таски) и поднимаем доменный LLMCredentialError → классификатор
-        §D трактует как не-транзиентный LLM-сбой → FAILED(agent_unavailable) без ретраев.
+        ADR-020: основной путь structured-output агентов — `run_agent_tool` (форсированный
+        tool-use). `run_agent` оставлен для не-структурированных вызовов и как транспорт-основа.
         """
+        message = await self._stream_final_message(
+            model=model,
+            system_prompt=system_prompt,
+            user_content=user_content,
+        )
+        text = "".join(block.text for block in message.content if block.type == "text")
+        return self._build_call(model, message, text)
+
+    async def run_agent_tool(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_content: str,
+        tool_name: str,
+        input_schema: dict[str, Any],
+    ) -> AgentToolCall:
+        """Форсированный tool-use вызов агента (ADR-020 §I.1, skill claude-api).
+
+        Подаётся ОДИН инструмент со схемой выхода агента (`input_schema`) и
+        `tool_choice={"type":"tool","name":tool_name}` — модель ОБЯЗАНА заполнить аргументы
+        этого инструмента. Структуру читаем из `tool_use`-блока (`block.input` — распарсенный
+        SDK-объект), НЕ из текста: это устраняет markdown-фенсы как класс (прод-баг §I).
+        Совместимо с extended thinking `adaptive` (в отличие от assistant-prefill).
+
+        `output_config` несёт `effort` (НЕ `format`) — `effort` совместим с forced tool_choice;
+        adaptive thinking остаётся включён. Стримим + `get_final_message()` (HTTP-таймаут-guard
+        при больших max_tokens). Возвращает tool_input (None при отсутствии tool_use-блока) +
+        text (fallback-парсинг/диагностика) + учёт стоимости (AgentCall).
+        """
+        tool: ToolParam = {
+            "name": tool_name,
+            "description": f"Submit the structured result for {tool_name}.",
+            "input_schema": cast(Any, input_schema),
+        }
+        tool_choice: ToolChoiceToolParam = {"type": "tool", "name": tool_name}
+        message = await self._stream_final_message(
+            model=model,
+            system_prompt=system_prompt,
+            user_content=user_content,
+            tools=[tool],
+            tool_choice=tool_choice,
+        )
+        text = "".join(block.text for block in message.content if block.type == "text")
+        tool_input: dict[str, Any] | None = None
+        for block in message.content:
+            if block.type == "tool_use" and block.name == tool_name:
+                raw_input = block.input
+                tool_input = raw_input if isinstance(raw_input, dict) else None
+                break
+        call = self._build_call(model, message, text)
+        return AgentToolCall(tool_input=tool_input, text=text, call=call)
+
+    async def _stream_final_message(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_content: str,
+        tools: list[ToolParam] | None = None,
+        tool_choice: ToolChoiceToolParam | None = None,
+    ) -> Any:
+        """Общий транспорт: stream + get_final_message для свободного и tool-use вызова.
+
+        ADR-019 §Fix round 3 (подстраховка, §G): единственная идентифицируемая точка обращения
+        к Anthropic SDK. При невалидном (но непустом — пустой отсекается preflight'ом §G)
+        credential SDK бросает ВСТРОЕННЫЙ stdlib-`TypeError` на client-side auth-resolution
+        (`_validate_headers`) ДО HTTP-запроса. Перехватываем РОВНО здесь (узкий, version-agnostic
+        матч по классу в точке SDK-вызова, а НЕ по подстроке через весь стек) и поднимаем
+        доменный LLMCredentialError → классификатор §D трактует как не-транзиентный LLM-сбой →
+        FAILED(agent_unavailable) без ретраев.
+        """
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": self._settings.agent_max_tokens,
+            "thinking": {"type": "adaptive"},
+            "output_config": cast(OutputConfigParam, {"effort": self._settings.agent_effort}),
+            "system": [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            "messages": [{"role": "user", "content": user_content}],
+        }
+        if tools is not None:
+            kwargs["tools"] = tools
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         try:
-            stream_ctx = self._client.messages.stream(
-                model=model,
-                max_tokens=self._settings.agent_max_tokens,
-                thinking={"type": "adaptive"},
-                output_config=cast(OutputConfigParam, {"effort": self._settings.agent_effort}),
-                system=[
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                messages=[{"role": "user", "content": user_content}],
-            )
-            async with stream_ctx as stream:
-                message = await stream.get_final_message()
+            async with self._client.messages.stream(**kwargs) as stream:
+                return await stream.get_final_message()
         except TypeError as exc:
             raise LLMCredentialError(
                 "Anthropic SDK auth-resolution failed (invalid LLM credential)"
             ) from exc
 
-        text = "".join(block.text for block in message.content if block.type == "text")
+    def _build_call(self, model: str, message: Any, text: str) -> AgentCall:
+        """Собирает AgentCall (текст + учёт токенов/стоимости) из финального сообщения SDK."""
         usage = message.usage
         input_tokens = usage.input_tokens
         output_tokens = usage.output_tokens

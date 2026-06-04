@@ -28,6 +28,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete, func, select
 
+from app.core.config import get_settings
 from app.core.ids import new_job_id, new_project_id, new_revision_id
 from app.core.security import hash_api_key
 from app.db.enums import JobState
@@ -115,7 +116,13 @@ def _call(text: str) -> AgentCall:
 
 
 class _FakeClient:
-    """Фейк ClaudeAgentClient: возвращает заранее заданный текст (по очереди)."""
+    """Фейк ClaudeAgentClient: форсированный tool-use (ADR-020 §I.1).
+
+    Возвращает заранее заданный JSON-текст (по очереди) как tool_input — модель
+    «заполняет аргументы инструмента» (structured-output читается из tool_use.input,
+    не из текста). Невалидный JSON в очереди → tool_input=None (граничный случай /
+    отказ tool-use), тогда structured-слой применяет толерантный парсинг к text (§I.2).
+    """
 
     _texts: list[str] = []
     captured: list[str] = []
@@ -123,10 +130,26 @@ class _FakeClient:
     def __init__(self, settings) -> None:  # noqa: ANN001
         pass
 
-    async def run_agent(self, *, model, system_prompt, user_content):  # noqa: ANN001, ANN003, ANN202
+    async def run_agent_tool(  # noqa: ANN201
+        self,
+        *,
+        model,
+        system_prompt,
+        user_content,
+        tool_name,
+        input_schema,  # noqa: ANN001, ANN003
+    ):
+        from app.pipeline.agents.claude_client import AgentToolCall
+
         type(self).captured.append(user_content)
         text = type(self)._texts.pop(0) if type(self)._texts else "{}"
-        return _call(text)
+        try:
+            tool_input = json.loads(text)
+            if not isinstance(tool_input, dict):
+                tool_input = None
+        except ValueError:
+            tool_input = None
+        return AgentToolCall(tool_input=tool_input, text=text, call=_call(text))
 
 
 async def _purge(uid: str) -> None:
@@ -286,9 +309,13 @@ async def test_fix_valid_patch_transitions_to_building(fixing_job, monkeypatch):
 async def test_fix_invalid_patch_stays_fixing_no_retry_increment(fixing_job, monkeypatch):
     pid, jid, storage = fixing_job
     tasks, dispatched = _wire(monkeypatch, storage)
-    # Невалидное дерево (пустой files) → AgentOutputError внутри run_agent4.
+    # Невалидное дерево (пустой files) → доменный schema-фейл. ADR-020 §I.3: structured-слой
+    # РЕТРАИТ parse/schema-фейл до AGENT_OUTPUT_MAX_RETRIES (re-семплирование) ВНУТРИ шага
+    # агента, прежде чем пробросить AgentOutputError в task. Подаём bad на все попытки.
+    settings = get_settings()
+    n_calls = settings.agent_output_max_retries + 1
     bad = json.dumps({"files": [], "entry": "x", "build": {"command": "vite build"}})
-    _FakeClient._texts = [bad]
+    _FakeClient._texts = [bad] * n_calls
 
     await tasks._fix(jid)
 
@@ -298,8 +325,8 @@ async def test_fix_invalid_patch_stays_fixing_no_retry_increment(fixing_job, mon
         assert job.retry_count == 0  # НЕ инкрементируется на невалидном патче
         # _handle_invalid_patch пометил новое событие классом agent_output_invalid.
         assert job.failure_event_pending is True
-    # llm_usage записан (вызов Claude оплачен даже при невалидном output).
-    assert await _llm_usage_count(jid) == 1
+    # llm_usage записан ПОСЛЕ КАЖДОГО вызова (включая retry, §I.3): N вызовов = N записей.
+    assert await _llm_usage_count(jid) == n_calls
     # re-dispatch task_fix (новый виток проверит гарды).
     assert (jid, JobState.FIXING) in dispatched
 

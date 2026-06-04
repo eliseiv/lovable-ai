@@ -109,14 +109,32 @@ def _call(text: str) -> AgentCall:
 
 
 class _FakeClient:
+    """Фейк ClaudeAgentClient: форсированный tool-use (ADR-020 §I.1) — структура из tool_input."""
+
     _texts: list[str] = []
 
     def __init__(self, settings) -> None:  # noqa: ANN001
         pass
 
-    async def run_agent(self, *, model, system_prompt, user_content):  # noqa: ANN001, ANN003, ANN202
+    async def run_agent_tool(  # noqa: ANN201
+        self,
+        *,
+        model,
+        system_prompt,
+        user_content,
+        tool_name,
+        input_schema,  # noqa: ANN001, ANN003
+    ):
+        from app.pipeline.agents.claude_client import AgentToolCall
+
         text = type(self)._texts.pop(0) if type(self)._texts else "{}"
-        return _call(text)
+        try:
+            tool_input = json.loads(text)
+            if not isinstance(tool_input, dict):
+                tool_input = None
+        except ValueError:
+            tool_input = None
+        return AgentToolCall(tool_input=tool_input, text=text, call=_call(text))
 
 
 async def _purge(uid: str) -> None:

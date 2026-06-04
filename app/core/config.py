@@ -61,6 +61,14 @@ class Settings(BaseSettings):
     agent_max_tokens: int = Field(default=16000)
     # effort из output_config — adaptive thinking всегда включён для агентов.
     agent_effort: str = Field(default="high")
+    # --- Structured-output всех 4 агентов (ADR-020, docs pipeline §I; env-контракт 07) ---
+    # Bounded retry ВНУТРИ шага агента на parse/schema-фейл (re-семплирование форсированного
+    # tool-use) ДО терминала. default 2 доп. попытки = до 3 LLM-вызовов суммарно (§I.3).
+    # НЕ Celery-retry и НЕ FIXING-виток — локальный re-sample вывода LLM.
+    agent_output_max_retries: int = Field(default=2)
+    # Сколько символов сырого ответа модели логировать/писать в job_events.payload при
+    # parse/schema-фейле (усечённый, scrubbed) — диагностируемость §I.4. default 2048.
+    agent_raw_output_log_bytes: int = Field(default=2048)
 
     # --- Auth (S1: один seeded Bearer-ключ, docs/05-security.md) ---
     seed_api_key: SecretStr = Field(

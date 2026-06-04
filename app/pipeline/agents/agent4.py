@@ -6,13 +6,12 @@
      джобы (текстовые файлы как {path, content}; бинарные ассеты — только {path, size});
   3. failure_log (хвост из S3, FIXER_LOG_TAIL_BYTES) + извлечённые error-строки.
 
-Выход (строго валидируется тем же контрактом, что Agent 3 — app.schemas.agent_output):
-  - исправленное дерево (ValidatedTree), ЛИБО
-  - сигнал {unrecoverable: true, reason, explanation} → UnrecoverableSignal.
-
-Невалидный патч = fix-неудача (учёт в retry_count/no-progress, ADR-005), не падение
-таски: бросается AgentOutputError (как у Agent 3). Модель — AGENT4_MODEL (tiering,
-default Opus); prompt caching стабильного system-промта; запись llm_usage у вызывающего.
+Выход (форсированный tool-use submit_project, ADR-020 §I.1; та же схема agent_output, что
+Agent 3, ПЛЮС ветка unrecoverable полями инструмента — §A): исправленное дерево (ValidatedTree),
+ЛИБО сигнал {unrecoverable: true, reason, explanation} → UnrecoverableSignal. Доменная валидация
+дерева — поверх tool-use (§I.1). Невалидный output после ретраев = fix-неудача (AgentOutputError,
+учёт в retry_count/no-progress, ADR-005), не падение таски. Bounded retry на parse/schema-фейл
+(AGENT_OUTPUT_MAX_RETRIES) — общий слой structured.py. Модель — AGENT4_MODEL (tiering).
 """
 
 from __future__ import annotations
@@ -24,12 +23,17 @@ from dataclasses import dataclass
 
 from app.core.config import Settings
 from app.core.logging import get_logger
-from app.observability.timing import timed_agent_call
 from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
+from app.pipeline.agents.structured import (
+    AGENT4_TOOL,
+    DiagnosticsHook,
+    GuardHook,
+    UsageHook,
+    run_structured_agent,
+)
 from app.pipeline.prompts import load_prompt
 from app.schemas.agent_output import (
     RESERVED_SERVICE_FILENAMES,
-    AgentOutputError,
     ValidatedTree,
     validate_agent_output,
 )
@@ -60,6 +64,14 @@ class Agent4Result:
     """Результат Fixer: ровно одно из tree / unrecoverable заполнено."""
 
     call: AgentCall
+    tree: ValidatedTree | None
+    unrecoverable: UnrecoverableSignal | None
+
+
+@dataclass(frozen=True)
+class _Agent4Output:
+    """Внутренний доменно-валидированный выход (без call — добавляется structured-слоем)."""
+
     tree: ValidatedTree | None
     unrecoverable: UnrecoverableSignal | None
 
@@ -134,7 +146,7 @@ def _build_user_content(
         f"failure_class: {failure_class}\n\n"
         "Failure log (tail):\n\n"
         f"{log_tail}\n\n"
-        "Return the corrected file tree JSON, or the unrecoverable signal JSON."
+        "Submit the corrected file tree, or set unrecoverable=true with reason/explanation."
     )
 
 
@@ -153,40 +165,27 @@ def _parse_unrecoverable(raw: dict[str, object]) -> UnrecoverableSignal | None:
     return UnrecoverableSignal(reason=reason_str, explanation=explanation_str)
 
 
-def _parse_agent4_output(call: AgentCall, settings: Settings) -> Agent4Result:
-    """Парсинг+валидация output Agent 4 (общая для fixer и editor режимов).
+def _validate_agent4_output(raw: object, settings: Settings) -> _Agent4Output:
+    """Доменная валидация tool_use.input Agent 4 поверх tool-use (ADR-020 §I.1).
 
-    Невалидный output → AgentOutputError (= неудача, учёт в retry_count/no-progress).
-    Сигнал unrecoverable — легальный выход (дерево None).
+    Сигнал unrecoverable — легальный выход (дерево None), не ошибка. Иначе валидируем дерево
+    тем же контрактом, что Agent 3 (AgentOutputError → schema-фейл, ретраится; на исчерпании
+    = fix-неудача класса agent_output_invalid, §I.3 / §A).
     """
-    try:
-        raw = json.loads(call.text)
-    except json.JSONDecodeError as exc:
-        raise AgentOutputError(
-            "agent4 output is not valid JSON",
-            signature="agent_output_invalid",
-            call=call,
-        ) from exc
     if not isinstance(raw, dict):
+        from app.schemas.agent_output import AgentOutputError
+
         raise AgentOutputError(
-            "agent4 output must be a JSON object",
-            signature="agent_output_invalid",
-            call=call,
+            "agent4 output must be a JSON object", signature="agent_output_invalid"
         )
 
     signal = _parse_unrecoverable(raw)
     if signal is not None:
         logger.info("agent4_unrecoverable", extra={"reason": signal.reason})
-        return Agent4Result(call=call, tree=None, unrecoverable=signal)
+        return _Agent4Output(tree=None, unrecoverable=signal)
 
-    try:
-        tree = validate_agent_output(raw, settings)
-    except AgentOutputError as exc:
-        # Прокидываем call наверх (вызов оплачен → запись llm_usage); невалидный патч
-        # трактуется как fix-неудача (учёт в retry_count/no-progress, docs §A).
-        exc.call = call
-        raise
-    return Agent4Result(call=call, tree=tree, unrecoverable=None)
+    tree = validate_agent_output(raw, settings)
+    return _Agent4Output(tree=tree, unrecoverable=None)
 
 
 async def run_agent4(
@@ -196,11 +195,15 @@ async def run_agent4(
     source_tgz: bytes,
     failure_class: str,
     failure_log: str,
+    before_call: GuardHook,
+    after_call: UsageHook,
+    on_attempt_failure: DiagnosticsHook,
 ) -> Agent4Result:
-    """Один вызов Fixer. Бросает AgentOutputError при невалидном патче (= fix-неудача).
+    """Один шаг Fixer (форсированный tool-use + bounded retry + доменная валидация, ADR-020 §I).
 
-    Сигнал unrecoverable — легальный выход (не ошибка валидации): возвращается в
-    Agent4Result.unrecoverable, дерево при этом None.
+    Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4). Сигнал
+    unrecoverable — легальный выход (дерево None). На исчерпании ретраев невалидный output →
+    AgentOutputError (fix-неудача, учёт в retry_count/no-progress, §A / §I.3).
     """
     source_tree_json = _read_tree_for_prompt(source_tgz)
     user_content = _build_user_content(
@@ -210,15 +213,14 @@ async def run_agent4(
         failure_class=failure_class,
         failure_log=failure_log,
     )
-
-    client = ClaudeAgentClient(settings)
-    with timed_agent_call("agent4", settings.agent4_model):
-        call = await client.run_agent(
-            model=settings.agent4_model,
-            system_prompt=_SYSTEM_PROMPT,
-            user_content=user_content,
-        )
-    return _parse_agent4_output(call, settings)
+    return await _run_agent4(
+        settings,
+        system_prompt=_SYSTEM_PROMPT,
+        user_content=user_content,
+        before_call=before_call,
+        after_call=after_call,
+        on_attempt_failure=on_attempt_failure,
+    )
 
 
 def _build_editor_content(*, spec_markdown: str, source_tree_json: str, instruction: str) -> str:
@@ -229,7 +231,7 @@ def _build_editor_content(*, spec_markdown: str, source_tree_json: str, instruct
         f"{source_tree_json}\n\n"
         "## Edit instruction\n\n"
         f"{instruction}\n\n"
-        "Return the new complete file tree JSON, or the unrecoverable signal JSON."
+        "Submit the new complete file tree, or set unrecoverable=true with reason/explanation."
     )
 
 
@@ -239,12 +241,15 @@ async def run_agent4_editor(
     spec_markdown: str,
     source_tgz: bytes,
     instruction: str,
+    before_call: GuardHook,
+    after_call: UsageHook,
+    on_attempt_failure: DiagnosticsHook,
 ) -> Agent4Result:
-    """Один вызов Agent 4 как editor (Sprint 5, ADR-014): спека + current good-дерево +
-    instruction → новое дерево (та же выходная схема/валидация, что fixer).
+    """Один шаг Agent 4 как editor (Sprint 5, ADR-014): спека + current good-дерево +
+    instruction → новое дерево (та же выходная схема/валидация/structured-механизм, что fixer).
 
-    Невалидный output → AgentOutputError (как fix-неудача — учёт в гардах edit-цикла).
-    unrecoverable → Agent4Result.unrecoverable (дерево None).
+    На исчерпании ретраев невалидный output → AgentOutputError (как fix-неудача — учёт в гардах
+    edit-цикла). unrecoverable → Agent4Result.unrecoverable (дерево None).
     """
     source_tree_json = _read_tree_for_prompt(source_tgz)
     user_content = _build_editor_content(
@@ -252,11 +257,42 @@ async def run_agent4_editor(
         source_tree_json=source_tree_json,
         instruction=instruction,
     )
+    return await _run_agent4(
+        settings,
+        system_prompt=_EDITOR_SYSTEM_PROMPT,
+        user_content=user_content,
+        before_call=before_call,
+        after_call=after_call,
+        on_attempt_failure=on_attempt_failure,
+    )
+
+
+async def _run_agent4(
+    settings: Settings,
+    *,
+    system_prompt: str,
+    user_content: str,
+    before_call: GuardHook,
+    after_call: UsageHook,
+    on_attempt_failure: DiagnosticsHook,
+) -> Agent4Result:
+    """Общий structured-вызов Agent 4 (fixer/editor): tool-use + retry + доменная валидация."""
     client = ClaudeAgentClient(settings)
-    with timed_agent_call("agent4", settings.agent4_model):
-        call = await client.run_agent(
-            model=settings.agent4_model,
-            system_prompt=_EDITOR_SYSTEM_PROMPT,
-            user_content=user_content,
-        )
-    return _parse_agent4_output(call, settings)
+    result = await run_structured_agent(
+        settings,
+        client,
+        agent="agent4",
+        model=settings.agent4_model,
+        system_prompt=system_prompt,
+        user_content=user_content,
+        tool=AGENT4_TOOL,
+        validate=lambda raw: _validate_agent4_output(raw, settings),
+        before_call=before_call,
+        after_call=after_call,
+        on_attempt_failure=on_attempt_failure,
+    )
+    return Agent4Result(
+        call=result.call,
+        tree=result.value.tree,
+        unrecoverable=result.value.unrecoverable,
+    )
