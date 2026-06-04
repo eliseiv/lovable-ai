@@ -132,6 +132,7 @@ class _FakeClient:
     async def run_agent(  # noqa: ANN201
         self,
         *,
+        agent,
         model,
         system_prompt,
         user_content,  # noqa: ANN001

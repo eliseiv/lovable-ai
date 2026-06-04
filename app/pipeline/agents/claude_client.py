@@ -80,6 +80,7 @@ class ClaudeAgentClient:
     async def run_agent(
         self,
         *,
+        agent: str,
         model: str,
         system_prompt: str,
         user_content: str,
@@ -89,12 +90,17 @@ class ClaudeAgentClient:
         защита от HTTP-таймаута при больших max_tokens (skill claude-api).
 
         ЕДИНЫЙ нормативный путь structured-output всех 4 агентов (ADR-020, revised 2026-06-04):
-        ТЕКСТОВЫЙ режим — `thinking=adaptive` + `output_config={effort}`, БЕЗ `tools`/`tool_choice`.
-        Форсированный tool-use ОТОЗВАН: несовместим с thinking → HTTP 400 «Thinking may not be
-        enabled when tool_choice forces tool use» → 100% отказ (ADR-020 §Ограничение API).
-        Структура извлекается из `block.text` хелпером `extract_json` (structured.py §I.2).
+        ТЕКСТОВЫЙ режим — пер-агентный `thinking` + `output_config={effort}`, БЕЗ
+        `tools`/`tool_choice`. Форсированный tool-use ОТОЗВАН: несовместим с thinking → HTTP 400
+        «Thinking may not be enabled when tool_choice forces tool use» → 100% отказ
+        (ADR-020 §Ограничение API). Структура извлекается из `block.text` хелпером `extract_json`.
+
+        `max_tokens`, `thinking`-mode и `model` собираются ПО АГЕНТУ из конфиг-маппинга
+        (ADR-023, §Token-бюджет агентов) — `agent` ∈ {agent1..agent4}. Единого поля
+        agent_max_tokens больше нет.
         """
         message = await self._stream_final_message(
+            agent=agent,
             model=model,
             system_prompt=system_prompt,
             user_content=user_content,
@@ -105,6 +111,7 @@ class ClaudeAgentClient:
     async def _stream_final_message(
         self,
         *,
+        agent: str,
         model: str,
         system_prompt: str,
         user_content: str,
@@ -112,8 +119,11 @@ class ClaudeAgentClient:
         """Транспорт: stream + get_final_message для текстового вызова агента.
 
         Собранные kwargs `messages.stream` НЕ содержат `tools`/`tool_choice` (ADR-020 §I.1,
-        revised) — несовместимы с `thinking=adaptive` (HTTP 400). Только `thinking=adaptive` +
-        `output_config={effort}`; формат выхода форсируется строгим системным промтом.
+        revised) — несовместимы с включённым `thinking` (HTTP 400). Пер-агентный `thinking`
+        (ADR-023: Agent 3 disabled, агенты 1/2/4 adaptive) + `output_config={effort}`; формат
+        выхода форсируется строгим системным промтом. `max_tokens` и `thinking`-mode берутся
+        из конфиг-маппинга по `agent` (ADR-023 §Token-бюджет); `budget_tokens` НИГДЕ не
+        собирается (HTTP 400 на Opus 4.8/4.7, deprecated на Sonnet — ADR-023 §Ограничение API).
 
         ADR-019 §Fix round 3 (подстраховка, §G): единственная идентифицируемая точка обращения
         к Anthropic SDK. При невалидном (но непустом — пустой отсекается preflight'ом §G)
@@ -125,8 +135,8 @@ class ClaudeAgentClient:
         """
         kwargs: dict[str, Any] = {
             "model": model,
-            "max_tokens": self._settings.agent_max_tokens,
-            "thinking": {"type": "adaptive"},
+            "max_tokens": self._settings.agent_max_tokens(agent),
+            "thinking": self._settings.agent_thinking(agent),
             "output_config": cast(OutputConfigParam, {"effort": self._settings.agent_effort}),
             "system": [
                 {

@@ -56,10 +56,24 @@ class Settings(BaseSettings):
     # model-tiering (docs/modules/observability/03-architecture.md §5.3).
     agent1_model: str = Field(default="claude-sonnet-4-6")  # Interviewer → Sonnet
     agent2_model: str = Field(default="claude-opus-4-8")  # Spec writer → Opus
-    agent3_model: str = Field(default="claude-opus-4-8")  # Builder → Opus
+    # ADR-023 R1: Builder Opus→Sonnet (стоимость −40%; thinking disabled у Builder,
+    # extended-thinking Opus не задействуется). Откат на Opus = env AGENT3_MODEL без релиза.
+    agent3_model: str = Field(default="claude-sonnet-4-6")  # Builder → Sonnet (R1)
     agent4_model: str = Field(default="claude-sonnet-4-6")  # Fixer → Sonnet
-    agent_max_tokens: int = Field(default=16000)
-    # effort из output_config — adaptive thinking всегда включён для агентов.
+    # --- Token-бюджет агентов: пер-агентный max_tokens + thinking-mode (ADR-023) ---
+    # Единый AGENT_MAX_TOKENS удалён (детерминированный отказ Agent 3 на сложных сайтах:
+    # усечение file-tree / пустой вывод). Пер-агентный cap + thinking-mode — нормативный
+    # single source: docs/modules/pipeline/03-architecture.md §Token-бюджет агентов (ADR-023),
+    # env-контракт docs/07-deployment.md. Каждый cap ≤ ceiling модели агента (Opus 128K /
+    # Sonnet 64K); Builder/Fixer (Sonnet) держат запас 56000 < 64000. thinking-mode пер-агентный
+    # живёт в конфиге (маппинг агент→mode), не в коде агента (как model-tiering): Agent 3
+    # (Builder) disabled (весь cap детерминированно под вывод), агенты 1/2/4 adaptive.
+    agent1_max_tokens: int = Field(default=16000)  # Interviewer (Sonnet ≤64K)
+    agent2_max_tokens: int = Field(default=32000)  # Spec writer (Opus ≤128K)
+    agent3_max_tokens: int = Field(default=56000)  # Builder (Sonnet ≤64K, самый большой)
+    agent4_max_tokens: int = Field(default=56000)  # Fixer/Editor (Sonnet ≤64K)
+    # effort из output_config — adaptive thinking у агентов 1/2/4; на Agent 3 (thinking
+    # disabled) не действует (ADR-023 §Decision (2)).
     agent_effort: str = Field(default="high")
     # --- Structured-output всех 4 агентов (ADR-020, docs pipeline §I; env-контракт 07) ---
     # Bounded retry ВНУТРИ шага агента на parse/schema-фейл (re-семплирование форсированного
@@ -373,6 +387,32 @@ class Settings(BaseSettings):
         description=".limit(BATCH) + курсор synced_at ASC в billing.resync (самые протухшие "
         "первыми, хвост на след. тиках). env BILLING_RESYNC_BATCH_SIZE (ADR-016).",
     )
+
+    def agent_max_tokens(self, agent: str) -> int:
+        """Пер-агентный max_tokens cap по имени агента (ADR-023, маппинг в конфиге).
+
+        agent ∈ {"agent1","agent2","agent3","agent4"}. Нормативные значения/ceiling —
+        docs/modules/pipeline/03-architecture.md §Token-бюджет агентов. Cap каждого агента
+        собирается claude_client в kwargs messages.stream вместо удалённого единого поля.
+        """
+        return {
+            "agent1": self.agent1_max_tokens,
+            "agent2": self.agent2_max_tokens,
+            "agent3": self.agent3_max_tokens,
+            "agent4": self.agent4_max_tokens,
+        }[agent]
+
+    def agent_thinking(self, agent: str) -> dict[str, str]:
+        """Пер-агентный thinking-mode по имени агента (ADR-023, маппинг в конфиге, не в агенте).
+
+        Agent 3 (Builder) → {"type":"disabled"} (детерминированная комната под вывод полного
+        file-tree); агенты 1/2/4 → {"type":"adaptive"} (thinking ценен). НИКОГДА не собирается
+        {"type":"enabled","budget_tokens":...} — HTTP 400 на Opus 4.8/4.7, deprecated на Sonnet
+        (ADR-023 §Ограничение API). Нормативный single source — docs pipeline §Token-бюджет.
+        """
+        if agent == "agent3":
+            return {"type": "disabled"}
+        return {"type": "adaptive"}
 
     @property
     def is_prod(self) -> bool:

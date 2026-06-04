@@ -65,7 +65,9 @@ async def test_run_agent_typeerror_on_stream_becomes_llm_credential_error(monkey
     monkeypatch.setattr(client._client.messages, "stream", _raise_typeerror)
 
     with pytest.raises(LLMCredentialError):
-        await client.run_agent(model="claude-opus-4-8", system_prompt="sys", user_content="u")
+        await client.run_agent(
+            agent="agent2", model="claude-opus-4-8", system_prompt="sys", user_content="u"
+        )
 
 
 @pytest.mark.asyncio
@@ -90,7 +92,9 @@ async def test_run_agent_typeerror_from_get_final_message_becomes_llm_credential
     monkeypatch.setattr(client._client.messages, "stream", lambda *a, **k: _FakeStreamCtx())
 
     with pytest.raises(LLMCredentialError):
-        await client.run_agent(model="claude-opus-4-8", system_prompt="sys", user_content="u")
+        await client.run_agent(
+            agent="agent2", model="claude-opus-4-8", system_prompt="sys", user_content="u"
+        )
 
 
 @pytest.mark.asyncio
@@ -106,7 +110,9 @@ async def test_run_agent_llm_credential_error_chains_original_typeerror(monkeypa
     monkeypatch.setattr(client._client.messages, "stream", _raise)
 
     with pytest.raises(LLMCredentialError) as ei:
-        await client.run_agent(model="claude-opus-4-8", system_prompt="s", user_content="u")
+        await client.run_agent(
+            agent="agent2", model="claude-opus-4-8", system_prompt="s", user_content="u"
+        )
     assert ei.value.__cause__ is original
 
 
@@ -171,4 +177,6 @@ async def test_run_agent_does_not_swallow_unrelated_typeerror_outside_sdk_call(m
 
     # Пост-обработка (доступ к message.content) падает вне SDK-try → НЕ LLMCredentialError.
     with pytest.raises((TypeError, AttributeError)):
-        await client.run_agent(model="claude-opus-4-8", system_prompt="s", user_content="u")
+        await client.run_agent(
+            agent="agent2", model="claude-opus-4-8", system_prompt="s", user_content="u"
+        )

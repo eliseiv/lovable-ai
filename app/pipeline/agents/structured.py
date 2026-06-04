@@ -220,6 +220,7 @@ async def run_structured_agent[T](
         content = user_content if attempt == 0 else user_content + retry_nudge
         with timed_agent_call(agent, model):
             call = await client.run_agent(
+                agent=agent,
                 model=model,
                 system_prompt=strict_system_prompt,
                 user_content=content,

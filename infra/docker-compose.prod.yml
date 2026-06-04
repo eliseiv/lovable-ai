@@ -121,8 +121,22 @@ x-app-env: &app-env
   NGINX_IMAGE: ${NGINX_IMAGE:-nginx:alpine}
   SITES_HOST_ROOT: ${SITES_HOST_ROOT:-/srv/sites}
   BUILDS_ROOT: ${BUILDS_ROOT:-/var/builds}
-  # --- Sprint 2: Fixer loop + resilience (дефолты — docs/07 env-контракт) ---
+  # --- ADR-023: пер-агентные модели + cap'ы output-токенов (заменил единый
+  # AGENT_MAX_TOKENS). Дефолты символ-в-символ с docs/07 env-контрактом
+  # (§канонический список ключей, потребитель worker). ⚠️ app-env worker →
+  # обязаны быть здесь, иначе extra=ignore молча отдаст дефолт config.py. ---
+  # Модели агентов (tiering; AGENT3 переведён Opus→Sonnet в ADR-023 R1,
+  # env-override = откат на Opus без релиза). Дефолты = docs/07 стр. 43-46.
+  AGENT1_MODEL: ${AGENT1_MODEL:-claude-sonnet-4-6}
+  AGENT2_MODEL: ${AGENT2_MODEL:-claude-opus-4-8}
+  AGENT3_MODEL: ${AGENT3_MODEL:-claude-sonnet-4-6}
   AGENT4_MODEL: ${AGENT4_MODEL:-claude-sonnet-4-6}
+  # Пер-агентные cap'ы output-токенов (docs/07 стр. 49-52).
+  AGENT1_MAX_TOKENS: ${AGENT1_MAX_TOKENS:-16000}
+  AGENT2_MAX_TOKENS: ${AGENT2_MAX_TOKENS:-32000}
+  AGENT3_MAX_TOKENS: ${AGENT3_MAX_TOKENS:-56000}
+  AGENT4_MAX_TOKENS: ${AGENT4_MAX_TOKENS:-56000}
+  # --- Sprint 2: Fixer loop + resilience (дефолты — docs/07 env-контракт) ---
   MAX_FIX_ATTEMPTS: ${MAX_FIX_ATTEMPTS:-3}
   JOB_BUDGET_USD: ${JOB_BUDGET_USD:-5.0000}
   USER_MONTHLY_BUDGET_USD: ${USER_MONTHLY_BUDGET_USD:-50.0000}

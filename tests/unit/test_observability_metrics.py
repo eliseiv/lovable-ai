@@ -234,7 +234,12 @@ def test_render_latest_prometheus_content_type():
 
 
 def test_model_tiering_defaults():
-    """Дефолты AGENTn_MODEL: 1/4 = Sonnet (Interviewer/Fixer), 2/3 = Opus (Spec/Builder)."""
+    """Дефолты AGENTn_MODEL (ADR-023 §Decision (3), ревизия R1): только Agent 2 (Spec) = Opus;
+    Agent 1 (Interviewer) / Agent 3 (Builder) / Agent 4 (Fixer) = Sonnet.
+
+    Источник истины — docs/modules/pipeline/03-architecture.md §Агенты → Tiering моделей (R1:
+    Builder переведён Opus→Sonnet ради стоимости). Прежний дефолт agent3=Opus устарел.
+    """
     s = Settings(
         database_url="postgresql+asyncpg://x:y@127.0.0.1/db",
         redis_url="redis://127.0.0.1:6379/0",
@@ -243,5 +248,5 @@ def test_model_tiering_defaults():
     )
     assert s.agent1_model == "claude-sonnet-4-6"
     assert s.agent2_model == "claude-opus-4-8"
-    assert s.agent3_model == "claude-opus-4-8"
+    assert s.agent3_model == "claude-sonnet-4-6"  # R1: Builder Opus→Sonnet (ADR-023)
     assert s.agent4_model == "claude-sonnet-4-6"

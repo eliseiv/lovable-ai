@@ -116,6 +116,9 @@ description: "DevOps инженер. Настраивает Dockerfile, docker-c
 - Dev secrets — в локальном `.env` (не commit'ить, только `.env.example` с плейсхолдерами).
 - Нет hardcoded credentials ни в одном конфиге (Dockerfile / compose / CI YAML / deployment скрипты).
 
+#### Env-key wiring в compose (ОБЯЗАТЕЛЬНО при новом app-уровневом ключе)
+Добавление ключа в Settings/`.env`/docs/07 env-контракт НЕ доводит его до процесса. Когда вводится НОВЫЙ app-уровневый env-ключ/секрет, потребляемый процессом api/worker/beat (особенно секрет, от которого зависит фича-гейт), ты ОБЯЗАН **провести его в `infra/docker-compose.prod.yml`** — в общий якорь `x-app-env` (или явный `environment` целевого сервиса, если ключ нужен только ему), а НЕ только в Settings/`.env`/docs. Затем подтверди проводку: ключ присутствует в rendered `docker compose config` для целевого сервиса, символ-в-символ с env-контрактом `docs/07-deployment.md`. Помни: `extra=ignore` в Settings молча проглатывает непроведённый ключ (фича отключается без ошибки старта) — «заполненный `.env`» без строки в compose означает ПУСТОЙ ключ в проде.
+
 ### 4. Self-check
 
 Прогрепай свои конфиги по двум классам паттернов.
@@ -238,6 +241,10 @@ JSON по формату ниже.
 ### Документация
 - [ ] `docs/07-deployment.md` обновлён (как деплоить, как rollback)
 - [ ] `.env.example` отражает реальные переменные
+
+### Env-key wiring
+- [ ] Каждый НОВЫЙ app-уровневый env-ключ/секрет (потребитель api/worker/beat) проведён в `x-app-env` / `environment` целевого сервиса `infra/docker-compose.prod.yml`, а не только в Settings/`.env`/docs
+- [ ] Проводка подтверждена: ключ присутствует в rendered `docker compose config` целевого сервиса, символ-в-символ с env-контрактом `docs/07-deployment.md`
 
 ## НАЧИНАЙ РАБОТУ
 

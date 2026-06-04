@@ -104,6 +104,26 @@ flowchart TB
 - `200` → транзакционно: `site_deployments.status=active`, `live_url=https://{subdomain}.apps.domain/`, `generation_jobs.state=LIVE`, событие в Redis.
 - Фейл (timeout/`!=200`/ошибка `docker run`) → **сначала teardown текущего контейнера** (`docker rm -f` + освобождение route, `status=failed`), **затем** build log/health log → S3 (`build_log_ref`/`failure_log_ref`) → `state=FIXING` (модуль `pipeline`). Порядок обязателен: см. §5 «Инвариант фейла».
 
+## F-1. Per-attempt ключи build/deploy-логов (ADR-022)
+
+> Нормативный ADR: [ADR-022](../../adr/ADR-022-per-attempt-build-logs.md).
+
+**Проблема (доказана на проде).** Build-лог писался по фиксированному ключу `logs/{job_id}/build.log` и **перезаписывался** каждой попыткой сборки: первый `build_failed` → фикс Agent 4 → пересборка → перезапись лога ранней ошибки успешной попыткой. Post-mortem причины первого `build_error` становился невозможен (приходилось воспроизводить вручную).
+
+**Контракт.** Каждая попытка пишет лог в **уникальный** S3-ключ, дискриминированный монотонным `generation_jobs.retry_count`:
+
+| Стадия | Ключ | Функция `s3.py` | Класс фейла | Точка записи |
+|---|---|---|---|---|
+| Build (успех и фейл) | `logs/{job_id}/build.{retry_count}.log` | `build_log_key(job_id, retry_count)` | `build_error`/`npm_install_error` | `enter_fixing` (build/npm-фейл), `_build_request` (`build_succeeded`) |
+| Deploy/health-фейл | `logs/{job_id}/deploy.{retry_count}.log` | `deploy_log_key(job_id, retry_count)` | `deploy_error`/`health_*` | `enter_fixing` (`deploy_error`/`health_*`) |
+| Отклонённый патч Agent 4 | `logs/{job_id}/agent.{retry_count}.log` | `agent_log_key(job_id, retry_count)` | `agent_output_invalid` | `_handle_invalid_patch` (`app/workers/tasks.py:1087`) |
+
+- **Дискриминатор — `retry_count`** (монотонный, доступен в `job` во всех трёх точках записи): `0` на первой сборке; инкрементируется ровно один раз на входе `FIXING → BUILDING` (`task_fix`, валидный патч, см. [pipeline §B п.3](../pipeline/03-architecture.md#b-fixing-цикл-исправления)). `revision_no` **не** годится дискриминатором: между fix-итерациями он может оказаться нестабильным/повторяющимся; `retry_count` строго монотонен в пределах джобы.
+- **Build / deploy / agent раздельными именами** (`build.{n}` / `deploy.{n}` / `agent.{n}`): в пределах одной попытки (одного `retry_count=N`) сборка может пройти (`build.{n}.log`, `build_succeeded`), а затем deploy/health упасть (`deploy.{n}.log`), а отклонённый патч Agent 4 — записать `agent.{n}.log`. Три раздельных имени-стадии гарантируют, что при одном `retry_count` ни одна стадия не затирает лог другой стадии того же витка. **Критично для `agent_output_invalid`:** `_handle_invalid_patch` **НЕ** инкрементирует `retry_count` (инкремент только на валидном патче, `app/workers/tasks.py:759`), поэтому отклонённый патч витка N пишется с тем же `retry_count=N`, что и предшествующий `build_error`/`deploy_error` витка N — и без отдельного имени `agent.{N}.log` затёр бы их лог.
+- **Ссылки в событиях.** `build_failed.payload.failure_log_ref` (build/deploy-фейл), `build_succeeded.payload.build_log_ref` (успешная сборка) и `fix_rejected.payload.failure_log_ref` (отклонённый патч Agent 4) несут per-attempt ключ именно этой попытки. `generation_jobs.failure_log_ref` / `site_deployments.build_log_ref` хранят per-attempt путь (см. [03-data-model.md](../../03-data-model.md)). История ранних попыток восстановима из append-only `build_failed`/`fix_rejected`-событий (`job_events`).
+- **Совместимость.** `*_ref` — opaque-строка; меняется только её **значение** (формат ключа), миграция/downgrade полей не нужны. Чтение существующих ссылок не ломается (читается тот ключ, что записан).
+- **Ретеншн.** Все per-attempt логи (`build.{n}` / `deploy.{n}` / `agent.{n}`) под `logs/{job_id}/` → подчищаются тем же batch-delete по префиксу `logs/{job_id}/` в `project.gc` ([ADR-011](../../adr/ADR-011-project-delete-gc.md), §6) — отдельной очистки не требуется.
+
 ## 5. Lifecycle сайт-деплоя (state machine `site_deployments.status`)
 
 Деплой сайта — самостоятельная машина состояний строки `site_deployments`, **ортогональная** машине `generation_jobs.state` (модуль `pipeline`). `generation_jobs.state` отражает прогресс джобы (`DEPLOYING`/`LIVE`/`FIXING`/`FAILED`); `site_deployments.status` отражает реальный lifecycle контейнера+route. Подсистема `deploy` обязана держать эти две машины согласованными: фейл деплоя/health не переводит джобу в `FIXING`/`FAILED` **до** того, как контейнер текущей попытки реально снесён.

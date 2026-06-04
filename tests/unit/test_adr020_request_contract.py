@@ -77,9 +77,11 @@ async def test_request_has_no_forcing_tool_choice_with_thinking():
     одновременно с thinking (ADR-020 revised §I.5 — против HTTP 400 / 100%-отказа)."""
     client, captured = _capturing_client()
 
-    await client.run_agent(model="claude-sonnet-4-6", system_prompt="sys", user_content="user")
+    await client.run_agent(
+        agent="agent1", model="claude-sonnet-4-6", system_prompt="sys", user_content="user"
+    )
 
-    # thinking присутствует (сохранён для всех 4 агентов — ценен для качества).
+    # thinking присутствует (adaptive у агентов 1/2/4 — ценен для качества; ADR-023).
     assert captured.get("thinking") == {"type": "adaptive"}
     # Несовместимая комбинация исключена: либо tool_choice отсутствует, либо НЕ форсирует.
     tc = captured.get("tool_choice")
@@ -92,7 +94,9 @@ async def test_request_omits_tools_and_tool_choice_entirely():
     """Текстовый режим (§I.1 revised): tools/tool_choice ВООБЩЕ не передаются в тело запроса."""
     client, captured = _capturing_client()
 
-    await client.run_agent(model="claude-opus-4-8", system_prompt="sys", user_content="user")
+    await client.run_agent(
+        agent="agent2", model="claude-opus-4-8", system_prompt="sys", user_content="user"
+    )
 
     assert "tools" not in captured
     assert "tool_choice" not in captured
@@ -103,7 +107,9 @@ async def test_request_carries_thinking_and_output_config():
     client, captured = _capturing_client()
     settings = get_settings()
 
-    await client.run_agent(model="claude-opus-4-8", system_prompt="sys", user_content="user")
+    await client.run_agent(
+        agent="agent2", model="claude-opus-4-8", system_prompt="sys", user_content="user"
+    )
 
     assert captured["thinking"] == {"type": "adaptive"}
     assert captured["output_config"] == {"effort": settings.agent_effort}

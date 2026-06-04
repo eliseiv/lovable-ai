@@ -42,12 +42,15 @@
 | `ANTHROPIC_API_KEY` | `anthropic_api_key` | SecretStr | both | Ключ Claude API. | `<your-anthropic-api-key>` |
 | `AGENT1_MODEL` | `agent1_model` | str | worker | Модель агента 1 (Interviewer, tiering). Единый маппинг — [pipeline §Агенты](modules/pipeline/03-architecture.md#агенты-anthropic-sdk). | `claude-sonnet-4-6` |
 | `AGENT2_MODEL` | `agent2_model` | str | worker | Модель агента 2 (Spec writer). | `claude-opus-4-8` |
-| `AGENT3_MODEL` | `agent3_model` | str | worker | Модель агента 3 (Builder). | `claude-opus-4-8` |
+| `AGENT3_MODEL` | `agent3_model` | str | worker | Модель агента 3 (Builder). **[ADR-023 R1]** Переведён Opus→Sonnet (стоимость); env-override — откат на Opus без релиза. | `claude-sonnet-4-6` |
 | `AGENT4_MODEL` | `agent4_model` | str | worker | Модель агента 4 (Fixer, tiering). | `claude-sonnet-4-6` |
 
-> **Маппинг агент→модель — единый нормативный источник:** [pipeline §Агенты → Tiering моделей](modules/pipeline/03-architecture.md#агенты-anthropic-sdk) / продуктовое решение [08 §6-2](08-product-decisions.md#sprint-6--observability-cost-scale). Дефолты выше = целевой tiering. Backend в **S6-калибровке model-tiering** приводит `config.py`-дефолты к этим значениям (`AGENT1`/`AGENT4` = `claude-sonnet-4-6`, `AGENT2`/`AGENT3` = `claude-opus-4-8`); если текущие дефолты кода отличаются — это часть калибровки S6, не новое решение.
-| `AGENT_MAX_TOKENS` | `agent_max_tokens` | int | worker | Лимит output-токенов агента. | `16000` |
-| `AGENT_EFFORT` | `agent_effort` | str | worker | Adaptive-thinking effort. | `high` |
+> **Маппинг агент→модель — единый нормативный источник:** [pipeline §Агенты → Tiering моделей](modules/pipeline/03-architecture.md#агенты-anthropic-sdk) / продуктовое решение [08 §6-2](08-product-decisions.md#sprint-6--observability-cost-scale). Дефолты выше = целевой tiering (после ревизии R1 [ADR-023](adr/ADR-023-agent3-token-budget-thinking-room.md): Builder Opus→Sonnet). Backend в **S6-калибровке model-tiering** приводит `config.py`-дефолты к этим значениям (`AGENT1`/`AGENT3`/`AGENT4` = `claude-sonnet-4-6`, `AGENT2` = `claude-opus-4-8`); если текущие дефолты кода отличаются — это часть калибровки S6, не новое решение.
+| `AGENT1_MAX_TOKENS` | `agent1_max_tokens` | int | worker | **[ADR-023]** Cap output-токенов Agent 1 (Interviewer). Пер-агентный (заменил единый `AGENT_MAX_TOKENS`). ≤ ceiling модели (Sonnet 64K). Маппинг — [pipeline §Token-бюджет](modules/pipeline/03-architecture.md#token-бюджет-агентов-adr-023). ⚠️ **devops: app-env worker → обязан быть в `x-app-env` compose, иначе `extra=ignore` молча отдаст дефолт.** | `16000` |
+| `AGENT2_MAX_TOKENS` | `agent2_max_tokens` | int | worker | **[ADR-023]** Cap output-токенов Agent 2 (Spec writer). ≤ ceiling Opus 128K. | `32000` |
+| `AGENT3_MAX_TOKENS` | `agent3_max_tokens` | int | worker | **[ADR-023 R1]** Cap output-токенов Agent 3 (Builder) — **самый большой** (полный file-tree сложного сайта; прод-инцидент усечения при 16000). Builder на **Sonnet** → **≤ ceiling Sonnet 64K с запасом** (56000 = 87.5% ceiling, ~8000 запас, НЕ упираемся в потолок). У Builder thinking **disabled** → весь cap под вывод. Снижен 64000→56000 при переводе Opus→Sonnet. | `56000` |
+| `AGENT4_MAX_TOKENS` | `agent4_max_tokens` | int | worker | **[ADR-023 R1]** Cap output-токенов Agent 4 (Fixer/Editor) — возвращает то же дерево, что Builder. Sonnet, thinking adaptive → **≤ ceiling Sonnet 64K с запасом** (56000). Снижен 64000→56000 в R1. | `56000` |
+| `AGENT_EFFORT` | `agent_effort` | str | worker | Adaptive-thinking effort (агенты 1/2/4 — thinking adaptive; Agent 3 — thinking disabled, effort на него не действует, [ADR-023](adr/ADR-023-agent3-token-budget-thinking-room.md)). | `high` |
 | `AGENT_OUTPUT_MAX_RETRIES` | `agent_output_max_retries` | int | worker | **[ADR-020]** Кол-во доп. LLM-вызовов (re-sample) шага агента на parse/schema-фейл structured-output ДО терминала. Default 2 = до 3 вызовов суммарно. Внутришаговый retry, **не** Celery-retry/FIXING; budget/wall-clock-гард считает retry-вызовы. Нормативный контракт — [pipeline §I](modules/pipeline/03-architecture.md#i-надёжный-structured-output-всех-4-агентов). | `2` |
 | `AGENT_RAW_OUTPUT_LOG_BYTES` | `agent_raw_output_log_bytes` | int | worker | **[ADR-020]** Сколько символов сырого ответа модели (scrubbed) логируется/пишется в `job_events.payload` при parse/schema-фейле для диагностируемости. | `2048` |
 | `SEED_API_KEY` | `seed_api_key` | SecretStr | api | Plaintext seeded Bearer-ключ для bootstrap единственного S1-пользователя; с Sprint 3 — legacy fallback на время миграции ([05-security.md](05-security.md), [ADR-008](adr/ADR-008-indexed-api-key-lookup.md)). | `<generate-random-opaque-key>` |
@@ -153,10 +156,14 @@ Scrape-конфиг Prometheus и provisioning/дашборды Grafana — **к
 |---|---|---|---|
 | Исходники ревизии | `sources/{job_id}/source.tgz` | `source_key()` | `revisions.source_artifact_ref` |
 | Собранный `dist/` | `dist/{job_id}/dist.tgz` | `dist_key()` | `site_deployments.dist_artifact_ref` |
-| Build-лог | `logs/{job_id}/build.log` | `build_log_key()` | `site_deployments.build_log_ref`, `generation_jobs.failure_log_ref` |
+| Build-лог (per-attempt) | `logs/{job_id}/build.{retry_count}.log` | `build_log_key(job_id, retry_count)` | `site_deployments.build_log_ref`, `generation_jobs.failure_log_ref` |
+| Deploy/health-лог фейла (per-attempt) | `logs/{job_id}/deploy.{retry_count}.log` | `deploy_log_key(job_id, retry_count)` | `generation_jobs.failure_log_ref` |
+| Лог отклонённого патча Agent 4 (per-attempt) | `logs/{job_id}/agent.{retry_count}.log` | `agent_log_key(job_id, retry_count)` | `generation_jobs.failure_log_ref` |
 | Большая спека | `specs/{job_id}/spec.md` | `spec_key()` | `generation_jobs.spec_tz` (`spec_ref`) |
 
 `minio-setup` (dev) создаёт ровно один бакет `${S3_BUCKET}` (idempotent), не три. Префиксы не требуют отдельного создания — S3 создаёт их неявно при `put_object`.
+
+> **Per-attempt build/deploy/agent-логи ([ADR-022](adr/ADR-022-per-attempt-build-logs.md)).** Каждая попытка сборки/деплоя пишет лог в **уникальный** ключ, дискриминированный монотонным `generation_jobs.retry_count` (`0` на первой сборке, +1 на каждом входе `FIXING → BUILDING` по **валидному** патчу), а не в фиксированный `build.log`. Так ранний лог build-ошибки **не затирается** успешной пересборкой после фикса Agent 4 → post-mortem причины каждого витка возможен по его собственному логу. Build-стадия, deploy/health-стадия и отклонённый патч Agent 4 одной попытки пишут в **три разных** ключа (`build.{n}.log` / `deploy.{n}.log` / `agent.{n}.log`) — при одном `retry_count` имена-стадии различны, поэтому ни одна стадия витка не затирает лог другой. Отдельный ключ `agent.{n}.log` обязателен, т.к. отклонённый патч (`_handle_invalid_patch`, `agent_output_invalid`) **не** инкрементирует `retry_count` и иначе писал бы в `build.{n}`/`deploy.{n}` того же витка, затирая их. Все per-attempt логи лежат под `logs/{job_id}/` и подчищаются тем же batch-delete по префиксу `logs/{job_id}/` в `project.gc` ([ADR-011](adr/ADR-011-project-delete-gc.md)) при удалении проекта — отдельной очистки не требуется.
 
 ## docker-compose.dev.yml (сервисы)
 

@@ -89,12 +89,19 @@ PASSWORD\\s*=|TOKEN\\s*=|SECRET\\s*=|API_KEY\\s*=|PRIVATE_KEY
 - [ ] Healthcheck для зависимостей + `depends_on: condition: service_healthy`?
 - [ ] `.env.example` без реальных секретов?
 
+### Шаг 6b: Env-key wiring (ОБЯЗАТЕЛЬНО при новом app-уровневом ключе)
+Если задача/ADR вводит НОВЫЙ app-уровневый env-ключ/секрет (потребитель api/worker/beat) — недостаточно строки в Settings/`.env`/docs/07: ключ должен реально доходить до процесса через compose. Проверь:
+- [ ] Ключ присутствует в `x-app-env` (или `environment` целевого сервиса) `infra/docker-compose.prod.yml`?
+- [ ] Ключ присутствует в rendered `docker compose config` для целевого сервиса, **символ-в-символ** с env-контрактом `docs/07-deployment.md` (имя не сокращено/не искажено)?
+
+⚠️ `extra=ignore` в Settings молча проглатывает непроведённый ключ — фича отключается в проде без ошибки старта. Поэтому отсутствие проводки = функциональный пробел (`major`), а не minor, даже если `.env` на сервере заполнен.
+
 ### Шаг 7: Severity classification
 
 | Severity | Когда применять |
 |---|---|
 | **critical** | Реальный секрет в коде (не плейсхолдер); контейнер запускается от root в runtime; `--privileged` без обоснования и `TD-NNN`; migrations не запускаются до старта нового кода; отключение TLS verification |
-| **major** | Базовый образ не pinned (`:latest`); отсутствие health check; отсутствие rollback процедуры; функциональный пробел из ТЗ (отсутствует CI stage, отсутствует deployment step); открытый порт наружу без необходимости |
+| **major** | Базовый образ не pinned (`:latest`); отсутствие health check; отсутствие rollback процедуры; функциональный пробел из ТЗ (отсутствует CI stage, отсутствует deployment step); новый app-уровневый env-ключ не проведён в `x-app-env`/`environment` `infra/docker-compose.prod.yml` (отсутствует в rendered `docker compose config` целевого сервиса) — фича молча отключена в проде; открытый порт наружу без необходимости |
 | **minor** | Отсутствие cache в CI (производительность, не безопасность); опечатка, стилистика |
 
 ⚠️ Функциональный пробел = `major`, не minor.
@@ -161,6 +168,7 @@ PASSWORD\\s*=|TOKEN\\s*=|SECRET\\s*=|API_KEY\\s*=|PRIVATE_KEY
 
 - [ ] Pre-review gate соблюдён
 - [ ] Secrets sweep выполнен
+- [ ] Новый app-уровневый env-ключ проведён в `x-app-env`/`environment` и присутствует в rendered `docker compose config` целевого сервиса (символ-в-символ с docs/07)
 - [ ] Container security проверен
 - [ ] CI/CD pipeline проверен
 - [ ] Deployment безопасен (migrations, rollback, idempotency)
