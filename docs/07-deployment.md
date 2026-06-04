@@ -84,7 +84,9 @@
 | `GRACE_PERIOD_DAYS` | `grace_period_days` | int | worker | **Sprint 3.5.** Длительность grace-периода сайтов при expire/refund (`grace_until = expire + это`). Продуктово = 7 ([08 §3.5-6](08-product-decisions.md#sprint-35--billing-adapty)). ⚠️ **devops: добавить в Settings + compose.** | `7` |
 | `SUBSCRIPTION_SWEEP_INTERVAL_S` | `subscription_sweep_interval_s` | int | worker | **Sprint 3.5.** Частота beat-sweeper'а grace-teardown сайтов (`billing.subscription_sweep`). ⚠️ **devops: добавить в Settings + compose (beat).** | `3600` |
 | `BUILD_SANDBOX_RUNTIME` | `build_sandbox_runtime` | str | worker | **Sprint 4** ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)). Runtime build-песочницы: `rootless` (дефолт) / `runsc` (опциональный gVisor поверх). Определяет, к какому Docker-сокету обращается build-воркер. ⚠️ **backend/devops: добавить в Settings + compose/build-хост.** | `rootless` |
-| `BUILD_EGRESS_NETWORK` | `build_egress_network` | str | worker | **Sprint 4.** Имя изолированной Docker-сети build-контейнера (egress только к egress-proxy/npm-registry, без внутренней сети/интернета). `--network` build-контейнера. ⚠️ **devops: создать сеть в compose + добавить в Settings.** | `lovable_build_egress` |
+| `BUILD_EGRESS_NETWORK` | `build_egress_network` | str | worker | **Sprint 4.** Имя изолированной Docker-сети build-контейнера (egress только к egress-proxy/npm-registry, без внутренней сети/интернета). `--network` build-контейнера. ⚠️ **devops: создать сеть в compose + добавить в Settings.** **Мульти-инстанс:** значение = `name:` сети `build_egress` в compose, символ-в-символ; для клона — своё (см. [Мульти-инстанс / клон сервиса](#мульти-инстанс--клон-сервиса-второй-инстанс-за-тем-же-edge-traefik-adr-018-мульти-инстанс)). | `lovable_build_egress` |
+| `EGRESS_UPLINK_NETWORK` | — (compose-only, **НЕ** поле `Settings`) | str | compose | **Мульти-инстанс.** Имя bridge-сети uplink egress-proxy (`name:` сети `egress_uplink` в compose). Приложение его НЕ читает (в `app/core/config.py` НЕ добавляется). Нужен, чтобы инстансы не делили uplink-сеть egress-proxy. Prod-дефолт (corelysite) — `corelysite_egress_uplink`; клон — своё (см. [Мульти-инстанс / клон сервиса](#мульти-инстанс--клон-сервиса-второй-инстанс-за-тем-же-edge-traefik-adr-018-мульти-инстанс)). | `corelysite_egress_uplink` |
+| `COMPOSE_PROJECT_NAME` | — (compose-only, **НЕ** поле `Settings`) | str | compose | **Мульти-инстанс.** Project-name + префикс image/router/service-имён (см. [Мульти-инстанс / клон сервиса](#мульти-инстанс--клон-сервиса-второй-инстанс-за-тем-же-edge-traefik-adr-018-мульти-инстанс)). Передаётся и как флаг `-p`. Приложение НЕ читает. Дефолт — `corelysite`. | `corelysite` |
 | `NPM_REGISTRY_ALLOWLIST` | `npm_registry_allowlist` | str | worker | **Sprint 4** ([Q-DEPLOY-1](99-open-questions.md#q-deploy-1)). Список хостов npm-registry, пропускаемых egress-proxy (CSV). Прочий egress build-песочницы — DROP. ⚠️ **devops: конфиг egress-proxy + Settings.** | `registry.npmjs.org` |
 | `BUILD_EGRESS_PROXY_URL` | `build_egress_proxy_url` | str | worker | **Sprint 4** ([ADR-010 §C](adr/ADR-010-build-sandbox-rootless-egress.md)). URL egress-proxy (forward-proxy) в `BUILD_EGRESS_NETWORK`, через который build-контейнер ходит к npm-registry. **Транспорт-сторона** allowlist-механизма: воркер инжектит его в build-контейнер как `-e http_proxy=` / `-e https_proxy=` (см. §C / [deploy §1](modules/deploy/03-architecture.md#1-sandbox-исполнение-недоверенного-кода)). Build-сеть `internal` (нет прямого маршрута к registry) → без этого `npm ci` не имеет выхода. Указывает на egress-proxy-сервис, **не** на app-процессы. ⚠️ **devops: значение = адрес egress-proxy-сервиса в compose/сети.** | `http://egress-proxy:3128` |
 | `BUILD_CPU_LIMIT` | `build_cpu_limit` | str | worker | **Sprint 4.** `--cpus` build-контейнера (resource-exhaustion). | `2` |
@@ -302,6 +304,83 @@ Scrape-конфиг Prometheus и provisioning/дашборды Grafana — **к
 - **`deploy`:** SSH (`SSH_HOST`/`SSH_USER`/`SSH_PRIVATE_KEY`) → `cd /opt/corelysite` → `git pull` → `docker compose -f infra/docker-compose.prod.yml --env-file .env up -d --build`. **`--env-file .env` обязателен:** project-directory у compose = каталог compose-файла (`infra/`), поэтому без явного `--env-file` compose ищет `infra/.env`, тогда как реальный `.env` лежит в `/opt/corelysite/.env` → все `${VAR}` blank (в т.ч. `${ROOTLESS_DOCKER_SOCK}` → невалидный volume `:/var/run/docker.sock`) → деплой падает. Явный `--env-file .env` подхватывает `/opt/corelysite/.env` (как ручной деплой). Чужие `/opt/music-backend`, `/opt/edge` не трогаются.
 - **SSH deploy-ключ — секретный конфиг-артефакт:** приватный ключ — **только** в GitHub Secrets (`SSH_PRIVATE_KEY`); публичный — в `~/.ssh/authorized_keys` deploy-пользователя на сервере (провизия — владелец сервера/devops, не в git). Правило конфиг-артефакта — [05-security → Секреты](05-security.md#секреты).
 - **GitHub Secrets (prod) — нормативный список:** `SSH_HOST`, `SSH_USER`, `SSH_PRIVATE_KEY`, `ANTHROPIC_API_KEY`, `ADAPTY_WEBHOOK_SECRET`, `ADAPTY_API_KEY`, `APNS_AUTH_KEY`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`, `POSTGRES_PASSWORD`, `MINIO_ROOT_USER`, `MINIO_ROOT_PASSWORD` (или внешние S3-creds), `SEED_API_KEY`, `APPLE_AUDIENCE`, опц. `SENTRY_DSN`. Имена приложенческих ключей — по [env-контракту](#канонический-список-ключей); список секретов — single normative source [05-security → Секреты](05-security.md#секреты).
+
+## Мульти-инстанс / клон сервиса (второй инстанс за тем же edge-Traefik, [ADR-018 §Мульти-инстанс](adr/ADR-018-prod-deployment-shared-traefik-cicd.md#примечание-мульти-инстанс--клон-сервиса-обратносовместимая-параметризация))
+
+> **Назначение.** Развернуть **второй (и далее) инстанс** того же кода на **том же** хосте, за тем же общим edge-Traefik (внешняя сеть `web`), с **другим доменом** и **своим** набором секретов/ANTHROPIC-ключа, **НЕ ломая** живой инстанс `corelysite.shop`. Первый практический кейс — `nexoraweb.shop` (DNS → тот же сервер). Этот раздел — **нормативный обратносовместимый контракт параметризации** `docker-compose.prod.yml`: каждый параметр получает env-дефолт = текущему `corelysite`-значению, поэтому редеплой живого инстанса без `.env`-переопределений ничего не меняет.
+
+### Инвариант обратной совместимости
+
+Любая параметризация ниже **обязана** иметь дефолт, равный текущему захардкоженному `corelysite`-значению. Критерий: `docker compose -f infra/docker-compose.prod.yml --env-file .env config` для **существующего** `/opt/corelysite/.env` (без новых ключей) даёт **идентичный** результат до и после параметризации (те же имена project/образов/router/сетей). Несоблюдение = регрессия живого прода.
+
+### Что параметризовать в `docker-compose.prod.yml` (построчно, нормативно)
+
+Источник истины по фактическим строкам — сам `infra/docker-compose.prod.yml`; ниже — что обязано стать параметризуемым и с каким дефолтом. Имя инстанс-префикса — единый ключ **`COMPOSE_PROJECT_NAME`** (дефолт `corelysite`).
+
+1. **Project name (`name:` в compose).** Текущее `name: corelysite`. Семантика Compose: при запуске с `-p <X>` / переменной окружения `COMPOSE_PROJECT_NAME=<X>` флаг/переменная **переопределяет** `name:` из файла (приоритет: CLI `-p` > `COMPOSE_PROJECT_NAME` env > `name:` в файле > имя каталога). Поэтому **достаточно** запускать клон как `docker compose -p nexoraweb …` — project-name станет `nexoraweb` **без** правки `name:`. Норматив: `name:` оставить как `corelysite` (или заменить на `name: ${COMPOSE_PROJECT_NAME:-corelysite}` — эквивалентно при запуске без `-p`), но **изоляция project-name достигается флагом `-p` при деплое клона**, а не правкой строки. Это однозначно фиксирует взаимодействие `name:`/`-p`/`COMPOSE_PROJECT_NAME`: для клона **всегда** передавать `-p ${COMPOSE_PROJECT_NAME}`.
+2. **Image-имена.** Текущие `image: corelysite-api:prod` (сервисы `migrate`, `api`) и `image: corelysite-worker:prod` (сервисы `worker`, `beat`). Параметризовать в **`${COMPOSE_PROJECT_NAME:-corelysite}-api:prod`** и **`${COMPOSE_PROJECT_NAME:-corelysite}-worker:prod`** соответственно. Причина: при `--build` каждый инстанс собирает образ под своим тегом; общий тег → билд клона **перезатёр бы** образ живого инстанса (один и тот же локальный image-tag на хосте). Дефолт сохраняет `corelysite-api:prod`/`corelysite-worker:prod` для живого.
+3. **Traefik router/service ИМЯ + Host-правило (сервис `api`).** Текущие лейблы хардкодят имя `corelysite-api` и Host:
+   - `traefik.http.routers.corelysite-api.rule=Host(\`corelysite.shop\`)`
+   - `traefik.http.routers.corelysite-api.entrypoints=websecure`
+   - `traefik.http.services.corelysite-api.loadbalancer.server.port=8000`
+
+   Параметризовать **ИМЯ router/service** в уникальное по инстансу: `traefik.http.routers.${COMPOSE_PROJECT_NAME:-corelysite}-api.…` и `traefik.http.services.${COMPOSE_PROJECT_NAME:-corelysite}-api.…`. **Host-правило** → **`Host(\`${APPS_DOMAIN}\`)`** (НЕ хардкод `corelysite.shop`; `APPS_DOMAIN` уже параметризован в x-app-env с дефолтом `corelysite.shop`). Сохранить без изменений: `entrypoints=websecure`, `loadbalancer.server.port=8000`, `traefik.docker.network=${TRAEFIK_NETWORK}` (= `web`), `traefik.enable=true`. **БЕЗ** собственного `tls=true`/`certresolver` (общий edge-Traefik терминирует TLS+ACME, как для `corelysite` — см. [Prod-модель](#prod-модель-shared-traefik-corelysiteshop-adr-018)). На общей сети `web` уникальные имена router/service + разные `Host(...)` гарантируют отсутствие коллизий маршрутов между инстансами.
+4. **Явные имена сетей `build_egress` / `egress_uplink`.** Текущие `name: corelysite_build_egress` и `name: corelysite_egress_uplink`. Параметризовать в **`name: ${BUILD_EGRESS_NETWORK:-corelysite_build_egress}`** (ключ `BUILD_EGRESS_NETWORK` уже существует в x-app-env с тем же дефолтом — теперь его значение используется и в блоке `networks:`, символ-в-символ) и в новый env-ключ **`name: ${EGRESS_UPLINK_NETWORK:-corelysite_egress_uplink}`**. Причина: build-egress-сети инстансов **обязаны** быть РАЗНЫМИ (инстансы не делят egress-границу build-песочницы); общее имя сети → инстансы делили бы одну Docker-сеть. `BUILD_EGRESS_NETWORK` (x-app-env, передаётся воркеру) и `name:` сети `build_egress` обязаны иметь **одно значение** — иначе воркер создаёт build-контейнеры в одной сети, а compose объявляет другую.
+   - **Новый env-ключ `EGRESS_UPLINK_NETWORK`** добавляется в [env-контракт](#канонический-список-ключей): str, потребитель — compose (НЕ поле `Settings`; приложение его не читает), назначение — имя bridge-сети uplink egress-proxy, дефолт `corelysite_egress_uplink`. (Не приложенческий ключ → в `Settings`/`app/core/config.py` не добавляется.)
+
+> **`web` НЕ параметризуется по инстансу:** сеть `web` (`external: true`, `name: web`) — **общая** для всех инстансов (один edge-Traefik). Остаётся `TRAEFIK_NETWORK=web` у обоих. Изоляция между инстансами на `web` достигается уникальными router/service-именами + разными `Host(...)`, НЕ разными сетями. Сети `default`, тома `pgdata`/`redis-data`/`minio-data` префиксуются project-name **автоматически** (Compose добавляет `<project>_` к именованным сетям/томам без явного `name:`) → данные инстансов изолированы без правок.
+
+### `.env`-контракт клона (изоляция инстанса)
+
+Клон деплоится со **своим** `.env` (в своём каталоге, см. процедуру). Ключи, обязательные к переопределению относительно `corelysite`-дефолтов (имена — по [env-контракту](#канонический-список-ключей), символ-в-символ):
+
+| Ключ | Значение для клона `nexoraweb` | Почему |
+|---|---|---|
+| `COMPOSE_PROJECT_NAME` | `nexoraweb` | Префикс project/образов/router/сетей/томов; передаётся и как `-p nexoraweb`. |
+| `APPS_DOMAIN` | `nexoraweb.shop` | Host API-роутера + домен сгенерированных сайтов (`app/deploy/routing.py` берёт `settings.apps_domain` → `Host(nexoraweb.shop) && PathPrefix(/s/{id})` автоматически). |
+| `ANTHROPIC_API_KEY` | новый валидный ключ клона | Отдельный LLM-биллинг инстанса. |
+| `POSTGRES_PASSWORD` | **новый**, сгенерирован на сервере | Свой Postgres-том; НЕ переиспользовать секрет `corelysite`. |
+| `POSTGRES_USER` / `POSTGRES_DB` | на усмотрение (можно те же логические имена — тома изолированы project-name) | Изоляция БД — через префикс тома `nexoraweb_pgdata`, не через имя БД. |
+| `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | **новые**, сгенерированы на сервере | Свой MinIO-том (`nexoraweb_minio-data`); НЕ переиспользовать. |
+| `SEED_API_KEY` | **новый**, сгенерирован на сервере | Свой bootstrap-пользователь инстанса. |
+| `ADAPTY_WEBHOOK_SECRET` / `ADAPTY_API_KEY` | свои (или плейсхолдеры, если billing клона не активен) | Изоляция billing-инстанса. |
+| `BUILDS_ROOT` | отдельный путь, напр. `/var/builds-nexora` | НЕ общий с `corelysite` (`/var/builds`) — изоляция build-workspace; host-каталог провижится отдельно (см. ниже). |
+| `SITES_HOST_ROOT` | отдельный путь, напр. `/srv/sites-nexora` | НЕ общий с `corelysite` (`/srv/sites`) — изоляция статики сайтов; провижится отдельно. |
+| `BUILD_EGRESS_NETWORK` | `nexoraweb_build_egress` | Своя egress-сеть build-песочницы (значение = `name:` сети `build_egress` клона). |
+| `EGRESS_UPLINK_NETWORK` | `nexoraweb_egress_uplink` | Своя uplink-сеть egress-proxy. |
+| `TRAEFIK_NETWORK` | `web` (**как у corelysite**) | Общий edge-Traefik — единственная разделяемая сеть. |
+| `ENVIRONMENT` | `prod` | Прод-режим. |
+| `SITE_ROUTING_MODE` | `path` | Path-based routing (`/s/{site_id}` на `APPS_DOMAIN`), как corelysite. |
+| `SITE_ROUTER_PRIORITY` | как у `corelysite` (по тому же env-контракту/коду) | Приоритет path-router (ADR-017 §Fix). Значение НЕ менять между инстансами без причины — берётся из того же источника, что для corelysite. |
+| `DOCKER_GID` / `ROOTLESS_DOCKER_SOCK` | как на этом хосте (значения хоста, общие) | Хостовые параметры rootless-демона — общие для хоста (см. инвариант ниже). |
+
+Остальные ключи (`AGENT4_MODEL`, лимиты бюджета, `SSE_*`, `APNS_*`, `SENTRY_DSN` и т.д.) — по [env-контракту](#канонический-список-ключей), значения на усмотрение оператора клона (дефолты compose применимы). Секреты клона — **только** в его `.env` на сервере (encrypted-at-rest, [05-security → Секреты](05-security.md#секреты)), в git не коммитятся.
+
+### Провижининг клона
+
+1. **Host-каталоги `BUILDS_ROOT`/`SITES_HOST_ROOT` клона** (напр. `/var/builds-nexora`, `/srv/sites-nexora`) создаются **до** старта worker клона с ownership «worker uid 10001 пишет / rootless-демон читает-монтирует» — **по той же топологии и тому же инварианту path-consistency**, что для `corelysite` ([§ Провижининг build-workspace](#провижининг-build-workspace-и-sites-каталога-host-bind-path-consistency--прод-фикс-2026-06-04)), но **своими путями**. Каталоги инстансов НЕ пересекаются.
+2. **Миграции** — через **свой** `migrate`-сервис клона (`alembic upgrade head` против Postgres клона; one-shot, как у corelysite). Project-изоляция тома → отдельная БД инстанса.
+3. **Seed-пользователь** — через **свой** `SEED_API_KEY` клона, тем же механизмом bootstrap, что у corelysite (`SEED_API_KEY` → seeded Bearer-ключ единственного S1-пользователя, [env-контракт](#канонический-список-ключей) строка `SEED_API_KEY`, [ADR-008](adr/ADR-008-indexed-api-key-lookup.md)). Сверка фактического механизма сидинга — по коду/процедуре corelysite.
+
+### Инварианты, которые НЕ ломаются
+
+- Оба инстанса делят внешнюю сеть **`web`** и общий **edge-Traefik**; коллизий маршрутов нет за счёт **разных router/service-имён** (`${COMPOSE_PROJECT_NAME}-api`) + **разных `Host(...)`** (`APPS_DOMAIN`).
+- **Build-egress-сети РАЗНЫЕ** (`*_build_egress` / `*_egress_uplink` по инстансу) — egress-граница build-песочницы каждого инстанса изолирована ([ADR-010 §C](adr/ADR-010-build-sandbox-rootless-egress.md)).
+- Общий **`/var/run/docker.sock`** (rootless, `ROOTLESS_DOCKER_SOCK`) — оба воркера создают сайт-контейнеры через один rootless-демон хоста, но с **разными Host/PathPrefix-роутерами** (домен per-инстанс через `APPS_DOMAIN`) → сайты разных инстансов не конфликтуют. Path-consistency host-bind'ов соблюдается **своими** путями каждого инстанса.
+- Generated-site routing — per-домен через `APPS_DOMAIN` (`app/deploy/routing.py` берёт `settings.apps_domain`) → клон автоматически получает `Host(nexoraweb.shop) && PathPrefix(/s/{site_id})`.
+
+### Процедура деплоя клона (нормативная)
+
+1. `git clone` репозитория в **отдельный** каталог, напр. `/opt/nexoraweb` (чужие `/opt/corelysite`, `/opt/music-backend`, `/opt/edge` не трогать).
+2. Создать **свой** `/opt/nexoraweb/.env` по `.env`-контракту клона выше (свои секреты сгенерированы на сервере; ANTHROPIC-ключ клона; свои `BUILDS_ROOT`/`SITES_HOST_ROOT`/`*_egress`-сети/`APPS_DOMAIN`/`COMPOSE_PROJECT_NAME`).
+3. Провижининг host-каталогов клона (`BUILDS_ROOT`/`SITES_HOST_ROOT` клона) с нужным ownership — **до** `compose up`.
+4. Деплой: `docker compose -p nexoraweb -f infra/docker-compose.prod.yml --env-file .env up -d --build`. `-p nexoraweb` изолирует project-name; `--env-file .env` обязателен (та же причина, что для corelysite — project-directory compose = каталог compose-файла `infra/`, [Prod-модель → CI/CD](#cicd-контракт-github-actions-adr-018)).
+5. Миграции выполнит свой `migrate`-сервис (гейт перед api/worker/beat); при необходимости — явный one-shot прогон.
+6. Верификация: API клона отвечает `/healthz` через `https://nexoraweb.shop` (TLS-сертификат выпускает общий edge-Traefik для нового домена); живой `corelysite.shop` продолжает отвечать без изменений; сгенерированный сайт клона доступен по `https://nexoraweb.shop/s/{site_id}/`.
+
+### CI/CD клона (решение)
+
+Текущий GitHub Actions workflow деплоит **только** в `/opt/corelysite` ([CI/CD-контракт](#cicd-контракт-github-actions-adr-018)). Для клона на старте **достаточно ручного деплоя** на сервере (процедура выше) — это **нормативное минимальное решение**, отдельный CI для клона **не вводится** в этой итерации. Параметризация workflow под несколько таргетов (matrix по `{каталог, project-name, env-файл}`) — **возможная** будущая работа devops, **НЕ требуется** для запуска `nexoraweb`. Зафиксировано как [Q-DEPLOY-4](99-open-questions.md#q-deploy-4) (не блокирует запуск клона: ответ нужен только если потребуется автоматизировать деплой второго инстанса).
 
 ## Прод-топология
 

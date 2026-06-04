@@ -283,7 +283,7 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.api
-    image: corelysite-api:prod
+    image: ${COMPOSE_PROJECT_NAME:-corelysite}-api:prod
     environment:
       <<: *app-env
     depends_on:
@@ -309,7 +309,7 @@ services:
     build:
       context: ..
       dockerfile: infra/Dockerfile.api
-    image: corelysite-api:prod
+    image: ${COMPOSE_PROJECT_NAME:-corelysite}-api:prod
     environment:
       <<: *app-env
     depends_on:
@@ -332,9 +332,13 @@ services:
       - "traefik.enable=true"
       # Traefik берёт IP контейнера в сети web (общий edge-Traefik подключён к web).
       - "traefik.docker.network=web"
-      # PROD router: Host(corelysite.shop) на websecure (docs/07 стр. 226, ADR-018).
-      - "traefik.http.routers.corelysite-api.rule=Host(`corelysite.shop`)"
-      - "traefik.http.routers.corelysite-api.entrypoints=websecure"
+      # PROD router: Host(APPS_DOMAIN) на websecure (docs/07 стр. 226/322-327, ADR-018).
+      # Мульти-инстанс (docs/07 §«Что параметризовать» п.3): ИМЯ router/service
+      # параметризовано через COMPOSE_PROJECT_NAME (дефолт corelysite -> corelysite-api),
+      # Host-правило через APPS_DOMAIN (дефолт corelysite.shop) — уникальные имена +
+      # разные Host(...) исключают коллизии маршрутов инстансов на общей сети web.
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-corelysite}-api.rule=Host(`${APPS_DOMAIN:-corelysite.shop}`)"
+      - "traefik.http.routers.${COMPOSE_PROJECT_NAME:-corelysite}-api.entrypoints=websecure"
       # TLS-терминацию и ACME (Let's Encrypt для corelysite.shop) несёт ОБЩИЙ
       # edge-Traefik владельца: его websecure-entrypoint уже терминирует TLS.
       # Поэтому НЕ навешиваем ни router-level tls=true, ни certresolver — это
@@ -342,7 +346,7 @@ services:
       # Router-level tls=true без certresolver на общем edge может дать self-signed
       # серт вместо ожидаемого Let's Encrypt. Нормативный набор лейблов — без них.
       # Бэкенд-порт uvicorn (Dockerfile.api EXPOSE 8000).
-      - "traefik.http.services.corelysite-api.loadbalancer.server.port=8000"
+      - "traefik.http.services.${COMPOSE_PROJECT_NAME:-corelysite}-api.loadbalancer.server.port=8000"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
       interval: 15s
@@ -416,7 +420,7 @@ services:
       dockerfile: infra/Dockerfile.worker
       args:
         DOCKER_GID: ${DOCKER_GID:-999}
-    image: corelysite-worker:prod
+    image: ${COMPOSE_PROJECT_NAME:-corelysite}-worker:prod
     environment:
       <<: *app-env
     depends_on:
@@ -492,7 +496,7 @@ services:
   # PROD: только default (БД/Redis); сайт-контейнеры не создаёт -> web не нужна.
   # ----------------------------------------------------------------------------
   beat:
-    image: corelysite-worker:prod
+    image: ${COMPOSE_PROJECT_NAME:-corelysite}-worker:prod
     environment:
       <<: *app-env
     depends_on:
@@ -551,16 +555,21 @@ networks:
   # => нет выхода в интернет/внутреннюю сеть; build-контейнер сидит ТОЛЬКО в ней,
   # единственный путь наружу — egress-proxy. Имя фиксировано и обязано совпадать
   # с BUILD_EGRESS_NETWORK (x-app-env) символ-в-символ.
+  # Мульти-инстанс (docs/07 §«Что параметризовать» п.4): имена egress-сетей
+  # параметризованы — инстансы НЕ делят egress-границу build-песочницы. Дефолты =
+  # текущие corelysite-значения. BUILD_EGRESS_NETWORK (x-app-env) и name: сети
+  # build_egress обязаны совпадать символ-в-символ (общий дефолт corelysite_build_egress).
   build_egress:
-    name: corelysite_build_egress
+    name: ${BUILD_EGRESS_NETWORK:-corelysite_build_egress}
     driver: bridge
     internal: true
     ipam:
       config:
         - subnet: 172.31.0.0/16
   # egress_uplink — обычный bridge, даёт ТОЛЬКО egress-proxy выход к npm-registry.
+  # EGRESS_UPLINK_NETWORK — compose-only ключ (docs/07 env-контракт), приложение не читает.
   egress_uplink:
-    name: corelysite_egress_uplink
+    name: ${EGRESS_UPLINK_NETWORK:-corelysite_egress_uplink}
     driver: bridge
 
 volumes:
