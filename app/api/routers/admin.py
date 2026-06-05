@@ -2,7 +2,8 @@
 
 Все эндпоинты:
   - защищены require_admin (заголовок X-Admin-Key, НЕ Bearer);
-  - скрыты из публичной схемы (include_in_schema=False на роутере) — как /metrics/healthz;
+  - видимы в публичной схеме под тегом «Администрирование» (ADR-021 revision); security
+    AdminKey навешивается per-operation в app.openapi() (main.py), защита — X-Admin-Key;
   - возвращают RFC-7807 при ошибках.
 
 POST /admin/login-as                — выпустить пользовательский Bearer за user_id (без Apple).
@@ -28,10 +29,11 @@ from app.schemas.api import (
 )
 from app.services import admin_service, billing_service
 
-# include_in_schema=False на уровне роутера → ни один /v1/admin/* не попадает в /openapi.json
-# и /docs (ADR-021 §C, docs/admin §4). Кастомный openapi() в main.py итерирует app.routes —
-# роуты с include_in_schema=False исключаются из схемы автоматически, B.7-чистота сохраняется.
-router = APIRouter(prefix="/admin", include_in_schema=False)
+# Видимы в публичной схеме под тегом «Администрирование» (ADR-021 revision): операторские
+# операции, требуют ADMIN_API_KEY (X-Admin-Key) — НЕ Bearer. Кастомный openapi() в main.py
+# навешивает per-operation security AdminKey на /v1/admin/* (вместо глобального BearerAuth),
+# чтобы Authorize в Swagger принимал админ-ключ. Защита — X-Admin-Key при любой видимости.
+router = APIRouter(prefix="/admin", tags=["Администрирование"])
 
 
 @router.post(
@@ -46,11 +48,7 @@ async def login_as(
     session: SessionDep,
     _admin: RequireAdmin,
 ) -> AdminLoginAsResponse:
-    """Выпускает свежий Bearer за user_id (создаёт пользователя без Apple, если его нет).
-
-    user_id задан и есть → токен за него; задан и нет → создать с этим идентификатором;
-    опущен → сгенерировать новый и создать. Ключ возвращается один раз.
-    """
+    """Выпускает Bearer за user_id"""
     result = await admin_service.login_as(
         session,
         user_id=body.user_id,

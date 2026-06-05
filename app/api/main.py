@@ -93,6 +93,10 @@ _OPENAPI_TAGS = [
         "name": "Биллинг",
         "description": "Тариф, остаток квоты, приём событий магазина подписок.",
     },
+    {
+        "name": "Администрирование",
+        "description": ("Операторские операции"),
+    },
 ]
 
 
@@ -161,19 +165,24 @@ app.include_router(jobs.router, prefix="/v1")
 app.include_router(billing.router, prefix="/v1")
 # Sprint 5: регистрация APNs устройств (ADR-013).
 app.include_router(devices.router, prefix="/v1")
-# ADR-021: операторская админ-плоскость (X-Admin-Key, скрыта из публичной схемы —
-# include_in_schema=False на роутере; B.7-чистота /openapi.json не затрагивается).
+# ADR-021 (revision): операторская админ-плоскость под тегом «Администрирование» — видима в
+# публичной схеме, защищена X-Admin-Key (per-operation security AdminKey, см. _custom_openapi).
 app.include_router(admin.router, prefix="/v1")
 
 
 def _custom_openapi() -> dict[str, Any]:
-    """OpenAPI с HTTP-Bearer security-схемой (B.6).
+    """OpenAPI с security-схемами (B.6).
 
     FastAPI не выводит securityScheme автоматически (auth — кастомная dependency, не
     `Security(...)`), поэтому кнопка Authorize в Swagger UI ничего не привязывала к запросам.
-    Объявляем `BearerAuth` (http/bearer) и глобальное `security`, чтобы введённый в Authorize
-    ключ уходил как `Authorization: Bearer <api-key>` на «Try it out». Эндпоинты без Bearer
-    (`/auth/apple`, webhook) принимают лишний заголовок безвредно.
+    Объявляем `BearerAuth` (http/bearer) глобально → введённый в Authorize ключ уходит как
+    `Authorization: Bearer <api-key>` на «Try it out». Эндпоинты без Bearer (`/auth/apple`,
+    webhook) принимают лишний заголовок безвредно.
+
+    Админ-плоскость (`/v1/admin/*`, ADR-021 revision) использует ОТДЕЛЬНУЮ схему `AdminKey`
+    (apiKey в заголовке `X-Admin-Key`): для этих путей глобальный BearerAuth переопределяется
+    per-operation на `[{AdminKey: []}]`, чтобы в Authorize появилось отдельное поле админ-ключа
+    и «Try it out» слал `X-Admin-Key`, а не Bearer.
     """
     if app.openapi_schema:
         return app.openapi_schema
@@ -190,9 +199,21 @@ def _custom_openapi() -> dict[str, Any]:
             "type": "http",
             "scheme": "bearer",
             "description": "API-ключ `lv_<key_id>_<secret>` из `POST /v1/auth/apple`.",
-        }
+        },
+        "AdminKey": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Admin-Key",
+            "description": "Операторский ключ `ADMIN_API_KEY` для эндпоинтов «Администрирование».",
+        },
     }
     schema["security"] = [{"BearerAuth": []}]
+    # Админ-пути требуют X-Admin-Key (НЕ Bearer): переопределяем security per-operation.
+    for path, item in schema.get("paths", {}).items():
+        if path.startswith("/v1/admin/"):
+            for operation in item.values():
+                if isinstance(operation, dict):
+                    operation["security"] = [{"AdminKey": []}]
     app.openapi_schema = schema
     return schema
 
