@@ -47,6 +47,11 @@ STRICT_JSON_SUFFIX = (
     "Return STRICTLY raw JSON of the required structure. NO markdown fences "
     "(``` or ```json), NO explanations/prefixes/prose before or after the JSON. "
     "The first character of your response must be { or [, and the last must be } or ]."
+    "\n\n"
+    "Inside every JSON string value, any double-quote character MUST be escaped as "
+    "\\\". Prefer single quotes ' or typographic quotes “ ” for quotations "
+    "and examples inside string values, so you do not produce unescaped quotes "
+    "(e.g. write 'Where every cup tells a story', never an unescaped \"...\")."
 )
 
 
@@ -66,12 +71,25 @@ def extract_json(text: str) -> Any:
     сбалансированный JSON-объект/массив (срезает ведущую/хвостовую прозу), затем json.loads.
     Минимально, версионно-устойчиво, без regex-парсинга всего тела. Бросает ValueError, если
     валидный JSON извлечь не удалось.
+
+    Repair-fallback (ADR-026, §I.2): строгий json.loads — ОСНОВНОЙ путь (на валидном JSON
+    поведение байт-в-байт прежнее). ТОЛЬКО при JSONDecodeError применяется узкая эвристика
+    экранирования неэкранированных внутренних двойных кавычек, затем json.loads повторяется
+    на починенной строке. При ПОВТОРНОМ падении — прежний ValueError (parse_error). Repair
+    строго fallback; доменная валидация (validate-колбэк выше по стеку) не затрагивается.
     """
     stripped = _strip_code_fence(text.strip())
     candidate = _first_balanced_json(stripped)
     if candidate is None:
         raise ValueError("no balanced JSON object/array found in model text")
-    return json.loads(candidate)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        # Уровень 2 defense-in-depth (ADR-026): чиним только неэкранированные внутренние
+        # двойные кавычки. Повторный парс; при повторном падении пробрасываем исходный
+        # parse_error (поведение/класс фейла §I.2 не меняется).
+        repaired = _repair_unescaped_inner_quotes(candidate)
+        return json.loads(repaired)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -128,6 +146,72 @@ def _first_index_of_any(text: str, chars: str) -> int | None:
     indices = [text.find(c) for c in chars]
     found = [i for i in indices if i != -1]
     return min(found) if found else None
+
+
+# Структурные символы JSON, после которых (за опц. пробелами) `"` — легальное закрытие строки
+# (строка-ключ перед `:`, строка-значение/элемент перед `,` `}` `]`). См. pipeline §I.2.
+_STRING_CLOSERS = frozenset(":,}]")
+
+
+def _repair_unescaped_inner_quotes(text: str) -> str:
+    """Узкая эвристика ADR-026 (pipeline §I.2): экранирует неэкранированные внутренние `"`.
+
+    Поверх той же машины строк/экранирования, что `_first_balanced_json` (трекинг
+    `in_string`/`escaped`), но с трансформацией и look-ahead-дисамбигуацией. Внутри строкового
+    литерала встреченный неэкранированный `"`:
+      - ЛЕГАЛЬНОЕ ЗАКРЫТИЕ — если за ним (после опц. пробелов/таб/\\n/\\r) следует структурный
+        символ JSON `:`/`,`/`}`/`]` ИЛИ конец входа → строка закрывается, кавычка НЕ экранируется;
+      - ВНУТРЕННЯЯ КАВЫЧКА — иначе (любой другой непробельный символ) → экранируется в `\\"`,
+        `in_string` остаётся True.
+
+    Намеренно узкая: чинит ТОЛЬКО внутренние двойные кавычки. Trailing comma, одинарные кавычки
+    как делимитеры, комментарии НЕ чинятся (parse_error → retry сохраняется, ADR-026 §Границы).
+    """
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    n = len(text)
+    for i in range(n):
+        ch = text[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            continue
+        # Внутри строкового литерала.
+        if escaped:
+            escaped = False
+            out.append(ch)
+            continue
+        if ch == "\\":
+            escaped = True
+            out.append(ch)
+            continue
+        if ch == '"':
+            if _is_legal_string_close(text, i + 1):
+                in_string = False
+                out.append(ch)
+            else:
+                # Внутренняя неэкранированная кавычка → экранируем, строка не закрывается.
+                out.append('\\"')
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _is_legal_string_close(text: str, pos: int) -> bool:
+    """True, если `"` в позиции pos-1 — легальное закрытие строки (pipeline §I.2 look-ahead).
+
+    Легально, если после опц. пробелов (` `/\\t/\\n/\\r) с pos идёт структурный символ JSON
+    (`:`/`,`/`}`/`]`) либо конец входа. Иначе — внутренняя кавычка (содержимое string value).
+    """
+    n = len(text)
+    j = pos
+    while j < n and text[j] in " \t\n\r":
+        j += 1
+    if j >= n:
+        return True
+    return text[j] in _STRING_CLOSERS
 
 
 class StructuredOutputError(ValueError):
