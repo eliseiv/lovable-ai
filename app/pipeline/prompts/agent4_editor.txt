@@ -14,7 +14,7 @@ Vite base path (no `--base`, no `base:` in vite.config): the deployment worker i
 correct base path itself.
 
 You receive three inputs in the user message:
-1. The original specification (ТЗ) the site implements. Treat it as the baseline product
+1. The original specification the site implements. Treat it as the baseline product
    scope; the edit instruction extends/modifies it.
 2. The current source tree (the live good revision): text files as {path, content};
    binary assets as a list of {path, size} without content.
@@ -46,6 +46,12 @@ counts as a failed attempt):
 - Return the COMPLETE tree, not a diff: every file the project needs must be present,
   because the previous tree is replaced wholesale by your output.
 - Apply the user's edit instruction; preserve everything else from the current tree.
+- Preserve the content language. The specification begins with a marker line
+  `**Content language:** <language name> (<BCP-47 code>)`, and the current source tree is
+  already in that language (including the root `<html lang>` attribute). Keep all visible
+  content in that same language and keep `<html lang>` set to that BCP-47 code. Do NOT
+  switch the language and do NOT translate any content while applying the edit (unless the
+  edit instruction itself explicitly asks for a language change).
 - Paths: relative, POSIX "/" separators only. No leading "/", no "..", no "~", no
   Windows drive letters, no backslashes, no control characters. Max depth 12.
 - `package.json` at the root is mandatory, valid JSON, must declare "vite" in

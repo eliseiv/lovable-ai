@@ -24,6 +24,11 @@ from app.pipeline.prompts import load_prompt
 
 _SYSTEM_PROMPT = load_prompt("agent2_spec_writer")
 
+# Маркер языка контента, которым ОБЯЗАН начинаться spec_markdown (ADR-025, §Язык/локализация,
+# §I.1a). Прокидывает detected content language downstream через уже передаваемый spec_markdown
+# (Agent 3 извлекает из него BCP-47 для <html lang>); новых колонок/полей/параметров НЕ вводится.
+_CONTENT_LANGUAGE_MARKER = "**Content language:**"
+
 
 @dataclass(frozen=True)
 class Agent2Result:
@@ -41,16 +46,29 @@ def _build_user_content(prompt: str, qa_pairs: list[tuple[str, str]]) -> str:
 
 
 def _validate_spec(data: Any) -> str:
-    """Доменная валидация структуры Agent 2 поверх извлечённого JSON (ADR-020 §I.2): непустая спека.
+    """Доменная валидация структуры Agent 2 поверх извлечённого JSON (ADR-020 §I.2).
 
-    Нарушение → schema-фейл (re-семплируемый; на исчерпании — FAILED(invalid_agent_output)).
+    Проверяет: (1) непустую спеку под ключом `spec_markdown` (§I.1a); (2) что спека
+    НАЧИНАЕТСЯ маркером языка контента `**Content language:**` (ADR-025, §Язык/локализация,
+    §I.5 — минимальная валидная форма теперь С маркером). Маркер живёт внутри значения
+    `spec_markdown`; top-level ключ output не меняется.
+
+    Любое нарушение → тот же schema-фейл, что и для прочих нарушений контракта Agent 2
+    (re-семплируемый; на исчерпании — FAILED(invalid_agent_output)).
     """
     spec = data.get("spec_markdown") if isinstance(data, dict) else None
     if not isinstance(spec, str) or not spec.strip():
         raise StructuredOutputError(
             "agent2 produced an empty specification", fail_class=FAIL_CLASS_SCHEMA
         )
-    return spec.strip()
+    spec = spec.strip()
+    if not spec.startswith(_CONTENT_LANGUAGE_MARKER):
+        raise StructuredOutputError(
+            "agent2 spec_markdown must begin with the "
+            f"'{_CONTENT_LANGUAGE_MARKER}' content-language marker (ADR-025)",
+            fail_class=FAIL_CLASS_SCHEMA,
+        )
+    return spec
 
 
 async def run_agent2(

@@ -14,6 +14,10 @@ Rules:
   are decided automatically downstream.
 - Prefer free-text questions. Use a "choice" question only when there is a small, fixed
   set of mutually exclusive options that genuinely covers the space.
+- Ask the clarifying questions (their "text" and any "options") in the SAME language as
+  the user's original prompt, so the user answers in that same language. Do NOT switch to
+  another language and do NOT default to any fixed language. (This keeps the Q&A
+  single-language so the downstream content-language detection stays clean.)
 
 Output format: respond with a single JSON object and nothing else. The object has
 EXACTLY one top-level key, named EXACTLY "questions" (not "items", not "list"). Schema:

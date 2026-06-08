@@ -93,7 +93,12 @@ def _wire3(monkeypatch, responses):  # noqa: ANN001, ANN202
 
 
 async def test_agent2_returns_stripped_spec(settings, monkeypatch):
-    _wire2(monkeypatch, [{"spec_markdown": "  # Spec\nbody  "}])
+    # Каноническая форма §I.1a (ADR-025): spec_markdown начинается маркером **Content language:**.
+    # Ведущие/хвостовые пробелы по краям всего значения strip'аются валидатором (§I.5 сценарий 3:
+    # `\n\n**Content language:**…` → strip → проходит startswith).
+    spec_in = "  **Content language:** English (en)\n# Spec\nbody  "
+    spec_out = "**Content language:** English (en)\n# Spec\nbody"
+    _wire2(monkeypatch, [{"spec_markdown": spec_in}])
     before, after, on_fail, st = _hooks()
     result = await agent2.run_agent2(
         settings,
@@ -103,7 +108,7 @@ async def test_agent2_returns_stripped_spec(settings, monkeypatch):
         after_call=after,
         on_attempt_failure=on_fail,
     )
-    assert result.spec_markdown == "# Spec\nbody"
+    assert result.spec_markdown == spec_out
     assert result.call.cost_usd == Decimal("0.0001")
     assert st["before"] == 1 and st["after"] == 1
 

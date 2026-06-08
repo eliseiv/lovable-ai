@@ -210,7 +210,10 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
         await before_call()
         call = _call()
         await after_call(call)
-        return Agent2Result(spec_markdown="# Spec\nCoffee shop landing.", call=call)
+        return Agent2Result(
+            spec_markdown="**Content language:** English (en)\n\n# Spec\nCoffee shop landing.",
+            call=call,
+        )
 
     async def _fake_agent3(settings, spec, *, before_call, after_call, on_attempt_failure):  # noqa: ANN001, ANN202
         await before_call()

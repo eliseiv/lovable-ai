@@ -98,15 +98,20 @@ def test_agent1_validator_reads_questions_key():
 
 
 def test_agent2_validator_reads_spec_markdown_key():
-    """agent2 `_validate_spec` читает `spec_markdown` — НЕ `spec`/`specification` (инцидент)."""
+    """agent2 `_validate_spec` читает `spec_markdown` — НЕ `spec`/`specification` (инцидент).
+
+    Каноническая форма §I.1a (ADR-025): значение `spec_markdown` ОБЯЗАНО начинаться маркером
+    `**Content language:**` — иначе schema-фейл (см. negative-тест маркера ниже).
+    """
     from app.pipeline.agents.structured import StructuredOutputError
 
-    assert _validate_spec({"spec_markdown": "# Spec"}) == "# Spec"
+    spec = "**Content language:** English (en)\n\n# Spec"
+    assert _validate_spec({"spec_markdown": spec}) == spec
     # Ровно та форма, что трижды вернула модель в инциденте, → schema-фейл (валидатор не читает их).
     with pytest.raises(StructuredOutputError):
-        _validate_spec({"spec": "# Spec"})
+        _validate_spec({"spec": spec})
     with pytest.raises(StructuredOutputError):
-        _validate_spec({"specification": "# Spec"})
+        _validate_spec({"specification": spec})
 
 
 def test_agent3_validator_reads_files_entry_build_keys(settings):  # noqa: ANN001
@@ -154,8 +159,14 @@ def test_agent1_canonical_minimal_form_validates():
 
 
 def test_agent2_canonical_minimal_form_validates():
-    """§I.1a Agent 2: {"spec_markdown":"# x"} → ok (закрывает инцидент «empty specification»)."""
-    assert _validate_spec({"spec_markdown": "# x"}) == "# x"
+    """§I.1a Agent 2: каноническая минимальная форма (С маркером §Язык/локализация, ADR-025)
+    → ok без schema-фейла (закрывает инцидент «empty specification» И требование маркера).
+
+    Канон §I.1a колонка «Минимальный валидный объект»:
+    `{"spec_markdown":"**Content language:** English (en)\\n\\n# Specification\\n…"}`.
+    """
+    spec = "**Content language:** English (en)\n\n# x"
+    assert _validate_spec({"spec_markdown": spec}) == spec
 
 
 def test_agent3_canonical_minimal_form_validates(settings):  # noqa: ANN001

@@ -39,7 +39,7 @@ stateDiagram-v2
 | Агент | Вход | Выход | Очередь |
 |---|---|---|---|
 | **Agent 1 (Interviewer)** | промт | список уточняющих вопросов → `questions` | llm |
-| **Agent 2 (Spec writer)** | промт + ответы | финальная спека (`spec_tz`/`spec_ref`) | llm |
+| **Agent 2 (Spec writer)** | промт + ответы | финальная спека (`spec_tz`/`spec_ref`); `spec_markdown` **обязан** начинаться маркером `**Content language:**` (§Язык/локализация) | llm |
 | **Agent 3 (Builder)** | спека | дерево файлов проекта → `source.tgz` в S3 (контракт ниже) | llm |
 | **Agent 4 (Fixer)** | спека + дерево исходников (последняя ревизия **текущей джобы**, §A) + `failure_log` из S3 | патч дерева → новый `source.tgz`, **либо** сигнал «неисправимо» | llm |
 
@@ -131,6 +131,46 @@ stateDiagram-v2
 
 ### Переиспользование Agent 4
 Та же схема и валидация применяются к output Agent 4 (вход = текущее дерево + лог фейла, выход = пропатченное дерево). Невалидный патч Agent 4 — это **fix-неудача, которая НЕ инкрементирует `retry_count`**: `retry_count++` происходит только при *применённом* патче (переход `FIXING → BUILDING`, единственный нормативный источник правила — §C(a)). Бесконечный цикл невалидных патчей обрывается не `retry_count`, а гардами no-progress §C(d) / budget §C(b) / wall-clock §C(c). Класс фейла такого витка — `agent_output_invalid` (см. §A «Выход», §C(d), ADR-005).
+
+---
+
+## Язык/локализация контента сайта ([ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md))
+
+> **Нормативный single source of truth** механики определения и прокидывания языка user-facing контента сгенерированного сайта. Продуктовое решение — [08 §Локализация](../../08-product-decisions.md#локализация--язык-сгенерированного-сайта-adr-025). Прод-баг: сайт выходил на русском при английском вводе пользователя (корень — кириллица/локаль-термины в эталонных примерах промтов смещали язык генерации; язык пользователя нигде не детектился; `<html lang>` не выставлялся).
+
+**Принцип:** язык контента сайта = **язык, на котором отвечает пользователь** (авто-детект из текста, БЕЗ изменения API, БЕЗ миграции БД, БЕЗ нового параметра в сигнатурах `agentN.py`).
+
+**Механизм (нормативно):**
+
+1. **Детект — один раз Agent 2 (Spec writer).** Agent 2 — единственный агент, видящий **весь** пользовательский ввод (оригинальный промпт + Q&A-ответы), поэтому язык определяется **им**. Agent 2 пишет **весь** user-facing контент спеки на этом языке и **обязан** начинать `spec_markdown` явной строкой-маркером:
+
+   ```
+   **Content language:** <название языка + BCP-47 код>
+   ```
+   Пример: `**Content language:** English (en)`. Это первые символы **значения** строкового поля `spec_markdown` (top-level ключ output Agent 2 не меняется — остаётся `spec_markdown`, §I.1a).
+
+2. **Приоритет при расхождении:** язык **ответов** пользователя на уточняющие вопросы важнее языка оригинального промпта (часть контракта Agent 2). Ответы — более свежий сигнал; промпт мог быть на одном языке, ответы — на другом.
+
+3. **Прокидывание — через уже передаваемый `spec_markdown`.** Маркер живёт внутри `spec_markdown` (inline `spec_tz` / `spec_ref` в S3), который и так подаётся downstream. **Новая колонка/поле/параметр сигнатуры НЕ вводится.**
+
+4. **Agent 3 (Builder):** генерит **весь** видимый контент сайта на языке маркера `**Content language:**` из спеки и выставляет корневой `<html lang="<bcp-47>">` (BCP-47-код извлекается из маркера).
+
+5. **Agent 4 (Fixer/Editor):** **сохраняет** язык контента (не переключает, не переводит) — маркер в той же неизменной спеке остаётся источником языка и для fix-витка, и для edit-витка.
+
+6. **Agent 1 (Interviewer):** задаёт уточняющие вопросы **на языке оригинального промпта** (пользователь ответит на том же), чтобы Q&A не смешивал языки и детект Agent 2 был чистым.
+
+7. **Дефолт «русский» убран полностью.** Эталонные примеры в системных промтах всех агентов **НЕ должны содержать кириллицы / локаль-специфичных строк** (русских примеров output, термина `ТЗ`) — few-shot-пример на русском смещает язык генерации. Примеры в промтах — нейтральные/англоязычные плейсхолдеры. *(Правка `.txt`-промтов — зона backend; здесь — нормативное требование к их содержимому. Затронуты 5 файлов: `agent1_interviewer.txt`, `agent2_spec_writer.txt`, `agent3_builder.txt`, `agent4_fixer.txt`, `agent4_editor.txt`.)*
+
+**Контракт output Agent 2 (обновлён):** `spec_markdown` обязан **начинаться** маркером `**Content language:** <язык> (<bcp-47>)`. Top-level ключ (`spec_markdown`, §I.1a) и сигнатура валидатора `_validate_spec` не меняются; добавляется лишь проверка наличия маркера в начале `spec_markdown` (в рамках существующего валидатора, зона backend).
+
+**Override явным locale от iOS-клиента** (когда пользователь хочет язык, отличный от языка ввода) — **вне MVP**, [Q-LOCALE-1](../../99-open-questions.md#q-locale-1) (`blocks_sprint: none`; API/схема не меняются в MVP).
+
+**Критерии приёмки (qa, [ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md)):**
+- **contract (нет кириллицы/локаль-строк в промтах):** ни один из 5 промт-файлов (`agent1_interviewer.txt`, `agent2_spec_writer.txt`, `agent3_builder.txt`, `agent4_fixer.txt`, `agent4_editor.txt`) **не содержит** кириллических символов и термина `ТЗ` в эталонных примерах (воспроизводит и закрывает корень прод-бага).
+- **contract (language-инструкция присутствует):** системные промты содержат инструкцию про язык контента — Agent 2 детектит язык из ввода и пишет контент на нём; Agent 3 — контент+`<html lang>` на языке маркера; Agent 4 — сохранение; Agent 1 — вопросы на языке промпта.
+- **contract (spec-маркер):** промт Agent 2 требует начинать `spec_markdown` маркером `**Content language:**`; валидатор Agent 2 проверяет наличие маркера в начале `spec_markdown`.
+- **integration / live двуязычная E2E:** прогон с **английским** вводом (промпт+ответы) → `spec_markdown` начинается `**Content language:** English (en)`, контент спеки на английском, сгенерированный сайт несёт `<html lang="en">` и видимый текст на английском; аналогичный прогон с **русским** вводом → `**Content language:** Russian (ru)` + `<html lang="ru">` + русский контент. (Real-stack — при наличии `ANTHROPIC_API_KEY`; иначе мок с двуязычными фикстурами вывода Agent 2.)
+- Cross-ref [06-testing-strategy.md](../../06-testing-strategy.md).
 
 ---
 
@@ -354,7 +394,7 @@ stateDiagram-v2
 | Агент | Валидатор (код) | Канонический top-level ключ(и) | Минимальный валидный объект |
 |---|---|---|---|
 | **Agent 1** (Interviewer) | `agent1.py::_validate_questions` → `data.get("questions")` | `questions` — непустой массив объектов `{position:int, text:string(непустой), kind:"free_text"\|"choice", options:[string,…] (только при kind=="choice")}` | `{"questions":[{"position":1,"text":"…","kind":"free_text"}]}` |
-| **Agent 2** (Spec Writer) | `agent2.py::_validate_spec` → `data.get("spec_markdown")` | **`spec_markdown`** — непустая строка с Markdown-текстом спецификации (НЕ `spec`, НЕ `specification`) | `{"spec_markdown":"# Спецификация\n…"}` |
+| **Agent 2** (Spec Writer) | `agent2.py::_validate_spec` → `data.get("spec_markdown")` | **`spec_markdown`** — непустая строка с Markdown-текстом спецификации (НЕ `spec`, НЕ `specification`); **обязана начинаться маркером** `**Content language:** <язык> (<bcp-47>)` (§Язык/локализация, [ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md)) | `{"spec_markdown":"**Content language:** English (en)\n\n# Specification\n…"}` |
 | **Agent 3** (Builder) | `agent3.py` → `validate_agent_output` (`schemas/agent_output.py`) | `files` (непустой массив `{path,encoding,content}`), `entry` (строка), `build` (объект `{command, output_dir?, tool?}`) — полная схема: §«Контракт output Agent 3» | `{"files":[…],"entry":"index.html","build":{"command":"npm install && npx vite build","output_dir":"dist"}}` (эталон; голый `vite build`/`npm run build` запрещены — воркер нормализует к `npx vite build`, base инжектит воркер, см. §«Контракт output Agent 3») |
 | **Agent 4** (Fixer/Editor) | `agent4.py::_validate_agent4_output` → `validate_agent_output` ИЛИ `_parse_unrecoverable` | Ветка дерева: те же `files`/`entry`/`build`, что Agent 3. **ЛИБО** ветка сигнала: `unrecoverable` (`true`), `reason` (строка), `explanation` (строка) | дерево как Agent 3 **или** `{"unrecoverable":true,"reason":"…","explanation":"…"}` |
 
@@ -413,8 +453,9 @@ stateDiagram-v2
 - **unit (bounded retry):** parse/schema-фейл ретраится до `AGENT_OUTPUT_MAX_RETRIES`; на исчерпании — `FAILED(invalid_agent_output)` (Agent 1/2) либо виток `agent_output_invalid`→FIXING/`invalid_agent_output` (Agent 3/4); каждый retry — отдельная запись `llm_usage`, budget/wall-clock-гард проверяется перед каждым вызовом.
 - **unit (диагностируемость):** при parse-фейле в `job_events.payload` присутствуют имя агента, текст ошибки и scrubbed усечённый raw-ответ (без секретов).
 - **contract (промт↔валидатор консистентность по single source, обязателен — фикс инцидента Agent 2, §I.1a/§I.6):** для **КАЖДОГО** из 4 агентов тест проверяет, что (а) системный промт агента **декларирует** канонический top-level ключ из §I.1a (Agent 1 — `questions`; Agent 2 — `spec_markdown`; Agent 3/4 — `files`/`entry`/`build`; Agent 4 — плюс `unrecoverable`) — например, искомый ключ присутствует в тексте промта; И (б) валидатор того же агента читает **тот же** ключ. Цель — ни один агент не может разойтись промт↔валидатор по имени ключа (как Agent 2: промт → `spec`/`specification`, валидатор → `spec_markdown`).
-- **contract (валидатор не падает «empty» на канонической форме, страховка):** для каждого агента — тест, что подача **канонической** минимальной формы из §I.1a (например `{"spec_markdown":"# x"}` в `_validate_spec`; `{"questions":[…]}` в `_validate_questions`; минимальное валидное дерево в `validate_agent_output`; `{"unrecoverable":true,…}` в `_validate_agent4_output`) проходит валидацию **без** schema-фейла. Воспроизводит и закрывает прод-инцидент: ранее `_validate_spec` падал «empty specification», т.к. промт не пинил `spec_markdown`.
+- **contract (валидатор не падает «empty» на канонической форме, страховка):** для каждого агента — тест, что подача **канонической** минимальной формы **из §I.1a** (для Agent 2 — ровно колонка «Минимальный валидный объект» §I.1a, т.е. форма **С** обязательным маркером: `{"spec_markdown":"**Content language:** English (en)\n\n# x"}` в `_validate_spec`; `{"questions":[…]}` в `_validate_questions`; минимальное валидное дерево в `validate_agent_output`; `{"unrecoverable":true,…}` в `_validate_agent4_output`) проходит валидацию **без** schema-фейла. Воспроизводит и закрывает прод-инцидент: ранее `_validate_spec` падал «empty specification», т.к. промт не пинил `spec_markdown`. **Примечание:** форма **без** маркера (`{"spec_markdown":"# x"}`) этим тестом **не** покрывается и валидной для `_validate_spec` **не** является — её отвержение проверяет отдельный negative-тест маркера (см. «contract (spec-маркер)» в §Язык/локализация и contract-критерий ADR-025 ниже), чтобы оба правила (`spec_markdown` непустой **И** начинается маркером) не вступали в противоречие.
 - **negative (Agent 2 — отсутствие противоречия в промте):** тест, что `agent2_spec_writer.txt` **не** содержит инструкции возвращать ответ как Markdown-текст / «do not wrap it in JSON» (устранённый второй корень §I.6).
+- **contract (язык/локализация, [ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md)):** нет кириллицы/`ТЗ` в 5 промт-файлах; промт Agent 2 требует маркер `**Content language:**` в начале `spec_markdown`, валидатор проверяет его наличие; language-инструкции присутствуют в промтах (детальные критерии — §Язык/локализация → Критерии приёмки).
 - Cross-ref [06-testing-strategy.md](../../06-testing-strategy.md).
 
 ## F. `failure_log` в S3

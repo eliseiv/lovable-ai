@@ -87,6 +87,20 @@
 
 > **Реализация (backend/qa):** новые публичные эндпоинты `/v1/auth/register`·`/login` + Bearer-`/auth/secret`, поле `auth_secret_hash` + миграция, per-`user_id` лок в `app/auth/rate_limit.py`, OpenAPI под тегом «Аутентификация» (публичные, без BearerAuth на register/login). Backend реализует по контракту [ADR-024](adr/ADR-024-user-id-secret-authentication.md)/[modules/auth](modules/auth/02-api-contracts.md); qa покрывает register/login/secret + единый `401` + anti-brute-force ([06-testing](06-testing-strategy.md)).
 
+## Локализация — язык сгенерированного сайта = язык пользователя (авто-детект, [ADR-025](adr/ADR-025-content-language-autodetect-spec-marker.md))
+
+Продуктовое решение (2026-06-08, утверждено пользователем). Прод-баг: сайт выходил на **русском**, хотя пользователь писал промпт и отвечал на **английском**. Решение: язык контента сайта = **язык, на котором отвечает пользователь** (авто-детект из текста ввода), **без** изменения публичного API (`POST /projects` без поля `language`), **без** миграции БД, **без** нового параметра в сигнатурах `agentN.py`.
+
+| # | Решение | Параметры | Cross-ref |
+|---|---|---|---|
+| L-1 | **Язык контента = язык пользователя** (авто-детект из промпта + ответов на уточняющие вопросы). Дефолт «русский» убран. | — | [ADR-025](adr/ADR-025-content-language-autodetect-spec-marker.md) |
+| L-2 | **Детект — один раз Agent 2** (единственный видит весь ввод: промпт + Q&A); фиксирует язык маркером `**Content language:** <язык> (<bcp-47>)` в начале `spec_markdown`. Прокидка downstream — через уже передаваемый `spec_markdown` (новых полей/колонок/параметров нет). | маркер `**Content language:**` | [ADR-025](adr/ADR-025-content-language-autodetect-spec-marker.md), [pipeline §Язык/локализация](modules/pipeline/03-architecture.md#языклокализация-контента-сайта-adr-025) |
+| L-3 | **Прокидка:** Agent 3 — весь контент сайта + корневой `<html lang="<bcp-47>">` на языке маркера; Agent 4 (fixer/editor) — **сохраняет** язык (не переводит); Agent 1 — вопросы на языке оригинального промпта. **Приоритет:** язык ответов > язык промпта. | — | [ADR-025](adr/ADR-025-content-language-autodetect-spec-marker.md), [pipeline §Язык/локализация](modules/pipeline/03-architecture.md#языклокализация-контента-сайта-adr-025) |
+| L-4 | **Эталонные примеры в 5 промт-файлах не содержат кириллицы / локаль-специфичных строк** (русских примеров output, термина `ТЗ`) — few-shot на русском смещал язык генерации (корень бага). | 5 файлов: `agent1_interviewer`, `agent2_spec_writer`, `agent3_builder`, `agent4_fixer`, `agent4_editor` | [ADR-025](adr/ADR-025-content-language-autodetect-spec-marker.md) |
+| L-5 | **Явный locale-override от iOS-клиента** (язык сайта ≠ язык ввода) — **вне MVP**; API/схема в MVP не меняются. | — | [Q-LOCALE-1](99-open-questions.md#q-locale-1) (`blocks_sprint: none`) |
+
+> **Реализация (backend/qa):** backend правит 5 системных промтов (`app/pipeline/prompts/*.txt`) — добавляет language-инструкции (детект Agent 2 + маркер `**Content language:**`; Agent 3 контент+`<html lang>`; Agent 4 сохранение; Agent 1 вопросы на языке промпта), убирает кириллицу/`ТЗ` из эталонных примеров; добавляет в `_validate_spec` проверку маркера в начале `spec_markdown`. qa покрывает contract-сценарии (нет кириллицы в промтах, есть language-инструкция, промт Agent 2 требует маркер) + live двуязычную E2E ([pipeline §Язык/локализация → Критерии приёмки](modules/pipeline/03-architecture.md#языклокализация-контента-сайта-adr-025), [06-testing](06-testing-strategy.md)).
+
 ## Prod-deploy — shared edge-Traefik + path-based routing (2026-06-03)
 
 Внешние требования прод-среды владельца (источник истины prod-deployment) + продуктовое решение по routing сайтов. ADR: [ADR-017](adr/ADR-017-path-based-site-routing.md) (path-routing), [ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md) (prod-deploy + CI/CD).
