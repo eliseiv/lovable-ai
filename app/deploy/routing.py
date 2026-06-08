@@ -18,10 +18,28 @@ threat-model). site_id известен до фазы build (§2A), генери
 
 from __future__ import annotations
 
+import re
+
 from app.core.config import Settings
 
 # Префикс path-сегмента сайта (ADR-017 §2A): {apps_domain}/s/{site_id}.
 _PATH_SEGMENT = "s"
+
+# Токен вызова vite в нормализованной build-команде (workspace._normalize_build_command
+# приводит её к `npx vite build`). Инжект `--base` идёт ИМЕННО в этот токен, не в хвост
+# строки (ADR-017 §Fix 2026-06-08, deploy §2A): хвостовой `--base` после потенциального
+# `&&`-сегмента или npm-script не доходит до vite → vite собирает с base=/ → ассеты 404
+# за StripPrefix → пустой экран. Матч по границе слова, чтобы не задеть подстроки.
+_NPX_VITE_BUILD_RE = re.compile(r"\bnpx vite build\b")
+
+# Любой `--base` уже присутствующий в команде — от НЕДОВЕРЕННОГО LLM-дерева (threat-model
+# ADR-017/05-security трактует output Agent 3 как недоверенный). Его удаляем ПЕРЕД инжектом
+# воркерного `--base=/s/{site_id}/`, иначе при двух флагах Vite CLI берёт ПОСЛЕДНИЙ: агентский
+# `npx vite build --base=/s/{id}/ --base=/evil/` перекрыл бы воркерный → ассеты 404 за
+# StripPrefix (ровно прод-инцидент, что чиним). Покрываются обе формы — `--base=VALUE` и
+# `--base VALUE`; VALUE — один токен без пробелов (shell-аргумент). Хвостовой `\s*` схлопывает
+# образовавшийся двойной пробел. Прочие аргументы не задеваются (якорь именно на `--base`).
+_AGENT_BASE_FLAG_RE = re.compile(r"\s*--base(?:=|\s+)\S+\s*")
 
 
 def site_path_prefix(site_id: str) -> str:
@@ -91,15 +109,40 @@ def traefik_labels(settings: Settings, site_id: str) -> dict[str, str]:
 
 
 def augment_build_command(settings: Settings, command: str, site_id: str) -> str:
-    """В path-режиме добавляет `--base=/s/{site_id}/` к vite-сборке (§2A, критично).
+    """В path-режиме инжектит `--base=/s/{site_id}/` в токен `npx vite build` (§2A, критично).
 
     CLI-флаг инжектится воркером (НЕ из vite.config LLM-дерева — безопасность). Без base-path
     ассеты за StripPrefix резолвятся в корень `{apps_domain}/assets/...` → 404. В subdomain-
     режиме base дефолтный `/` — команда не меняется (сайт в корне хоста).
+
+    `--base` добавляется ИМЕННО как аргумент vite (сразу после токена `npx vite build`), а НЕ
+    дописывается в хвост всей строки (ADR-017 §Fix 2026-06-08, deploy §2A): хвостовой `--base`
+    после `&&`-сегмента/npm-script не доходит до vite → дефолтный base=/ → ассеты 404 за
+    StripPrefix → пустой экран (прод-инцидент). Команда уже нормализована к `npx vite build`
+    (workspace._normalize_build_command применяется в read_build_manifest до этого вызова),
+    поэтому токен присутствует. Если токен почему-то отсутствует — fail-fast, а не тихий
+    no-op base (иначе вернулся бы прод-инцидент пустого экрана).
+
+    Defense-in-depth (threat-model ADR-017/05-security: output Agent 3 — недоверенный): любой
+    уже присутствующий агентский `--base=...`/`--base ...` УДАЛЯЕТСЯ перед инжектом. Иначе при
+    двух флагах Vite CLI берёт последний → агентский перекрыл бы воркерный (`... --base=/s/{id}/
+    --base=/evil/`) → ассеты 404, ровно чинимый инцидент. После удаления воркерный `--base` —
+    единственный источник истины и всегда побеждает. Идемпотентно: повторный прогон сначала
+    снимает воркерный `--base`, затем инжектит его заново в тот же токен (результат тот же).
     """
     if not settings.routing_is_path:
         return command
-    return f"{command} --base={vite_base(site_id)}"
+    # Снимаем любой агентский (или воркерный с прошлого прогона) `--base` — недоверенный/
+    # дублирующий; затем единственным источником истины ставим воркерный. ` ` как замена
+    # схлопывает поглощённые регексом окружающие пробелы в один; .strip() убирает крайний.
+    command = _AGENT_BASE_FLAG_RE.sub(" ", command).strip()
+    flag = f"--base={vite_base(site_id)}"
+    new_command, n = _NPX_VITE_BUILD_RE.subn(f"npx vite build {flag}", command, count=1)
+    if n == 0:
+        raise ValueError(
+            f"build command lacks `npx vite build` token, cannot inject base: {command!r}"
+        )
+    return new_command
 
 
 def health_check_target(settings: Settings, site_id: str, container_name: str) -> tuple[str, bool]:

@@ -127,22 +127,86 @@ def test_live_url_subdomain_prod_https_regression():
 
 
 # ===========================================================================
-# augment_build_command — path: добавляет --base=/s/{site_id}/ ; subdomain: без base.
+# augment_build_command — path: инжектит --base=/s/{site_id}/ В ТОКЕН `npx vite build`
+# (НЕ в хвост строки, ADR-017 §Fix 2026-06-08); subdomain: без base. Команда поступает
+# уже нормализованной (workspace._normalize_build_command в read_build_manifest до этого).
 # ===========================================================================
 
 
-def test_augment_build_command_path_adds_base():
-    cmd = "npm ci && npm run build"
+def test_augment_build_command_path_injects_base_into_token():
+    """--base инжектится СРАЗУ ПОСЛЕ токена `npx vite build`, а НЕ в хвост строки (ADR-017 §Fix).
+
+    Хвостовой `--base` после `&&`-сегмента не доходит до vite → base=/ → ассеты 404 за
+    StripPrefix → пустой экран (прод-инцидент 2026-06-08).
+    """
+    cmd = "npm install && npx vite build"
     out = routing.augment_build_command(_path_settings(), cmd, SITE)
-    assert out == f"npm ci && npm run build --base=/s/{SITE}/"
-    assert out.endswith(f"--base=/s/{SITE}/")
+    assert out == f"npm install && npx vite build --base=/s/{SITE}/"
+    # Флаг сразу после токена, не в хвосте после возможного следующего сегмента.
+    assert f"npx vite build --base=/s/{SITE}/" in out
+
+
+def test_augment_build_command_path_preserves_other_vite_args():
+    """Прочие vite-аргументы (`--mode prod`) сохраняются; --base встаёт сразу за токеном."""
+    cmd = "npm install && npx vite build --mode prod"
+    out = routing.augment_build_command(_path_settings(), cmd, SITE)
+    assert out == f"npm install && npx vite build --base=/s/{SITE}/ --mode prod"
+    assert "--mode prod" in out
+
+
+@pytest.mark.parametrize(
+    "agent_form",
+    [
+        "npm install && npx vite build --base=/evil/",
+        "npm install && npx vite build --base /evil/",
+    ],
+)
+def test_augment_build_command_path_strips_agent_base_defense_in_depth(agent_form: str):
+    """Defense-in-depth: агентский `--base` (обе формы `=X` и ` X`) удаляется до инжекта.
+
+    Output Agent 3 недоверен (threat-model ADR-017/05-security). При двух флагах Vite CLI
+    берёт последний → агентский перекрыл бы воркерный (`--base=/s/{id}/ --base=/evil/`) →
+    ассеты 404. После удаления воркерный `--base` — единственный источник истины.
+    """
+    out = routing.augment_build_command(_path_settings(), agent_form, SITE)
+    assert out == f"npm install && npx vite build --base=/s/{SITE}/"
+    assert "/evil/" not in out
+    assert out.count("--base") == 1
+
+
+def test_augment_build_command_path_idempotent():
+    """Повторный прогон: снимает воркерный `--base` прошлого прогона, инжектит заново → тот же."""
+    cmd = "npm install && npx vite build"
+    once = routing.augment_build_command(_path_settings(), cmd, SITE)
+    twice = routing.augment_build_command(_path_settings(), once, SITE)
+    assert once == twice == f"npm install && npx vite build --base=/s/{SITE}/"
+    assert twice.count("--base") == 1
+
+
+def test_augment_build_command_path_fail_fast_without_token():
+    """fail-fast: команда без токена `npx vite build` → ValueError (не тихий no-op base).
+
+    Тихий no-op вернул бы прод-инцидент пустого экрана (ассеты 404 без base). Кастомный
+    npm-script проходит нормализацию без подмены и здесь ловится fail-fast.
+    """
+    cmd = "npm install && npm run build:custom"
+    with pytest.raises(ValueError, match="lacks `npx vite build` token"):
+        routing.augment_build_command(_path_settings(), cmd, SITE)
 
 
 def test_augment_build_command_subdomain_unchanged():
-    cmd = "npm ci && npm run build"
+    """subdomain-режим: base не инжектится (сайт в корне хоста), команда без изменений."""
+    cmd = "npm install && npx vite build"
     out = routing.augment_build_command(_subdomain_settings(), cmd, SITE)
     assert out == cmd
     assert "--base" not in out
+
+
+def test_augment_build_command_subdomain_no_token_no_failfast():
+    """subdomain: даже без токена `npx vite build` — НЕ fail-fast (база не нужна, ранний return)."""
+    cmd = "npm install && npm run build:custom"
+    out = routing.augment_build_command(_subdomain_settings(), cmd, SITE)
+    assert out == cmd
 
 
 def test_vite_base_helper_format():

@@ -36,7 +36,12 @@ assert _BUILD_MANIFEST_NAME in RESERVED_SERVICE_FILENAMES
 # существующего package-lock.json, а сгенерированное Agent 3 дерево lockfile НЕ
 # содержит (LLM не может надёжно собрать валидный package-lock.json). `npm install`
 # ставит зависимости по package.json и сам генерирует lock. См. _normalize_build_command.
-_DEFAULT_BUILD_COMMAND = "npm install && vite build"
+#
+# `npx vite build`, НЕ голый `vite build` / `npm run build` (ADR-017 §Fix 2026-06-08,
+# deploy §2A): голый `vite` отсутствует в `$PATH` (лежит в node_modules/.bin) →
+# `sh: vite: not found`; `npm run build` ломает инжект воркером `--base` (npm не
+# прокидывает флаг во vite без `--`-разделителя). См. _normalize_build_command.
+_DEFAULT_BUILD_COMMAND = "npm install && npx vite build"
 _DEFAULT_BUILD_OUTPUT_DIR = "dist"
 
 # Любой `npm ci` в команде сборки заменяется на `npm install` (lockfile отсутствует —
@@ -44,10 +49,40 @@ _DEFAULT_BUILD_OUTPUT_DIR = "dist"
 # чтобы не задеть прочие подстроки.
 _NPM_CI_RE = re.compile(r"\bnpm ci\b")
 
+# Нормализация вызова vite к канонической форме `npx vite build` (ADR-017 §Fix 2026-06-08,
+# deploy §2A): голый `vite build` → `npx vite build` (vite в node_modules/.bin, не в PATH);
+# `npm run build` → `npx vite build` (хвостовой `--base` воркера не доходит до vite через
+# npm-script без `--`-разделителя). Уже `npx vite build` не трогается.
+#
+# Идемпотентность гарантируется отрицательным lookbehind `(?<!npx )` в _BARE_VITE_BUILD_RE:
+# `npx vite build` не матчится → повторный прогон не даёт `npx npx vite build`.
+#
+# `_NPM_RUN_BUILD_RE` намеренно НЕ матчит script-варианты (`npm run build:vite`,
+# `npm run build-prod`): хвостовой `(?![:\w-])` после `build` отсекает `:`, дефис и
+# слово-символ, поэтому подменяется только ровно `npm run build`. Голый `\bnpm run build\b`
+# этого не даёт (`\b` срабатывает на границе `build`↔`:` и `build`↔`-`, ошибочно матча
+# `build:vite`/`build-prod` и оставляя хвост `:vite`/`-prod`). Кастомный npm-script —
+# недоверенный вход LLM-дерева с непредсказуемой семантикой, нормализовать его к
+# `npx vite build` нельзя (мог бы делать не сборку); такие команды проходят без подмены и,
+# если не содержат токена `npx vite build`, ловятся fail-fast при инжекте `--base` (routing).
+_NPM_RUN_BUILD_RE = re.compile(r"\bnpm run build(?![:\w-])")
+_BARE_VITE_BUILD_RE = re.compile(r"(?<!npx )\bvite build\b")
+
 
 def _normalize_build_command(command: str) -> str:
-    """Нормализует команду сборки: `npm ci` → `npm install` (lockfile отсутствует)."""
-    return _NPM_CI_RE.sub("npm install", command)
+    """Нормализует команду сборки к канонической форме (ADR-017 §Fix, deploy §2A).
+
+    Шаги (порядок важен, идемпотентны при повторном прогоне):
+      1. `npm ci` → `npm install` (lockfile отсутствует — `npm ci` упал бы до сборки);
+      2. `npm run build` → `npx vite build` (npm-script не прокидывает воркерный `--base`);
+      3. голый `vite build` → `npx vite build` (vite в node_modules/.bin, не в PATH).
+
+    Шаг 2 предшествует шагу 3: после `npm run build` → `npx vite build` строка уже несёт
+    `npx vite build`, и lookbehind `(?<!npx )` в шаге 3 её не трогает (нет двойного `npx`).
+    """
+    command = _NPM_CI_RE.sub("npm install", command)
+    command = _NPM_RUN_BUILD_RE.sub("npx vite build", command)
+    return _BARE_VITE_BUILD_RE.sub("npx vite build", command)
 
 
 @dataclass(frozen=True)
