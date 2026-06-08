@@ -29,7 +29,7 @@ Backend-сервис для iOS-приложения: по промту поль
 | Модуль | Документация | Статус |
 |---|---|---|
 | `api` | [modules/api/](modules/api/README.md) | реализован happy-path (Sprint 1) |
-| `auth` | [modules/auth/](modules/auth/README.md) | **реализован (Sprint 3)** — Sign in with Apple, индексируемый O(1) lookup, мульти-устройство, rate-limit/cap |
+| `auth` | [modules/auth/](modules/auth/README.md) | **реализован (Sprint 3)** — Sign in with Apple, индексируемый O(1) lookup, мульти-устройство, rate-limit/cap. **+ контракт зафиксирован ([ADR-024](adr/ADR-024-user-id-secret-authentication.md)):** клиентская аутентификация по `user_id`+секрет (`/auth/register`·`/login`·`/secret`), сосуществует с Apple — реализация backend |
 | `pipeline` | [modules/pipeline/](modules/pipeline/README.md) | happy-path (Sprint 1); Fixer loop + resilience реализован (Sprint 2) |
 | `deploy` | [modules/deploy/](modules/deploy/README.md) | happy-path (Sprint 1); **sandbox & security реализован (Sprint 4)** — rootless Docker + egress-allowlist + project-GC ([ADR-010](adr/ADR-010-build-sandbox-rootless-egress.md)/[ADR-011](adr/ADR-011-project-delete-gc.md)); **prod-deploy зафиксирован** — path-based routing `/s/{site_id}` ([ADR-017](adr/ADR-017-path-based-site-routing.md)) + shared edge-Traefik `corelysite.shop` ([ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md)), [Q-DEPLOY-2](99-open-questions.md#q-deploy-2) resolved |
 | `billing` | [modules/billing/](modules/billing/README.md) | **реализован (Sprint 3.5)** — Adapty webhook+ресинк, entitlements/quota-gate, usage_counters, grace-teardown; **S5:** активирован `/edits`-гейт отдельным лимитом правок ([ADR-014](adr/ADR-014-edit-limit-revision-rollback.md)) |

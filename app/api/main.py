@@ -183,6 +183,12 @@ def _custom_openapi() -> dict[str, Any]:
     (apiKey в заголовке `X-Admin-Key`): для этих путей глобальный BearerAuth переопределяется
     per-operation на `[{AdminKey: []}]`, чтобы в Authorize появилось отдельное поле админ-ключа
     и «Try it out» слал `X-Admin-Key`, а не Bearer.
+
+    Публичные эндпоинты (`/v1/auth/register`, `/v1/auth/login`, `/v1/auth/apple` — вход/
+    регистрация; `/v1/billing/webhook/adapty` — server-to-server по подписи Adapty) НЕ требуют
+    Bearer (docs/modules/auth/02-api-contracts.md, billing/02): для них глобальный BearerAuth
+    переопределяется per-operation на `[]` (пустой массив = без auth), чтобы публичность в
+    схеме совпадала с рантаймом и Swagger не помечал их как требующие токен.
     """
     if app.openapi_schema:
         return app.openapi_schema
@@ -208,12 +214,27 @@ def _custom_openapi() -> dict[str, Any]:
         },
     }
     schema["security"] = [{"BearerAuth": []}]
-    # Админ-пути требуют X-Admin-Key (НЕ Bearer): переопределяем security per-operation.
+    # Публичные эндпоинты (вход/регистрация без Bearer + webhook Adapty по подписи): security:[]
+    # снимает глобальный BearerAuth per-operation, приводя схему в соответствие с рантаймом.
+    _public_paths = frozenset(
+        {
+            "/v1/auth/register",
+            "/v1/auth/login",
+            "/v1/auth/apple",
+            "/v1/billing/webhook/adapty",
+        }
+    )
     for path, item in schema.get("paths", {}).items():
         if path.startswith("/v1/admin/"):
+            # Админ-пути требуют X-Admin-Key (НЕ Bearer): переопределяем security per-operation.
             for operation in item.values():
                 if isinstance(operation, dict):
                     operation["security"] = [{"AdminKey": []}]
+        elif path in _public_paths:
+            # Публичный путь: пустой security = без auth (не помечаем как требующий Bearer).
+            for operation in item.values():
+                if isinstance(operation, dict):
+                    operation["security"] = []
     app.openapi_schema = schema
     return schema
 

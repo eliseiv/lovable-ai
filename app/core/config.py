@@ -110,6 +110,19 @@ class Settings(BaseSettings):
         description="Лимит запросов в минуту на ключ (Redis token bucket по key_id, env "
         "RATE_LIMIT_PER_MIN, docs/05-security.md §Rate-limit).",
     )
+    # ADR-024: per-user_id лок против перебора секрета на POST /v1/auth/login (defense-in-depth;
+    # user_id виден в ответах API, не секрет). Redis fixed-window rl:login:uid:{user_id}.
+    login_user_lock_threshold: int = Field(
+        default=10,
+        description="Порог неудачных попыток POST /v1/auth/login на одно значение user_id за "
+        "окно LOGIN_USER_LOCK_WINDOW_S → 429 независимо от IP; успешный вход сбрасывает счётчик. "
+        "env LOGIN_USER_LOCK_THRESHOLD (ADR-024, docs/05-security §Клиентская аутентификация).",
+    )
+    login_user_lock_window_s: int = Field(
+        default=900,
+        description="Окно (сек) счётчика неудач per-user_id лока /auth/login. "
+        "env LOGIN_USER_LOCK_WINDOW_S (ADR-024).",
+    )
 
     # --- Админ-плоскость (ADR-021, docs/07-deployment env-контракт) ---
     # Секрет X-Admin-Key для require_admin на /v1/admin/* (login-as, бонус-кредиты).

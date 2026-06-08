@@ -107,6 +107,13 @@ x-app-env: &app-env
   ADMIN_API_KEY: ${ADMIN_API_KEY:-}
   # Apple Sign in (Sprint 3) — ожидаемый aud identity token (bundle/Services ID).
   APPLE_AUDIENCE: ${APPLE_AUDIENCE:-mba.gipsy.lovable}
+  # ADR-024: per-user_id лок POST /v1/auth/login (defense-in-depth против перебора
+  # секрета; user_id не секрет). Дефолты символ-в-символ с docs/07 env-контрактом
+  # (стр. 61-62: threshold=10, window_s=900), потребитель api. Redis fixed-window
+  # rl:login:uid:{user_id}. ⚠️ app-env api → обязаны быть здесь, иначе extra=ignore
+  # молча отдаст дефолт config.py (фичу нельзя сконфигурировать в проде).
+  LOGIN_USER_LOCK_THRESHOLD: ${LOGIN_USER_LOCK_THRESHOLD:-10}
+  LOGIN_USER_LOCK_WINDOW_S: ${LOGIN_USER_LOCK_WINDOW_S:-900}
   # --- Деплой сайтов / роутинг (PROD: path-based на corelysite.shop) ---
   # docs/07 стр. 231 + ADR-018: prod = path-based, домен corelysite.shop,
   # сайт-контейнеры в сети web (общий Traefik видит их).

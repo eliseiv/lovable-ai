@@ -59,6 +59,67 @@ async def check_key_rate_limit(key_id: str) -> RateLimitResult:
 
 
 async def check_login_rate_limit(client_ip: str) -> RateLimitResult:
-    """Лимит анонимного /auth/apple по IP (rl:apple:{ip}) — защита от брутфорса логина."""
+    """Лимит анонимного /auth/apple по IP (rl:apple:{ip}) — защита от брутфорса логина.
+
+    Переиспользуется на публичных /auth/register и /auth/login (IP-лимит, ADR-024 §4).
+    """
     limit = get_settings().rate_limit_per_min
     return await _check(f"rl:apple:{client_ip}", limit, scope="apple_login_ip")
+
+
+def _user_lock_key(user_id: str) -> str:
+    return f"rl:login:uid:{user_id}"
+
+
+async def check_user_login_lock(user_id: str) -> RateLimitResult:
+    """Per-`user_id` лок на /auth/login (defense-in-depth, ADR-024 §4): счётчик НЕудачных
+    попыток входа на значение user_id уже превысил порог → 429 (без инкремента).
+
+    Redis fixed-window `rl:login:uid:{user_id}`: порог LOGIN_USER_LOCK_THRESHOLD за окно
+    LOGIN_USER_LOCK_WINDOW_S. Этот вызов — ГЕЙТ (до проверки секрета): только читает текущий
+    счётчик, НЕ инкрементит (инкремент — register_login_failure при неудаче). Счётчик ведётся
+    по присланному значению user_id НЕЗАВИСИМО от существования юзера → лок не становится
+    user-enumeration-оракулом (docs/05-security §Клиентская аутентификация). docs §5A.
+    """
+    settings = get_settings()
+    threshold = settings.login_user_lock_threshold
+    client = get_redis()
+    metrics.redis_pool_in_use.labels(pool="rate_limit").inc()
+    try:
+        raw = await client.get(_user_lock_key(user_id))
+        count = int(raw) if raw is not None else 0
+        if count >= threshold:
+            ttl = await client.ttl(_user_lock_key(user_id))
+            retry_after = ttl if ttl and ttl > 0 else settings.login_user_lock_window_s
+            metrics.rate_limit_rejected_total.labels(scope="login_user_lock").inc()
+            return RateLimitResult(allowed=False, retry_after_s=retry_after)
+        return RateLimitResult(allowed=True, retry_after_s=0)
+    finally:
+        metrics.redis_pool_in_use.labels(pool="rate_limit").dec()
+
+
+async def register_login_failure(user_id: str) -> None:
+    """Инкремент счётчика НЕудачных попыток входа на значение user_id (ADR-024 §4).
+
+    Атомарный INCR; на первой неудаче окна ставит EXPIRE = LOGIN_USER_LOCK_WINDOW_S
+    (fixed-window). Вызывается ТОЛЬКО при провале верификации секрета на /auth/login.
+    """
+    settings = get_settings()
+    client = get_redis()
+    metrics.redis_pool_in_use.labels(pool="rate_limit").inc()
+    try:
+        count = await client.incr(_user_lock_key(user_id))
+        if count == 1:
+            await client.expire(_user_lock_key(user_id), settings.login_user_lock_window_s)
+    finally:
+        metrics.redis_pool_in_use.labels(pool="rate_limit").dec()
+
+
+async def reset_login_failures(user_id: str) -> None:
+    """Сброс счётчика неудач (DEL) при успешном входе на этот user_id (ADR-024 §4)."""
+    client = get_redis()
+    metrics.redis_pool_in_use.labels(pool="rate_limit").inc()
+    try:
+        await client.delete(_user_lock_key(user_id))
+    finally:
+        metrics.redis_pool_in_use.labels(pool="rate_limit").dec()

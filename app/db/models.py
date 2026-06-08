@@ -43,6 +43,13 @@ class User(Base):
     # Legacy S1 (ADR-008 «Миграционный путь»): argon2id-хэш единственного seeded ключа.
     # С Sprint 3 реальные токены живут в api_tokens; поле становится nullable (fallback-путь).
     api_key_hash: Mapped[str | None] = mapped_column(Text, nullable=True, unique=True)
+    # ADR-024: argon2id-хэш клиентского секрета для POST /v1/auth/login (вход без Apple/
+    # админ-ключа). Сам секрет не хранится/не восстановим; constant-time verify ровно один
+    # раз. ОДИН секрет на юзера (поле на users, не отдельная таблица — ADR-024 §3). NULL у
+    # Apple-юзеров и admin-created (у них секрета нет) → login по секрету для них = единый 401.
+    # БЕЗ UNIQUE: auth_secret_hash не identity-якорь (им остаётся id/apple_sub), лишь
+    # верификатор. Set/rotate — POST /v1/auth/secret (под Bearer). Никогда не логируется.
+    auth_secret_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     adapty_customer_user_id: Mapped[str | None] = mapped_column(Text, nullable=True, unique=True)
     monthly_budget_usd: Mapped[Decimal] = mapped_column(
         Numeric(10, 4), nullable=False, default=Decimal("50.0000")

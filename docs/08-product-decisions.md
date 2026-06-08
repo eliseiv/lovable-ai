@@ -70,6 +70,23 @@
 
 > **Нормативный маппинг агент→роль→модель (6-2):** единый источник истины — [pipeline §Агенты → Tiering моделей](modules/pipeline/03-architecture.md#агенты-anthropic-sdk). Целевые значения по номерам (после ревизии R1 [ADR-023](adr/ADR-023-agent3-token-budget-thinking-room.md)): **AGENT1 Interviewer = Sonnet** (`claude-sonnet-4-6`), **AGENT2 Spec = Opus** (`claude-opus-4-8`), **AGENT3 Builder = Sonnet** (`claude-sonnet-4-6` — переведён Opus→Sonnet в R1), **AGENT4 Fixer = Sonnet** (`claude-sonnet-4-6`). env-дефолты ([07-deployment.md](07-deployment.md#контракт-переменных-окружения-environment-reference)) приведены к этим значениям; backend в **S6-калибровке** синхронизирует `config.py`-дефолты с таблицей (правка дефолтов **без нового решения** — маппинг уже в конфиге, не в коде агентов). Ранее зафиксированная «дельта Fixer=Sonnet vs env Opus» **разрешена** этим единым маппингом (AGENT4=Sonnet целевой и в env). Верификация применения — `lovable_llm_call_cost_usd_total{agent,model}` до/после на дашборде Cost ([observability §5.3](modules/observability/03-architecture.md#53-model-tiering-08-6-2)).
 
+## Auth-secret — клиентская аутентификация по `user_id` + секрет ([ADR-024](adr/ADR-024-user-id-secret-authentication.md))
+
+Продуктовое решение (2026-06-08): добавить клиентский путь регистрации/входа **по паре `user_id` + секрет**, **сосуществующий** с Sign in with Apple (§3-1) — оба способа доступны одновременно. Утверждено пользователем.
+
+| # | Решение | Параметры | Cross-ref |
+|---|---|---|---|
+| AS-1 | **Назначение фичи:** Dev/QA на проде (аккаунт без iOS/Apple), кросс-платформа (не-Apple клиенты), перенос/восстановление аккаунта между устройствами/платформами. | — | [ADR-024](adr/ADR-024-user-id-secret-authentication.md) |
+| AS-2 | **Модель безопасности (утверждена пользователем):** вход подтверждается `user_id`+секрет; секрет — только `argon2id`-хэш, constant-time verify. Вариант «только `user_id` без секрета» **отклонён** (`user_id` не секретный — виден в ответах API). | секрет 256 бит; `argon2id`. | [ADR-024 §Alternatives](adr/ADR-024-user-id-secret-authentication.md), [05-security → Клиентская аутентификация](05-security.md#клиентская-аутентификация-по-user_id--секрет-adr-024) |
+| AS-3 | **Сервер генерирует И `user_id`, И секрет** (`POST /v1/auth/register`); клиентский `user_id` не принимается (захват/коллизия аккаунта). Секрет показывается **один раз**. | `new_user_id()` + `new_token_secret()`. | [modules/auth/02-api-contracts.md → register](modules/auth/02-api-contracts.md) |
+| AS-4 | **Вход** `POST /v1/auth/login` (`user_id`+секрет) → новый Bearer; любой провал → **единый `401`** без раскрытия причины. Bearer-механизм не меняется (тот же `token_service.issue_token()`). | — | [ADR-008](adr/ADR-008-indexed-api-key-lookup.md), [modules/auth/02-api-contracts.md → login](modules/auth/02-api-contracts.md) |
+| AS-5 | **Anti-brute-force:** IP rate-limit на оба эндпоинта + **per-`user_id` лок на `/login`** (defense-in-depth против перебора секрета известного `user_id`). | `LOGIN_USER_LOCK_THRESHOLD`=10 / `LOGIN_USER_LOCK_WINDOW_S`=900. | [05-security → Клиентская аутентификация](05-security.md#клиентская-аутентификация-по-user_id--секрет-adr-024) |
+| AS-6 | **Перенос/восстановление:** `POST /v1/auth/secret` (set/rotate секрета под Bearer) — Apple-юзер ставит секрет на своём аккаунте для кросс-платформенного входа. Слияние **двух разных** существующих аккаунтов — вне MVP. | — | [Q-AUTH-1](99-open-questions.md#q-auth-1), [ADR-024 §5](adr/ADR-024-user-id-secret-authentication.md) |
+
+> **Модель данных:** одно новое поле `users.auth_secret_hash text NULL` (один секрет на юзера, без UNIQUE — не identity-якорь). Миграция аддитивна (revises head `20260604_0001`). [03-data-model → users](03-data-model.md#users).
+
+> **Реализация (backend/qa):** новые публичные эндпоинты `/v1/auth/register`·`/login` + Bearer-`/auth/secret`, поле `auth_secret_hash` + миграция, per-`user_id` лок в `app/auth/rate_limit.py`, OpenAPI под тегом «Аутентификация» (публичные, без BearerAuth на register/login). Backend реализует по контракту [ADR-024](adr/ADR-024-user-id-secret-authentication.md)/[modules/auth](modules/auth/02-api-contracts.md); qa покрывает register/login/secret + единый `401` + anti-brute-force ([06-testing](06-testing-strategy.md)).
+
 ## Prod-deploy — shared edge-Traefik + path-based routing (2026-06-03)
 
 Внешние требования прод-среды владельца (источник истины prod-deployment) + продуктовое решение по routing сайтов. ADR: [ADR-017](adr/ADR-017-path-based-site-routing.md) (path-routing), [ADR-018](adr/ADR-018-prod-deployment-shared-traefik-cicd.md) (prod-deploy + CI/CD).

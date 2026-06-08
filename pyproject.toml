@@ -60,6 +60,10 @@ ignore = ["S101"]
 # *token* (database_password=..., webhook_secret=...) — это ТЕСТ-ДАННЫЕ для проверки
 # before_send-маскировки, не настоящие секреты (S105/S106 false-positive).
 "tests/unit/test_observability_sentry.py" = ["S105", "S106"]
+# ADR-024: `secret=`-kwarg в auth-тестах по user_id+секрет — ТЕСТ-данные (фиктивный/
+# сгенерированный секрет для register/login), не настоящий креденшел (S106 false-positive).
+"tests/unit/test_auth_secret_service.py" = ["S105", "S106"]
+"tests/integration/test_auth_secret_flow.py" = ["S105", "S106"]
 
 [tool.mypy]
 python_version = "3.12"

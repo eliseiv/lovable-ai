@@ -24,6 +24,57 @@ flowchart TB
 - **JWKS-кэш:** ключи Apple кэшируются по `kid`; при неизвестном `kid` — refresh JWKS. Верификация офлайн (без вызова Apple на каждый логин).
 - **Upsert по `apple_sub`:** identity-якорь — `sub` Apple-токена (не email; «Hide My Email» даёт релейный/отсутствующий email).
 
+## 1A. Аутентификация по `user_id` + секрет ([ADR-024](../../adr/ADR-024-user-id-secret-authentication.md))
+
+Публичный путь register/login **без Apple и без админ-ключа** — сосуществует с Sign in with Apple (§1). Не меняет токен-модель (§2): только добавляет ещё один способ *получить* Bearer через тот же `token_service.issue_token()`.
+
+### Register flow (`POST /v1/auth/register`)
+
+```mermaid
+flowchart TB
+    A[client: POST /v1/auth/register device_label?] --> RL{IP rate-limit ok?}
+    RL -->|нет| E429[429 + Retry-After]
+    RL -->|да| G[server: user_id=new_user_id, secret=new_token_secret]
+    G --> U[insert users apple_sub=NULL, adapty_customer_user_id=users.id]
+    U --> H[users.auth_secret_hash = argon2id secret]
+    H --> T[token_service.issue_token → новая строка api_tokens]
+    T --> R[201 user_id + secret + api_key + token_id — секрет ОДИН раз]
+```
+
+- **Сервер генерирует оба** (`user_id` и секрет); клиентский `user_id` **не принимается** (захват/коллизия). `secret` = `new_token_secret()` (256 бит); в БД — только `argon2id(secret)`.
+- Юзер создаётся как admin-created (`apple_sub=NULL` допустим, [ADR-021 §B](../../adr/ADR-021-admin-plane-and-bonus-credits.md), [§7](#7-admin-login-as-upsert-юзера-без-apple_sub-adr-021)).
+
+### Login flow (`POST /v1/auth/login`)
+
+```mermaid
+flowchart TB
+    A[client: POST /v1/auth/login user_id + secret] --> RL{IP-лимит И per-user_id лок ok?}
+    RL -->|нет| E429[429 + Retry-After]
+    RL -->|да| S[SELECT auth_secret_hash FROM users WHERE id=user_id]
+    S --> V{constant-time argon2.verify secret}
+    V -->|нет юзера / hash NULL / mismatch| E401[401 RFC-7807 — единый, без раскрытия причины]
+    V -->|ok| T[token_service.issue_token → новая строка api_tokens]
+    T --> RST[сброс per-user_id счётчика неудач]
+    RST --> R[200 api_key + token_id + user_id]
+```
+
+- **Где проверяется секрет:** в сервисном слое `auth` — один `SELECT` по PK `users.id` + **ровно один** constant-time `argon2.verify` против `users.auth_secret_hash` (тот же `verify_api_key`-стек, что для `api_tokens.key_hash`).
+- **Единый `401`:** ветки «нет юзера», «`auth_secret_hash IS NULL`» (Apple-only/admin-created без секрета), «неверный секрет» → **неотличимы** для клиента (как §1 Apple). Не раскрываем существование `user_id`.
+- **Мульти-устройство:** login = новая строка `api_tokens` (как §2); существующие токены не трогаются.
+
+### Set/rotate секрета (`POST /v1/auth/secret`)
+- Под Bearer (`current_user`); генерирует новый секрет, пишет `users.auth_secret_hash = argon2id(secret)`. Set (был `NULL`) или rotate (был задан — старый секрет перестаёт подходить). **Не отзывает** `api_tokens` (ротация секрета ≠ logout устройств).
+- Закрывает «перенос/восстановление»: Apple-юзер ставит секрет на своём аккаунте → может войти `/auth/login` с не-Apple клиента. Слияние **двух разных** существующих аккаунтов — вне MVP ([Q-AUTH-1](../../99-open-questions.md#q-auth-1)).
+
+### Где хранится секрет
+- `users.auth_secret_hash text NULL` — **один секрет на пользователя**, поле на `users` (не отдельная таблица — [ADR-024 §3](../../adr/ADR-024-user-id-secret-authentication.md)). **Без UNIQUE** (не identity-якорь). `NULL` у Apple/admin-юзеров без секрета. [03-data-model → users](../../03-data-model.md#users).
+- В логах — **никогда** не печатается секрет (как `key_hash`/`key_id` §Конвенции).
+
+### Гонки и идемпотентность
+- **Register:** конкуренции по `user_id` нет (генерируется сервером, PK-коллизия `u_...` статистически невозможна; при коллизии PK insert падает → ретрай/`500`, наблюдаемо). Параллельные register создают независимые аккаунты.
+- **Set/rotate `/auth/secret`:** конкурентные вызовы за одного юзера сериализуются на уровне строки `users` (последний выигрывает; оба секрета валидны лишь тот, чей хэш записан последним — клиент должен использовать секрет из последнего ответа). Это приемлемо: ротация — редкая явная операция.
+- **Login против ротации:** если секрет ротируется между чтением и проверкой — verify против актуального `auth_secret_hash` (читается в той же транзакции login); устаревший секрет → `401`.
+
 ## 2. Токен-модель и O(1) lookup ([ADR-008](../../adr/ADR-008-indexed-api-key-lookup.md))
 
 **Формат ключа клиента:** `lv_<key_id>_<secret>`.
@@ -59,6 +110,11 @@ flowchart TB
 - **Redis token bucket** на `key_id` (gранулярность — токен, не user: мульти-устройство масштабирует независимо).
 - Ключ Redis: `rl:{key_id}`; bucket 60 токенов / 60 s refill. Превышение → `429` + `Retry-After`.
 - Применяется в middleware после `current_user` (нужен `key_id`). Анонимные `/auth/apple` лимитируются отдельным bucket по IP (защита от брутфорса логина) — `rl:apple:{ip}`.
+
+### 5A. Anti-brute-force для `/auth/register` + `/auth/login` ([ADR-024](../../adr/ADR-024-user-id-secret-authentication.md))
+- **IP-лимит** на оба публичных эндпоинта — переиспользуется `check_login_rate_limit(client_ip)` (`app/auth/rate_limit.py`), как для `/auth/apple`. Превышение → `429` + `Retry-After`.
+- **Per-`user_id` лок на `/login`** (defense-in-depth, т.к. `user_id` виден в ответах API — не секрет): Redis fixed-window счётчик **неудачных** попыток, ключ `rl:login:uid:{user_id}`. Порог `LOGIN_USER_LOCK_THRESHOLD` (default 10) за окно `LOGIN_USER_LOCK_WINDOW_S` (default 900 s) → `429` + `Retry-After` на это значение `user_id` **независимо от IP**. Успешный вход сбрасывает счётчик (DEL ключа).
+- **Без user-enumeration-оракула:** счётчик и `429` ведутся по присланному значению `user_id` **независимо от существования юзера** — лок не раскрывает, существует ли `user_id` (как единый `401`). Нормативный контракт — [05-security → Клиентская аутентификация](../../05-security.md#клиентская-аутентификация-по-user_id--секрет-adr-024).
 
 ## 6. Cap конкурентных генераций (1 free / 3 pro)
 - **Счётчик активных джоб** на `user_id` (джоба «активна», пока не в терминальном `LIVE`/`FAILED`/`AWAITING_CLARIFICATION`).

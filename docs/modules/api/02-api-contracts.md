@@ -189,7 +189,7 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
 
 | Tag (рус.) | Назначение (description, рус.) | Эндпоинты |
 |---|---|---|
-| **Аутентификация** | Вход через Apple и управление токенами устройств | `POST /auth/apple`, `GET /auth/tokens`, `DELETE /auth/tokens/{id}` |
+| **Аутентификация** | Вход через Apple, регистрация/вход по `user_id`+секрет, управление токенами устройств | `POST /auth/apple`, `POST /auth/register`, `POST /auth/login`, `POST /auth/secret`, `GET /auth/tokens`, `DELETE /auth/tokens/{id}` |
 | **Проекты** | Создание сайтов, список, детали, удаление | `POST /projects`, `GET /projects`, `GET /projects/{pid}`, `DELETE /projects/{pid}` |
 | **Джобы генерации** | Статус генерации, уточняющие вопросы, ответы, live-поток событий | `GET /jobs/{jid}`, `GET /jobs/{jid}/events`, `GET /jobs/{jid}/questions`, `POST /jobs/{jid}/answers` |
 | **Правки и ревизии** | Post-delivery правки сайта, история ревизий, откат | `POST /projects/{pid}/edits`, `GET /projects/{pid}/revisions`, `POST /projects/{pid}/revisions/{revision_no}/rollback` |
@@ -203,6 +203,7 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
   - **`GET /metrics`** (Prometheus, internal-only — [observability §1](../observability/03-architecture.md#1-экспозиция-metrics));
   - **`GET /healthz` / `GET /readyz`** (liveness/readiness, инфра — [07-deployment.md → Health/readiness](../../07-deployment.md#health--readiness)).
 - **`POST /billing/webhook/adapty`** — **оставить** в схеме, но с явной пометкой в `description`: **server-to-server (S2S)**, вызывается провайдером подписок, **не** требует Bearer (верификация по секрету провайдера). Тег — «Биллинг». Пометка нужна, чтобы iOS-разработчик понимал, что этот endpoint **не** для клиента.
+- **`POST /auth/register` · `POST /auth/login`** ([ADR-024](../../adr/ADR-024-user-id-secret-authentication.md)) — **публичные** (вход/регистрация, **не** требуют Bearer — как `/auth/apple`), `include_in_schema=True`, тег «Аутентификация». Глобальный `BearerAuth` ([B.6 securityScheme](#b6-глобальные-метаданные-fastapi-рус-без-внутренних-маркеров)) на них **не** обязателен — описать в `description`, что авторизация не требуется (как у `/auth/apple`); лишний `Authorization`-заголовок безвреден. `POST /auth/secret` — наоборот, **требует** Bearer (глобальный `BearerAuth` применяется).
 - Прочие эндпоинты из сводной таблицы выше — публичные (`include_in_schema=True`, дефолт).
 
 ## B.6 Глобальные метаданные FastAPI (рус., без внутренних маркеров)

@@ -155,6 +155,49 @@ class AppleSignInResponse(BaseModel):
     user_id: str = Field(description="Идентификатор пользователя.")
 
 
+# --- POST /auth/register (ADR-024) ---
+
+
+class RegisterRequest(BaseModel):
+    device_label: str | None = Field(default=None, description="Необязательная метка устройства.")
+
+
+class RegisterResponse(BaseModel):
+    user_id: str = Field(description="Идентификатор созданного пользователя.")
+    secret: str = Field(
+        description="Секрет для входа с новых устройств (`POST /auth/login`). Показывается "
+        "один раз — сохраните."
+    )
+    api_key: str = Field(description="Bearer-ключ для запросов (`lv_<key_id>_<secret>`).")
+    token_id: str = Field(description="Идентификатор выданного токена устройства.")
+
+
+# --- POST /auth/login (ADR-024) ---
+
+
+class LoginRequest(BaseModel):
+    user_id: str = Field(min_length=1, description="Идентификатор пользователя.")
+    secret: str = Field(min_length=1, description="Секрет пользователя (из регистрации).")
+    device_label: str | None = Field(default=None, description="Необязательная метка устройства.")
+
+
+class LoginResponse(BaseModel):
+    api_key: str = Field(description="Bearer-ключ для запросов (`lv_<key_id>_<secret>`).")
+    token_id: str = Field(description="Идентификатор выданного токена устройства.")
+    user_id: str = Field(description="Идентификатор пользователя.")
+
+
+# --- POST /auth/secret (ADR-024 §5) ---
+
+
+class SetSecretResponse(BaseModel):
+    user_id: str = Field(description="Идентификатор пользователя.")
+    secret: str = Field(
+        description="Новый секрет для входа (`POST /auth/login`). Показывается один раз — "
+        "сохраните."
+    )
+
+
 # --- GET /auth/tokens ---
 
 
