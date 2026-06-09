@@ -1,11 +1,10 @@
-"""Async httpx-клиент к Adapty Server-side API v2 + верификация подписи вебхука.
+"""Async httpx-клиент к Adapty Server-side API v2.
 
-docs/02-tech-stack.md §Биллинг: клиент к Adapty — httpx (без отдельного SDK);
-верификация подписи вебхука — штатными hmac/hashlib (stdlib) по ADAPTY_WEBHOOK_SECRET.
-docs/modules/billing/03-architecture.md §2.1/§3, ADR-004/009.
+docs/02-tech-stack.md §Биллинг: клиент к Adapty — httpx (без отдельного SDK).
+docs/modules/billing/03-architecture.md §2.1/§3, ADR-004/009. Авторизация вебхука — Bearer
+constant-time в роутере (ADR-027 §A), HMAC-подпись с webhook-пути убрана.
 
 - getProfile: GET профиля по customer_user_id для ресинка subscriptions.
-- verify_webhook_signature: constant-time HMAC-SHA256 проверка подписи вебхука.
 - Redis token-bucket rate-limit к Adapty API (ключ adapty:rl) — ресинк не превышает квоту.
 - TLS verify включён (verify=True), таймауты заданы, 5xx/429 → AdaptyTransientError для
   backoff-ретрая (Celery), не валит весь батч ресинка.
@@ -13,8 +12,6 @@ docs/modules/billing/03-architecture.md §2.1/§3, ADR-004/009.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 from dataclasses import dataclass
 from typing import Any
 
@@ -56,21 +53,6 @@ class AdaptyProfile:
     will_renew: bool
     transaction_id: str | None
     raw: dict[str, Any]
-
-
-def verify_webhook_signature(secret: str, raw_body: bytes, signature: str | None) -> bool:
-    """Constant-time HMAC-SHA256 проверка подписи вебхука Adapty (docs/05-security.md §Adapty).
-
-    Подпись Adapty webhook v2 — HMAC-SHA256(secret, raw_body) в hex. Сравнение —
-    constant-time (hmac.compare_digest). Пустой секрет/подпись → False (невалидно → 401).
-    raw_body — СЫРОЕ тело запроса (до парсинга JSON), иначе подпись не сойдётся.
-    """
-    if not secret or not signature:
-        return False
-    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    # Адапти может прислать подпись с префиксом схемы — сравниваем хвост hex как есть.
-    candidate = signature.strip()
-    return hmac.compare_digest(expected, candidate)
 
 
 async def _check_rate_limit(redis_url: str) -> bool:

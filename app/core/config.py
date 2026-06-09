@@ -214,8 +214,9 @@ class Settings(BaseSettings):
     reconcile_interval_s: int = Field(default=120)
 
     # --- Billing / Adapty Sprint 3.5 (docs/07-deployment.md env-контракт, ADR-009) ---
-    # Секрет верификации подписи вебхука Adapty (POST /v1/billing/webhook/adapty, S2S —
-    # не Bearer). Невалидно → 401. HMAC/hashlib stdlib по этому секрету.
+    # Bearer-секрет вебхука Adapty (POST /v1/billing/webhook/adapty, ADR-027): сверка
+    # с заголовком Authorization constant-time (hmac.compare_digest), НЕ HMAC-подпись.
+    # Пусто/не задан → 500.
     adapty_webhook_secret: SecretStr = Field(default=SecretStr(""))
     # Secret-ключ Adapty Server-side API (getProfile-ресинк).
     adapty_api_key: SecretStr = Field(default=SecretStr(""))
@@ -228,6 +229,20 @@ class Settings(BaseSettings):
     grace_period_days: int = Field(default=7)
     # Частота beat-sweeper'а grace-teardown сайтов (billing.subscription_sweep).
     subscription_sweep_interval_s: int = Field(default=3600)
+    # --- Token-grant по тиру подписки (ADR-027, docs/07-deployment.md) ---
+    # SKU/vendor_product_id недельной подписки Adapty → токены SUBSCRIPTION_TOKENS_WEEKLY.
+    subscription_product_weekly: str = Field(default="lovable.pro.weekly")
+    # Число генераций (кредитов) при подписке тира SUBSCRIPTION_PRODUCT_WEEKLY.
+    # ge=0 (ADR-027): защита от мисконфига оператора — отрицательное значение дало бы
+    # rowcount=0 в _apply_balance_delta (инвариант balance>=0) → тихий рассинхрон
+    # ledger↔balance (credit_grants записан, баланс не обновлён).
+    subscription_tokens_weekly: int = Field(default=30, ge=0)
+    # SKU/vendor_product_id годовой подписки Adapty → токены SUBSCRIPTION_TOKENS_YEARLY.
+    subscription_product_yearly: str = Field(default="lovable.pro.yearly")
+    # Число генераций (кредитов) при подписке тира SUBSCRIPTION_PRODUCT_YEARLY.
+    subscription_tokens_yearly: int = Field(default=2000, ge=0)
+    # Fallback-число генераций для неизвестного vendor_product_id (не WEEKLY/YEARLY).
+    subscription_tokens_grant: int = Field(default=30, ge=0)
 
     # --- Sprint 4: build-sandbox runtime + egress (ADR-010, docs/07 env-контракт) ---
     # Имена/типы/дефолты — символ-в-символ с docs/07-deployment.md «Канонический список».

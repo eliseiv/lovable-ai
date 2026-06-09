@@ -162,6 +162,17 @@ x-app-env: &app-env
   BILLING_RESYNC_INTERVAL_S: ${BILLING_RESYNC_INTERVAL_S:-3600}
   GRACE_PERIOD_DAYS: ${GRACE_PERIOD_DAYS:-7}
   SUBSCRIPTION_SWEEP_INTERVAL_S: ${SUBSCRIPTION_SWEEP_INTERVAL_S:-3600}
+  # ADR-027: token-grant по тиру подписки. Все пять — app-env (читаются Settings,
+  # потребитель both=api+worker) → ОБЯЗАНЫ быть здесь, иначе extra=ignore молча
+  # отдаст дефолт config.py (фичу нельзя сконфигурировать в проде). Дефолты
+  # символ-в-символ с docs/07 env-контрактом (стр. 92-96). PRODUCT_* — SKU-строки
+  # (vendor_product_id Adapty, внешняя зависимость дашборда); TOKENS_* — int-кредиты
+  # в bonus_generations_balance. GRANT — fallback для неизвестного SKU.
+  SUBSCRIPTION_PRODUCT_WEEKLY: ${SUBSCRIPTION_PRODUCT_WEEKLY:-lovable.pro.weekly}
+  SUBSCRIPTION_TOKENS_WEEKLY: ${SUBSCRIPTION_TOKENS_WEEKLY:-30}
+  SUBSCRIPTION_PRODUCT_YEARLY: ${SUBSCRIPTION_PRODUCT_YEARLY:-lovable.pro.yearly}
+  SUBSCRIPTION_TOKENS_YEARLY: ${SUBSCRIPTION_TOKENS_YEARLY:-2000}
+  SUBSCRIPTION_TOKENS_GRANT: ${SUBSCRIPTION_TOKENS_GRANT:-30}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   BUILD_SANDBOX_RUNTIME: ${BUILD_SANDBOX_RUNTIME:-rootless}
   # PROD: build-контейнеры по-прежнему в изолированной egress-сети build-воркера

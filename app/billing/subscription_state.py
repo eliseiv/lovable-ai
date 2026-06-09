@@ -15,10 +15,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.adapty_client import AdaptyProfile
-from app.core.config import get_settings
-from app.core.ids import new_subscription_id
+from app.core.config import Settings, get_settings
+from app.core.ids import new_credit_grant_id, new_subscription_id
 from app.core.logging import get_logger
-from app.db.models import Subscription
+from app.db.models import CreditGrant, Subscription
 
 logger = get_logger(__name__)
 
@@ -29,6 +29,23 @@ EVENT_EXPIRED = "subscription_expired"
 EVENT_REFUNDED = "subscription_refunded"
 EVENT_BILLING_ISSUE = "billing_issue_detected"
 EVENT_ACCESS_LEVEL_UPDATED = "access_level_updated"
+EVENT_CANCELLED = "subscription_cancelled"
+
+# Известные event_type Adapty (docs §2.3). Неизвестный → 200 ignored (event_type).
+KNOWN_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        EVENT_STARTED,
+        EVENT_RENEWED,
+        EVENT_EXPIRED,
+        EVENT_REFUNDED,
+        EVENT_BILLING_ISSUE,
+        EVENT_ACCESS_LEVEL_UPDATED,
+        EVENT_CANCELLED,
+    }
+)
+
+# event_type → token-grant начисляется (docs §11.2: только started/renewed).
+TOKEN_GRANT_EVENT_TYPES: frozenset[str] = frozenset({EVENT_STARTED, EVENT_RENEWED})
 
 # Статусы subscriptions.status.
 STATUS_ACTIVE = "active"
@@ -152,6 +169,10 @@ async def apply_webhook_event(
         sub.status = STATUS_BILLING_ISSUE
         sub.grace_until = None
         sub.will_renew = bool(subscription_payload.get("will_renew", sub.will_renew))
+    elif event_type == EVENT_CANCELLED:
+        # cancelled (ADR-027 §F): «не продлится» — will_renew=false. status/access_level/
+        # grace_until НЕ меняем (teardown позже по subscription_expired). Токены не трогаем.
+        sub.will_renew = False
     else:
         # Неизвестный event_type: не меняем status, фиксируем raw (для аудита/алерта).
         logger.warning(
@@ -161,6 +182,68 @@ async def apply_webhook_event(
     sub.raw = raw_payload
     sub.synced_at = now
     return sub
+
+
+def resolve_tier_tokens(vendor_product_id: str | None, settings: Settings) -> int:
+    """Число токенов (кредитов) для начисления по тиру vendor_product_id (docs §11.1).
+
+    `== SUBSCRIPTION_PRODUCT_WEEKLY` → `SUBSCRIPTION_TOKENS_WEEKLY`;
+    `== SUBSCRIPTION_PRODUCT_YEARLY` → `SUBSCRIPTION_TOKENS_YEARLY`;
+    иной/неизвестный SKU → fallback `SUBSCRIPTION_TOKENS_GRANT` (начисление не теряется).
+    """
+    if vendor_product_id and vendor_product_id == settings.subscription_product_weekly:
+        return settings.subscription_tokens_weekly
+    if vendor_product_id and vendor_product_id == settings.subscription_product_yearly:
+        return settings.subscription_tokens_yearly
+    return settings.subscription_tokens_grant
+
+
+async def grant_subscription_tokens(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    event_id: str,
+    event_type: str,
+    vendor_product_id: str | None,
+) -> int:
+    """Начисляет пакет генераций по тиру подписки (ADR-027 §E, docs §11.2).
+
+    Относительный атомарный UPDATE users.bonus_generations_balance += tier_tokens (та же
+    механика, что admin `_apply_balance_delta`) + insert credit_grants(created_by='adapty',
+    idempotency_key=event_id) — БЕЗ commit (вызывающий коммитит в ТОЙ ЖЕ транзакции, что
+    insert billing_events). Дедуп начисления — UNIQUE billing_events.adapty_event_id (повтор
+    event_id → 200 duplicate, сюда не доходит) + партиальный UNIQUE credit_grants(user_id,
+    idempotency_key=event_id) как вторая страховка. Возвращает число начисленных токенов.
+    """
+    # Лениво: избегаем импорт-цикла billing↔services и переиспользуем существующую механику
+    # относительного атомарного UPDATE (НЕ дублируем логику начисления, docs §11.2).
+    from app.services.admin_service import _apply_balance_delta
+
+    settings = get_settings()
+    tier_tokens = resolve_tier_tokens(vendor_product_id, settings)
+
+    session.add(
+        CreditGrant(
+            id=new_credit_grant_id(),
+            user_id=user_id,
+            amount=tier_tokens,
+            reason=f"adapty:{event_type}",
+            idempotency_key=event_id,
+            created_by="adapty",
+        )
+    )
+    # tier_tokens >= 0 (env-конфиг), инвариант balance >= 0 не нарушается → None не ожидается.
+    await _apply_balance_delta(session, user_id, tier_tokens)
+    logger.info(
+        "billing_token_grant",
+        extra={
+            "user_id": user_id,
+            "event_id": event_id,
+            "vendor_product_id": vendor_product_id,
+            "tier_tokens": tier_tokens,
+        },
+    )
+    return tier_tokens
 
 
 def apply_profile_resync(sub: Subscription, profile: AdaptyProfile) -> None:

@@ -45,9 +45,9 @@ os.environ.setdefault("SEED_API_KEY", "test-seed-key")
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-anthropic-key")
 # Прикладные секреты, от которых зависят тесты, выставляются детерминированно здесь —
 # набор самодостаточен и НЕ наследует значения из окружения неявно (только инфра-стек
-# DATABASE_URL/REDIS_URL — внешняя зависимость тест-стека). Билд-вебхук Adapty
-# подписывается в тестах тем же ADAPTY_WEBHOOK_SECRET, что читает verify_webhook_signature
-# (get_settings().adapty_webhook_secret) — значения согласованы по построению.
+# DATABASE_URL/REDIS_URL — внешняя зависимость тест-стека). Вебхук Adapty авторизуется
+# (ADR-027 §A) Bearer-секретом ADAPTY_WEBHOOK_SECRET: тесты шлют тот же секрет в заголовке
+# Authorization, что читает роутер (get_settings().adapty_webhook_secret) — согласованы.
 os.environ.setdefault("ADAPTY_WEBHOOK_SECRET", "qa-test-adapty-webhook-secret")
 os.environ.setdefault("ADAPTY_API_KEY", "qa-test-adapty-api-key")
 # ADR-021 админ-плоскость: секрет X-Admin-Key для require_admin. Детерминированно задаём

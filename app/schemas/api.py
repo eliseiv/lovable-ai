@@ -298,6 +298,22 @@ class BillingMeResponse(BaseModel):
     quota: BillingQuota = Field(description="Лимиты и остатки квот.")
 
 
+class AdaptyWebhookResponse(BaseModel):
+    """Тело ответа на событие подписки: `{status, reason?, event_type?}`.
+
+    Пустые поля (`reason`, `event_type`) исключаются из ответа — он несёт ровно те ключи,
+    что применимы к конкретному исходу обработки события.
+    """
+
+    status: str = Field(description="`applied` / `ignored` / `duplicate`.")
+    reason: str | None = Field(
+        default=None, description="Причина ignored (empty_body/invalid_json/...)."
+    )
+    event_type: str | None = Field(
+        default=None, description="event_type при ignored неизвестного типа."
+    )
+
+
 # --- Админ-плоскость (ADR-021, не в публичной схеме: include_in_schema=False) ---
 
 
