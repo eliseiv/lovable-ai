@@ -327,7 +327,7 @@ Scrape-конфиг Prometheus и provisioning/дашборды Grafana — **к
 > Платформа **GitHub Actions** декларирована в стеке — [02-tech-stack.md → CI/CD-платформа](02-tech-stack.md#cicd-платформа-prod-deploy-adr-018) (managed, pin не требуется; pin конкретных third-party actions — требование devops). Этот раздел — нормативный контракт workflow.
 
 - **Jobs:** `lint` + `type-check` + `test` → **`deploy` job с `needs: [lint, type-check, test]`** (деплой только на зелёном). Команды lint/type-check/test — из [02-tech-stack.md](02-tech-stack.md) / [06-testing-strategy.md](06-testing-strategy.md), не дублируются здесь.
-- **`deploy` деплоит ВСЕ прод-инстансы (нормативно, [Q-DEPLOY-4](99-open-questions.md#q-deploy-4) resolved).** Один `deploy`-job по SSH (`SSH_HOST`/`SSH_USER`/`SSH_PRIVATE_KEY`) на тот же хост `87.239.135.154` последовательно деплоит **каждый** инстанс из нормативного списка ниже. На push в `main` авто-деплоятся **все** инстансы из списка (`corelysite.shop`, `nexoraweb.shop`, `qyvrenzo.shop`), а не только `corelysite`. Ручной деплой клона (прежний baseline) больше не требуется как штатный путь — CI делает это автоматически.
+- **`deploy` деплоит ВСЕ прод-инстансы (нормативно, [Q-DEPLOY-4](99-open-questions.md#q-deploy-4) resolved).** Один `deploy`-job по SSH (`SSH_HOST`/`SSH_USER`/`SSH_PRIVATE_KEY`) на тот же хост `87.239.135.154` последовательно деплоит **каждый** инстанс из нормативного списка ниже. На push в `main` авто-деплоятся **все** инстансы из списка (`corelysite.shop`, `nexoraweb.shop`, `qyvrenzo.shop`, `lumorixsite.shop`), а не только `corelysite`. Ручной деплой клона (прежний baseline) больше не требуется как штатный путь — CI делает это автоматически.
 
   **Нормативный список инстансов (источник истины для workflow).** Workflow держит инстансы **списком/массивом** `{dir, project}` — добавление третьего инстанса = добавление одной строки в список, без правки логики деплоя (требование расширяемости):
 
@@ -336,6 +336,7 @@ Scrape-конфиг Prometheus и provisioning/дашборды Grafana — **к
   | corelysite | `/opt/corelysite` | `corelysite` | `corelysite.shop` |
   | nexoraweb | `/opt/nexoraweb` | `nexoraweb` | `nexoraweb.shop` |
   | qyvrenzo | `/opt/qyvrenzo` | `qyvrenzo` | `qyvrenzo.shop` |
+  | lumorix | `/opt/lumorix` | `lumorix` | `lumorixsite.shop` |
 
 - **Команда деплоя per-инстанс (нормативно, точная).** Для каждого инстанса из списка выполняется на сервере:
   ```
