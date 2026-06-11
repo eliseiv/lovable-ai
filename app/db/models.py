@@ -187,6 +187,15 @@ class GenerationJob(Base):
     failure_event_pending: Mapped[bool] = mapped_column(
         nullable=False, default=False, server_default=sql_text("false")
     )
+    # BCP-47 язык контента сайта (ADR-028 ревизует ADR-025). Детерминированный серверный
+    # детект из ИСХОДНОГО project.prompt (script-эвристика) один раз на старте фазы interview,
+    # ДО Agent 1. Crash-устойчивый якорь: переживает рестарт воркера между фазами,
+    # восстанавливается без передетекта; единый источник для language-директивы Agent 1/2.
+    # Fallback при неуверенном/смешанном script — 'en' (= default). См. docs/03-data-model.md
+    # → generation_jobs.content_language, pipeline §Язык/локализация.
+    content_language: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=sql_text("'en'"), default="en"
+    )
     # Финальная спека Agent 2: текст ≤ 16 KB inline, иначе spec_ref в S3.
     spec_tz: Mapped[str | None] = mapped_column(Text, nullable=True)
     spec_ref: Mapped[str | None] = mapped_column(Text, nullable=True)

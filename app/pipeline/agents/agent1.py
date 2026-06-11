@@ -20,6 +20,7 @@ from app.pipeline.agents.structured import (
     UsageHook,
     run_structured_agent,
 )
+from app.pipeline.language import DetectedLanguage
 from app.pipeline.prompts import load_prompt
 
 _SYSTEM_PROMPT = load_prompt("agent1_interviewer")
@@ -81,9 +82,17 @@ def _validate_questions(data: Any) -> list[ParsedQuestion]:
     return questions
 
 
+def _build_user_content(prompt: str, language: DetectedLanguage) -> str:
+    """Серверная language-директива (ADR-028 §3) + промт. Язык — детерминированный детект
+    из исходного промпта (`content_language`), НЕ само-детект модели."""
+    directive = f"Generate all questions in {language.marker_value}."
+    return f"{directive}\n\nUser website idea:\n\n{prompt}"
+
+
 async def run_agent1(
     settings: Settings,
     prompt: str,
+    language: DetectedLanguage,
     *,
     before_call: GuardHook,
     after_call: UsageHook,
@@ -91,6 +100,8 @@ async def run_agent1(
 ) -> Agent1Result:
     """Один шаг Agent 1 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
 
+    `language` — серверный детерминированный детект языка из исходного промпта (ADR-028);
+    инжектируется в ввод явной директивой (Agent 1 язык НЕ детектит сам).
     before_call/after_call/on_attempt_failure инъектируются task-слоем (budget/wall-clock-гард
     перед каждым вызовом; запись llm_usage после каждого; диагностика parse/schema-фейла §I.4).
     На исчерпании ретраев бросает StructuredOutputError → task → FAILED(invalid_agent_output).
@@ -102,7 +113,7 @@ async def run_agent1(
         agent="agent1",
         model=settings.agent1_model,
         system_prompt=_SYSTEM_PROMPT,
-        user_content=f"User website idea:\n\n{prompt}",
+        user_content=_build_user_content(prompt, language),
         validate=_validate_questions,
         before_call=before_call,
         after_call=after_call,

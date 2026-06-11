@@ -71,6 +71,7 @@ from app.pipeline.guards import (
     check_fix_guards,
     check_pre_call_guards,
 )
+from app.pipeline.language import detect_language, language_from_bcp47
 from app.schemas.agent_output import AgentOutputError
 from app.storage import s3
 from app.storage.s3 import S3Storage, get_storage
@@ -173,22 +174,31 @@ async def _interview(job_id: str) -> None:
         # (docs/modules/billing/03 §5). Идемпотентно по job_id (guard от acks_late/реплея) —
         # коммитится одной транзакцией с переходом ниже (transition делает commit).
         await count_generation_start(session, job)
+        # project гарантированно жив и не None — проверено _abort_if_project_deleted выше.
+        project = await session.get(Project, job.project_id)
+        assert project is not None
+        # ADR-028: детерминированный серверный детект языка из ИСХОДНОГО project.prompt
+        # (script-эвристика) ОДИН РАЗ, ДО Agent 1. Результат — crash-устойчивый якорь в
+        # generation_jobs.content_language, фиксируется в той же транзакции, что и transition
+        # в INTERVIEWING (первый commit). _interview стартует только из state==CREATED, поэтому
+        # детект выполняется ровно один раз за джобу (передетекта при crash-resume нет — на
+        # фазе spec язык читается из БД, см. _spec).
+        language = detect_language(project.prompt)
+        job.content_language = language.bcp47
         await transition(
             session,
             job,
             JobState.INTERVIEWING,
             event_type="agent_started",
-            payload={"agent": "agent1"},
+            payload={"agent": "agent1", "content_language": language.bcp47},
         )
-        # project гарантированно жив и не None — проверено _abort_if_project_deleted выше.
-        project = await session.get(Project, job.project_id)
-        assert project is not None
         # ADR-020 §I: usage пишется хуком after_call ПОСЛЕ каждого LLM-вызова (включая retry).
         before_call, after_call, on_fail = _make_agent_hooks(session, job, "agent1")
         try:
             result = await run_agent1(
                 settings,
                 project.prompt,
+                language,
                 before_call=before_call,
                 after_call=after_call,
                 on_attempt_failure=on_fail,
@@ -267,6 +277,11 @@ async def _spec(job_id: str) -> None:
         await record_event(session, job.id, "agent_started", payload={"agent": "agent2"})
         await session.commit()
 
+        # ADR-028 crash-resume: язык НЕ передетектится на фазе spec — берётся из зафиксированного
+        # на фазе interview generation_jobs.content_language (единый серверный детект из исходного
+        # промпта, переживший рестарт воркера между фазами). Инжектируется в директиву Agent 2.
+        language = language_from_bcp47(job.content_language)
+
         # Agent 2: спека. usage пишется хуком after_call (ADR-020 §I) — без отдельного record.
         a2_before, a2_after, a2_fail = _make_agent_hooks(session, job, "agent2")
         try:
@@ -274,6 +289,7 @@ async def _spec(job_id: str) -> None:
                 settings,
                 project.prompt,
                 qa_pairs,
+                language,
                 before_call=a2_before,
                 after_call=a2_after,
                 on_attempt_failure=a2_fail,

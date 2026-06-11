@@ -14,9 +14,9 @@ docs/adr/ADR-025-content-language-autodetect-spec-marker.md; cross-ref docs/06-t
      тот же класс, что пустая спека.
   3. Маркер с ведущими пробелами/переводами строк → strip → проходит (startswith после strip).
   4. Контракт промтов — нет кириллицы / термина `ТЗ` ни в одном из 5 .txt-промтов.
-  5. Контракт промтов — language-инструкции присутствуют (Agent 2 детект+маркер; Agent 3
-     <html lang>+контент по маркеру; Agent 4 fixer/editor — сохранение языка; Agent 1 — вопросы
-     на языке промпта).
+  5. Контракт промтов — language-инструкции присутствуют (ADR-028: Agent 1/2 следуют СЕРВЕРНОЙ
+     директиве, само-детект отозван; Agent 2 — маркер из директивы; Agent 3 <html lang>+контент
+     по маркеру; Agent 4 fixer/editor — сохранение языка).
   6. Маркер символ-в-символ: строка `**Content language:**` идентична в промтах Agent 2/3/4 и в
      константе agent2.py.
 
@@ -144,22 +144,30 @@ def test_prompt_has_no_tz_term(prompt_name):  # noqa: ANN001
 # --------------------------------------------------------------------------- #
 
 
-def test_agent2_prompt_has_language_detection_and_marker_instruction():
-    """Agent 2: детектит язык из ввода + ОБЯЗАН начинать spec_markdown маркером."""
+def test_agent2_prompt_has_language_directive_and_marker_instruction():
+    """Agent 2 (ADR-028): следует СЕРВЕРНОЙ language-директиве + ОБЯЗАН начинать spec_markdown
+    маркером со значением из директивы. Промт НЕ инструктирует само-детект."""
     text = load_prompt("agent2_spec_writer")
     low = text.lower()
-    # Детект языка из пользовательского ввода.
+    # Серверная директива — единый источник языка (не само-детект модели, ADR-028 §3/§4).
     assert "content language" in low
-    assert "language" in low and "detect" in low.replace("determine", "detect")
+    assert "directive" in low
+    assert "server" in low
+    # Запрет само-детекта/перегадывания языка (ADR-028: агент язык не детектит).
+    # (Промт может переносить строку между "do not" и "detect"; матчим continuous-фразу.)
+    assert "detect or re-guess" in low
     # Требование маркера в начале spec_markdown.
     assert _MARKER in text
     assert "must begin" in low or "must start" in low
 
 
-def test_agent2_prompt_marker_priority_of_answers():
-    """Agent 2: при расхождении язык ОТВЕТОВ важнее языка промпта (§Язык/локализация п.2)."""
+def test_agent2_prompt_obeys_server_directive_not_answers():
+    """Agent 2 (ADR-028 §4): приоритет «ответы > промпт» ОТОЗВАН — промт обязывает следовать
+    серверной директиве и НЕ позволять языку ответов переопределять её."""
     low = load_prompt("agent2_spec_writer").lower()
-    assert "answers" in low and "priority" in low
+    assert "obey the server directive" in low
+    # Язык ответов НЕ переопределяет директиву (каскад прод-бага закрыт).
+    assert "answers override" in low or "answers to override" in low or "answers" in low
 
 
 def test_agent3_prompt_has_html_lang_and_marker_instruction():
@@ -181,10 +189,18 @@ def test_agent4_prompts_preserve_language(prompt_name):  # noqa: ANN001
     assert "do not switch" in low or "do not translate" in low
 
 
-def test_agent1_prompt_asks_in_prompt_language():
-    """Agent 1: задаёт вопросы на языке оригинального промпта (§Язык/локализация п.6)."""
+def test_agent1_prompt_asks_in_server_directive_language():
+    """Agent 1 (ADR-028 §4): задаёт вопросы на языке СЕРВЕРНОЙ директивы (детерминированный
+    детект из исходного промпта), НЕ детектит/перегадывает язык сам."""
     low = load_prompt("agent1_interviewer").lower()
-    assert "same language" in low
+    # Серверная content-language директива — первая строка ввода (ADR-028 §4).
+    assert "directive" in low
+    assert "server" in low
+    assert "obey the server directive" in low
+    # Запрет само-детекта языка (ADR-028: Agent 1 язык не угадывает). Промт переносит строку
+    # внутри фразы "detect or re-guess" — матчим устойчивую к переносам подстроку.
+    assert "do not detect" in low
+    # Язык решается детерминированно сервером из исходного промпта.
     assert "prompt" in low
 
 

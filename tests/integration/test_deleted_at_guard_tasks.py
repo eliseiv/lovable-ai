@@ -270,7 +270,7 @@ async def test_interview_happy_path_not_broken_by_guard(monkeypatch, _noop_publi
 
     agent1_called = {"n": 0}
 
-    async def _stub_agent1(settings, prompt, **_hooks):  # noqa: ANN001, ANN003, ANN202
+    async def _stub_agent1(settings, prompt, language, **_hooks):  # noqa: ANN001, ANN003, ANN202
         agent1_called["n"] += 1
         call = AgentCall(
             text="{}",

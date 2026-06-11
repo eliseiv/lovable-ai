@@ -192,7 +192,13 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
     # инъектируемые хуки (before_call/after_call/on_attempt_failure) от task-слоя. usage
     # пишется хуком after_call ПОСЛЕ вызова (а не task'ом из result.call) — фейк вызывает
     # before_call (budget/wall-clock-гард) + after_call(call) (cost-ledger), как реальный агент.
-    async def _fake_agent1(settings, prompt, *, before_call, after_call, on_attempt_failure):  # noqa: ANN001, ANN202
+    # ADR-028: run_agent1/run_agent2 принимают серверную language-директиву (детерминированный
+    # детект из исходного промпта). Фейк ассертит, что _interview/_spec передают DetectedLanguage
+    # со значением `en` (английский промпт "Landing page for a coffee shop").
+    async def _fake_agent1(
+        settings, prompt, language, *, before_call, after_call, on_attempt_failure
+    ):  # noqa: ANN001, ANN202, E501
+        assert language.bcp47 == "en", f"ожидался серверный детект en, получено {language.bcp47}"
         await before_call()
         call = _call()
         await after_call(call)
@@ -205,13 +211,17 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
         )
 
     async def _fake_agent2(
-        settings, prompt, qa_pairs, *, before_call, after_call, on_attempt_failure
+        settings, prompt, qa_pairs, language, *, before_call, after_call, on_attempt_failure
     ):  # noqa: ANN001, ANN202, E501
+        # Crash-resume (ADR-028): язык на фазе spec читается из job.content_language (en),
+        # НЕ передетектится. Маркер несёт значение директивы.
+        assert language.bcp47 == "en", f"ожидался язык из БД en, получено {language.bcp47}"
         await before_call()
         call = _call()
         await after_call(call)
         return Agent2Result(
-            spec_markdown="**Content language:** English (en)\n\n# Spec\nCoffee shop landing.",
+            spec_markdown=f"**Content language:** {language.marker_value}"
+            "\n\n# Spec\nCoffee shop landing.",
             call=call,
         )
 
@@ -258,6 +268,9 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
     async with session_scope() as s:
         job = await s.get(GenerationJob, jid)
         assert job.state == JobState.AWAITING_CLARIFICATION
+        # ADR-028: серверный детект из исходного (английского) промпта зафиксирован в БД ДО
+        # Agent 1 — crash-устойчивый якорь языка, переживающий рестарт между фазами.
+        assert job.content_language == "en"
         qs = (await s.execute(select(Question).where(Question.job_id == jid))).scalars().all()
         assert len(qs) == 2
         qids = [q.id for q in qs]

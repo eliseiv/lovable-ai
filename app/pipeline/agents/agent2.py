@@ -20,6 +20,7 @@ from app.pipeline.agents.structured import (
     UsageHook,
     run_structured_agent,
 )
+from app.pipeline.language import DetectedLanguage
 from app.pipeline.prompts import load_prompt
 
 _SYSTEM_PROMPT = load_prompt("agent2_spec_writer")
@@ -36,8 +37,22 @@ class Agent2Result:
     call: AgentCall
 
 
-def _build_user_content(prompt: str, qa_pairs: list[tuple[str, str]]) -> str:
-    lines = [f"Original user prompt:\n{prompt}\n", "Clarifying questions and answers:"]
+def _build_user_content(
+    prompt: str, qa_pairs: list[tuple[str, str]], language: DetectedLanguage
+) -> str:
+    # Серверная language-директива (ADR-028 §3): язык — детерминированный детект из исходного
+    # промпта (content_language), НЕ само-детект модели. Маркер `**Content language:**` в начале
+    # spec_markdown обязан нести именно это значение (ADR-028 §3/§5).
+    directive = (
+        f"Generate all user-facing content in {language.marker_value}. "
+        f"Begin the spec_markdown value with the exact marker line "
+        f"`{_CONTENT_LANGUAGE_MARKER} {language.marker_value}`."
+    )
+    lines = [
+        directive,
+        f"\nOriginal user prompt:\n{prompt}\n",
+        "Clarifying questions and answers:",
+    ]
     for idx, (question, answer) in enumerate(qa_pairs, start=1):
         lines.append(f"{idx}. Q: {question}")
         lines.append(f"   A: {answer}")
@@ -75,6 +90,7 @@ async def run_agent2(
     settings: Settings,
     prompt: str,
     qa_pairs: list[tuple[str, str]],
+    language: DetectedLanguage,
     *,
     before_call: GuardHook,
     after_call: UsageHook,
@@ -82,6 +98,9 @@ async def run_agent2(
 ) -> Agent2Result:
     """Один шаг Agent 2 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
 
+    `language` — серверный детерминированный детект языка из исходного промпта (ADR-028);
+    инжектируется явной директивой; значение маркера `**Content language:**` приходит отсюда,
+    НЕ из само-детекта модели.
     Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4).
     На исчерпании ретраев бросает StructuredOutputError → task → FAILED(invalid_agent_output).
     """
@@ -92,7 +111,7 @@ async def run_agent2(
         agent="agent2",
         model=settings.agent2_model,
         system_prompt=_SYSTEM_PROMPT,
-        user_content=_build_user_content(prompt, qa_pairs),
+        user_content=_build_user_content(prompt, qa_pairs, language),
         validate=_validate_spec,
         before_call=before_call,
         after_call=after_call,

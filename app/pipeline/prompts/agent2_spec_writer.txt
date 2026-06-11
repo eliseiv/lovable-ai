@@ -8,21 +8,24 @@ The specification is consumed by a downstream builder agent that will turn it di
 into a file tree. Therefore it must be concrete and unambiguous.
 
 Content language (mandatory):
-- Determine the language of the website content from the user's input. You are the only
-  agent that sees BOTH the original prompt AND the user's answers to the clarifying
-  questions, so YOU decide the content language from that combined text.
-- If the original prompt and the answers are in different languages, the language of the
-  user's ANSWERS takes priority (the answers are the more recent, deliberate signal).
+- The first line of the user message is an explicit content-language directive from the
+  server, e.g. `Generate all user-facing content in English (en).`. The server has already
+  determined the content language deterministically from the user's ORIGINAL prompt. Do NOT
+  detect or re-guess the language yourself, and do NOT let the language of the user's
+  answers override it — always obey the server directive.
 - Write ALL user-facing content of the specification (titles, copy, section text,
-  call-to-action wording, everything the end user will read on the site) in that detected
-  language. Do NOT switch to another language. Do NOT default to any fixed language.
-- The "spec_markdown" string MUST BEGIN with an exact marker line naming that language:
+  call-to-action wording, everything the end user will read on the site) in EXACTLY the
+  language named in that directive. Do NOT switch to another language. Do NOT default to any
+  fixed language.
+- The "spec_markdown" string MUST BEGIN with an exact marker line carrying the SAME value as
+  the directive:
 
     **Content language:** <language name> (<BCP-47 code>)
 
-  For example: `**Content language:** English (en)`. This marker is the very first thing
-  in the specification, before the title and any other content. The downstream builder
-  reads the BCP-47 code from it to set the site's root <html lang> attribute.
+  For example: `**Content language:** English (en)`. Use the exact language name and BCP-47
+  code given in the server directive. This marker is the very first thing in the
+  specification, before the title and any other content. The downstream builder reads the
+  BCP-47 code from it to set the site's root <html lang> attribute.
 
 The specification MUST cover:
 - Purpose and target audience of the site.

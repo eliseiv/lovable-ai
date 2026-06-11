@@ -31,7 +31,7 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 Создаёт проект и стартует генерацию (Agent 1).
 - Headers: `Idempotency-Key` (обяз.).
 - Body: `{ "prompt": "string", "title": "string?" }`.
-- **Язык контента сайта НЕ принимается параметром** — авто-детект из текста пользователя (промпт + ответы), язык сайта = язык, на котором отвечает пользователь ([ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md), [pipeline §Язык/локализация](../pipeline/03-architecture.md#языклокализация-контента-сайта-adr-025)). Схема body не меняется; явный `locale`-override — вне MVP ([Q-LOCALE-1](../../99-open-questions.md#q-locale-1)).
+- **Язык контента сайта НЕ принимается параметром** — детерминированный серверный детект из **исходного** `prompt` (язык сайта = язык исходного промпта пользователя), [ADR-028](../../adr/ADR-028-deterministic-source-prompt-language-detection.md) ревизует [ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md), [pipeline §Язык/локализация](../pipeline/03-architecture.md#языклокализация-контента-сайта--детерминированный-детект-adr-028-ревизует-adr-025). Схема body не меняется; явный `locale`-override — вне MVP ([Q-LOCALE-1](../../99-open-questions.md#q-locale-1)).
 - Гейтинг: quota-gate (активный entitlement + остаток квоты — генерации/`max_projects`/`max_concurrent`). Нарушение → `402`. Контракт гейта — [modules/billing/02-api-contracts.md §3](../billing/02-api-contracts.md#3-quota-gate-на-post-v1projects-и-post-v1projectspidedits).
 - `202` → `{ "project_id": "p_...", "job_id": "j_..." }`.
 - Ошибки: `401`, `402` (RFC-7807, поля `required_entitlement` + `reason` ∈ `no_entitlement`/`quota_exhausted`/`project_limit`/`concurrency_limit`), `422`.
