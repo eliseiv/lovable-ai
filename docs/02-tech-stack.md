@@ -16,8 +16,9 @@
 | Uvicorn | **0.32.x** | ASGI-сервер для FastAPI. |
 | Pydantic | **2.x** | Валидация схем API, settings. |
 | SQLAlchemy | **2.0.x (async)** | ORM, async-движок (`asyncpg`). System of record — Postgres. |
-| asyncpg | **0.30.x** | Async-драйвер Postgres. |
-| Alembic | **1.14.x** | Миграции схемы БД. |
+| asyncpg | **0.30.x** | Async-драйвер Postgres (рантайм приложения: FastAPI/Celery, `DATABASE_URL`). |
+| psycopg (3) | **3.2.x** (`psycopg[binary]`) | **SYNC-драйвер Postgres для Alembic** ([ADR-031](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md)). Alembic-движок переведён с async (asyncpg+`run_sync`) на **sync psycopg** (`DATABASE_URL_SYNC`, `postgresql+psycopg://`), где `op.get_context().autocommit_block()` для non-transactional DDL (`ALTER TYPE ... ADD VALUE`) работает штатно. **Прямая зависимость** — объявить в `pyproject.toml` явно (extra `binary` тянет C-биндинги), **не** полагаться на транзитив. Используется **только** alembic-движком (env.py), не рантаймом приложения. |
+| Alembic | **1.14.x** | Миграции схемы БД. Движок — **sync psycopg** (см. выше, [ADR-031](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md)), а не async asyncpg. |
 | Postgres | **16** | Реляционная БД, jsonb для raw-payload вебхуков, enum для state. |
 
 ## Очереди и фон

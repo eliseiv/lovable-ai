@@ -112,6 +112,12 @@ TODO|FIXME|XXX|HACK|WIP|stub|mockData
 - Idempotency: повторный запуск polling не дублирует данные.
 - Race conditions: параллельные вызовы не приводят к inconsistent state.
 
+#### Migration tests (если в diff есть миграция БД) — проверка РЕАЛЬНОГО применения DDL
+`alembic upgrade head` exit 0 и продвинутый `alembic_version` НЕ доказывают, что DDL применился: на async-движке (asyncpg) `autocommit_block()` молча теряет `ALTER TYPE ... ADD VALUE`, version при этом коммитится (ложно-зелёный прод). Поэтому тест миграции ОБЯЗАН:
+
+- **Прогонять миграцию тем же движком/механизмом, что прод migrate-сервис** (тот же `migrations/env.py`, тот же драйвер — asyncpg, если прод async). Запрещено прогонять миграцию иным движком/способом, чем прод: расхождение test↔prod не поймается.
+- **Проверять фактическое состояние схемы ПОСЛЕ `upgrade head`**, а не только exit 0 / `alembic_version`. Для enum-миграции — запросом к `pg_enum` подтвердить, что новое значение реально присутствует в типе; для индекса/колонки/constraint — что объект существует в каталоге. Если ожидаемый DDL не материализовался при exit 0 — это `blame: "code"` (миграция написана несовместимо с движком), `verdict: "rework"`.
+
 ### Шаг 3: Реализация тестов
 
 Используй тестовый фреймворк из `docs/02-tech-stack.md`. Способ поднятия реальной БД для integration — из `docs/06-testing-strategy.md`.
@@ -261,6 +267,7 @@ JSON по формату ниже.
 - [ ] Authz тесты (cross-user isolation) написаны
 - [ ] Contract tests для response schema
 - [ ] Idempotency тесты для polling / async (если применимо)
+- [ ] Если в diff миграция БД: тест прогоняет её тем же движком/драйвером, что прод (asyncpg при async env.py), и проверяет РЕАЛЬНОЕ состояние схемы после `upgrade head` (для enum — значение в `pg_enum`), а не только exit 0 / `alembic_version`; нематериализованный DDL при exit 0 → `blame: "code"`, `rework`
 - [ ] Все required env для тестов заданы детерминированно в conftest/фикстурах (прогон воспроизводим без ручного экспорта)
 - [ ] Sad paths покрыты (4xx, 5xx)
 - [ ] Coverage соответствует gate

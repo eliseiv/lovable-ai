@@ -52,6 +52,12 @@
 - **failure_log в S3 (S2):** deploy пишет `logs/{job_id}/build.log` с машинной шапкой; pipeline читает по `failure_log_ref`, парсит `failure_class`, подаёт хвост (`FIXER_LOG_TAIL_BYTES`) в Agent 4.
 - **Идемпотентность:** повторный `POST /projects` / `/edits` с тем же `Idempotency-Key` не создаёт дубль; повторный `/answers` на уже продвинувшейся джобе безопасен ([Q-PIPELINE-2](99-open-questions.md#q-pipeline-2)); повторный вебхук с тем же `adapty_event_id` обрабатывается один раз (включая **token-grant**: кредиты не начисляются повторно, [ADR-027 §E](adr/ADR-027-adapty-webhook-bearer-token-grant.md)).
 - **Crash-resumability:** джоба в промежуточном `state` подхватывается диспетчером после рестарта воркера.
+- **Non-transactional DDL-миграции — РЕАЛЬНОЕ применение DDL (обязателен, [ADR-031](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md), [03-data-model → Migration-guidance](03-data-model.md#migration-guidance--non-transactional-ddl-adr-031)):** на свежей эфемерной БД прогон `alembic upgrade head` через **тот же `env.py` / тот же URL-механизм, что прод-migrate** (sync psycopg, `DATABASE_URL_SYNC`) обязан после апгрейда проверить, что значение enum **реально создано в `pg_enum`**:
+  ```sql
+  SELECT 1 FROM pg_enum e JOIN pg_type t ON e.enumtypid = t.oid
+  WHERE t.typname = 'job_state' AND e.enumlabel = 'EDITING';
+  ```
+  — а не только что `alembic_version` встал на `20260612_0001`. ⚠️ **Проверка одного `alembic_version` НЕДОСТАТОЧНА** — именно она пропустила прод-инцидент 2026-06-12 (version закоммитился, `ADD VALUE` не применился под async-движком). Тест ОБЯЗАН гонять прод-путь (`env.py`), а не отдельный sync-коннект мимо него. **Идемпотентность ([ADR-031 §C](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md)):** повторный прогон миграции `20260612_0001` на БД, где `EDITING` **уже** существует (эмуляция 4 исправленных вручную прод-БД), — **не падает** (`ADD VALUE IF NOT EXISTS` / проверка `pg_enum`) и не дублирует значение.
 
 ## Contract
 

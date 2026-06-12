@@ -55,6 +55,12 @@ async def test_migration_0006_up_down_and_seed(autonomous_db):
     env["DATABASE_URL"] = _asyncpg_dsn(base_url, db=tmp_db).replace(
         "postgresql://", "postgresql+asyncpg://"
     )
+    # ADR-031: alembic-движок — sync psycopg по DATABASE_URL_SYNC (env.py читает его, НЕ
+    # DATABASE_URL). Без ключа на throwaway-БД env.py мигрировал бы не ту БД / падал
+    # RuntimeError. Указываем psycopg-DSN на ту же throwaway-БД (прод-путь миграций).
+    env["DATABASE_URL_SYNC"] = _asyncpg_dsn(base_url, db=tmp_db).replace(
+        "postgresql://", "postgresql+psycopg://"
+    )
 
     def _alembic(*args: str) -> None:
         result = subprocess.run(  # noqa: S603

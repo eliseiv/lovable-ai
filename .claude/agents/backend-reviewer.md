@@ -91,6 +91,9 @@ TODO|FIXME|XXX|HACK|WIP|stub
 - Exception handling — конкретные типы, не голый `except`?
 - Retry / circuit breaker для external HTTP?
 
+#### Если в diff есть миграция БД (DDL): применимость механизма на фактическом движке
+Открой `migrations/env.py` и установи реальный движок миграций (sync vs async/asyncpg). Проверь, что механизм миграции ДЕЙСТВИТЕЛЬНО применяет DDL на этом движке — не верь словам «вне транзакции» в коде/JSON, проверь совместимость самого механизма. Конкретно: `op.get_context().autocommit_block()` для non-transactional DDL (`ALTER TYPE ... ADD VALUE`, `CREATE INDEX CONCURRENTLY`) при async env.py (asyncpg через `run_sync`) НЕ применяет DDL — `alembic_version` коммитится, а схема не меняется (ложно-зелёный прод). Если механизм несовместим с фактическим движком — `severity: "critical"` (`category: "migration"`), `verdict: "rework"`: указать backend применить проверенно-совместимый с asyncpg паттерн из `docs/`. Также убедись, что backend в `follow_up_for_qa` потребовал проверить РЕАЛЬНОЕ применение DDL (для enum — `pg_enum`), а не только `alembic_version`; если нет — finding `major`.
+
 ### Шаг 6: Качество кода
 - Type hints / типизация — везде?
 - Docstrings для public API?
@@ -165,6 +168,7 @@ TODO|FIXME|XXX|HACK|WIP|stub
 - [ ] Каждый endpoint/model/event из ТЗ проверен
 - [ ] Безопасность проверена (auth, секреты, TLS)
 - [ ] Отказоустойчивость проверена (idempotency, retry, N+1)
+- [ ] Если в diff миграция БД: сверен фактический движок по `migrations/env.py`; механизм реально применяет DDL на нём (non-transactional DDL не через `autocommit_block()` при async/asyncpg — иначе `critical`); backend потребовал у qa проверку реального применения DDL (для enum — `pg_enum`)
 - [ ] Severity classification применён корректно (функциональный пробел = major)
 - [ ] JSON корректен
 

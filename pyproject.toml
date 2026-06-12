@@ -10,6 +10,11 @@ dependencies = [
     "pydantic-settings==2.*",
     "sqlalchemy[asyncio]==2.0.*",
     "asyncpg==0.30.*",
+    # ADR-031: SYNC-драйвер Postgres ТОЛЬКО для Alembic-движка (migrations/env.py).
+    # autocommit_block() для non-transactional DDL (ALTER TYPE ADD VALUE) работает штатно
+    # лишь на sync-движке; рантайм приложения остаётся на asyncpg. extra binary тянет
+    # C-биндинги. Прямая зависимость (docs/02-tech-stack.md §psycopg), не транзитив.
+    "psycopg[binary]==3.2.*",
     "alembic==1.14.*",
     "celery==5.4.*",
     "redis==5.*",
