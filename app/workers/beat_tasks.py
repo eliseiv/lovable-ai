@@ -6,11 +6,11 @@
 
 E1. sweeper: AWAITING_CLARIFICATION дольше CLARIFICATION_TTL_S → FAILED(clarification_timeout).
 E2. reconciler (ADR-019): ВСЕ активные нетерминальные состояния (CREATED/INTERVIEWING/
-    SPECCING/BUILDING/DEPLOYING/FIXING, кроме AWAITING_CLARIFICATION — свой TTL §E1) дольше
-    STUCK_THRESHOLD_S по last_transition_at. Две ветви:
+    SPECCING/EDITING/BUILDING/DEPLOYING/FIXING, кроме AWAITING_CLARIFICATION — свой TTL §E1)
+    дольше STUCK_THRESHOLD_S по last_transition_at. Две ветви:
       (1) resumable BUILDING/DEPLOYING/FIXING → ре-диспетчеризация по текущему state
           (не меняет state, ADR-001; идемпотентно через cleanup-before-run);
-      (2) LLM-фаза CREATED/INTERVIEWING/SPECCING без живой таски → fail-stuck в
+      (2) LLM-фаза CREATED/INTERVIEWING/SPECCING/EDITING без живой таски → fail-stuck в
           FAILED(stuck_timeout) — предохранитель concurrency-leak, если graceful-fail (§G)
           не сработал (смерть воркера до записи перехода).
     Под FOR UPDATE SKIP LOCKED + Redis dispatch-lock против двойной постановки/терминализации.
@@ -49,7 +49,15 @@ logger = get_logger(__name__)
 _RESUMABLE_STATES = (JobState.BUILDING, JobState.DEPLOYING, JobState.FIXING)
 # LLM-фазные активные состояния (ветвь 2): при систематически недоступном LLM повторная
 # постановка таски лишь бесконечно крутила бы Celery-retry без терминализации → fail-stuck.
-_LLM_PHASE_STATES = (JobState.CREATED, JobState.INTERVIEWING, JobState.SPECCING)
+# EDITING (ADR-030 §D) — Agent 4 editor (LLM-вызов, как INTERVIEWING/SPECCING): провисание
+# дольше STUCK_THRESHOLD_S без живой таски → FAILED(stuck_timeout); живой editor двигает
+# last_transition_at входом в EDITING и ложного fail-stuck не получает.
+_LLM_PHASE_STATES = (
+    JobState.CREATED,
+    JobState.INTERVIEWING,
+    JobState.SPECCING,
+    JobState.EDITING,
+)
 # Полный набор активных нетерминальных состояний, удерживающих concurrency-слот (ADR-019).
 # AWAITING_CLARIFICATION исключён (свой TTL §E1); терминалы LIVE/FAILED — слот уже свободен.
 _STUCK_STATES = _RESUMABLE_STATES + _LLM_PHASE_STATES
@@ -239,7 +247,7 @@ async def _reconcile_one(
             )
             return True
 
-        # Ветвь (2): LLM-фаза (CREATED/INTERVIEWING/SPECCING) без живой таски, провисевшая
+        # Ветвь (2): LLM-фаза (CREATED/INTERVIEWING/SPECCING/EDITING) без живой таски, провисевшая
         # дольше STUCK_THRESHOLD_S → fail-stuck FAILED(stuck_timeout), освобождая concurrency-
         # слот. Предохранитель: даже если graceful-fail (§G) не сработал (смерть воркера до
         # записи перехода), reconciler терминализирует. fail_job→transition коммитит.

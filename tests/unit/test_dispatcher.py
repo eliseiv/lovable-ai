@@ -50,6 +50,7 @@ def fake_tasks(monkeypatch):  # noqa: ANN001, ANN201
         "task_build_request": _FakeTask(),
         "task_deploy": _FakeTask(),
         "task_fix": _FakeTask(),
+        "task_edit": _FakeTask(),
     }
     for name, fake in fakes.items():
         monkeypatch.setattr(tasks_mod, name, fake)
@@ -65,6 +66,8 @@ def fake_tasks(monkeypatch):  # noqa: ANN001, ANN201
         (JobState.DEPLOYING, "task_deploy", "build"),
         # FIXING → task_fix (queue=llm): восстановительный цикл S2 (docs pipeline §B п.2).
         (JobState.FIXING, "task_fix", "llm"),
+        # EDITING → task_edit (queue=llm): crash-resume editor'а (ADR-030 §B).
+        (JobState.EDITING, "task_edit", "llm"),
     ],
 )
 def test_dispatch_enqueues_correct_task_and_queue(fake_tasks, state, task_name, queue):
@@ -109,4 +112,25 @@ def test_dispatch_fixing_enqueues_task_fix(fake_tasks):
     assert kwargs["queue"] == "llm"
     for name, fake in fake_tasks.items():
         if name != "task_fix":
+            assert fake.calls == []
+
+
+@pytest.mark.parametrize("kind", ["edit", "generation"])
+def test_dispatch_editing_enqueues_task_edit_not_task_fix(fake_tasks, kind):
+    """EDITING диспетчеризует task_edit (queue=llm), НЕ task_fix — kind-независимо (ADR-030 §B).
+
+    Снимает коллизию FIXING-маршрута: в EDITING оказывается только edit-джоба, поэтому
+    маршрут явный (EDITING → task_edit) и не делит путь с fix-витком. Crash-resume editor'а
+    обязан попасть в task_edit (editor), а не task_fix (fixer без failure_log).
+    """
+    dispatcher.dispatch_for_state("j_edit", JobState.EDITING, kind=kind)
+    edit = fake_tasks["task_edit"]
+    assert len(edit.calls) == 1
+    _, kwargs = edit.calls[0]
+    assert kwargs["args"] == ["j_edit"]
+    assert kwargs["queue"] == "llm"
+    # Главный инвариант ADR-030: НЕ task_fix.
+    assert fake_tasks["task_fix"].calls == []
+    for name, fake in fake_tasks.items():
+        if name != "task_edit":
             assert fake.calls == []

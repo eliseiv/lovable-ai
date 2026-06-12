@@ -23,6 +23,10 @@ class JobState(enum.StrEnum):
     LIVE = "LIVE"
     FIXING = "FIXING"
     FAILED = "FAILED"
+    # ADR-030: видимый промежуточный статус edit-джобы (Agent 4 editor) между CREATED и
+    # BUILDING. Активное нетерминальное LLM-фазное состояние (как INTERVIEWING/SPECCING);
+    # маршрут EDITING → task_edit (crash-resume editor'а, НЕ task_fix). Не терминал.
+    EDITING = "EDITING"
 
 
 # Терминальные/устойчивые состояния — задач в очереди нет (docs/03-data-model.md).

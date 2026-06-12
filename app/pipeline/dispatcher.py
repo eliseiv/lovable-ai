@@ -69,6 +69,11 @@ def dispatch_for_state(job_id: str, state: JobState, *, kind: str = "generation"
             result = tasks.task_edit.apply_async(args=[job_id], queue="llm")
         else:
             result = tasks.task_interview.apply_async(args=[job_id], queue="llm")
+    elif state == JobState.EDITING:
+        # ADR-030: crash-resume editor'а. В EDITING оказывается только edit-джоба, поэтому
+        # маршрут kind-независим → task_edit (НЕ task_fix). Снимает коллизию FIXING-маршрута:
+        # edit-обработка не делит маршрут с fix-витком (FIXING → task_fix остаётся неизменным).
+        result = tasks.task_edit.apply_async(args=[job_id], queue="llm")
     elif state == JobState.SPECCING:
         result = tasks.task_spec.apply_async(args=[job_id], queue="llm")
     elif state == JobState.BUILDING:

@@ -86,8 +86,8 @@ class JobStatusResponse(BaseModel):
     project_id: str = Field(description="Идентификатор проекта задачи.")
     state: str = Field(
         description="Текущий этап задачи (`CREATED`, `INTERVIEWING`, "
-        "`AWAITING_CLARIFICATION`, `SPECCING`, `BUILDING`, `DEPLOYING`, `LIVE`, `FIXING`, "
-        "`FAILED`)."
+        "`AWAITING_CLARIFICATION`, `SPECCING`, `EDITING`, `BUILDING`, `DEPLOYING`, `LIVE`, "
+        "`FIXING`, `FAILED`). `EDITING` — применение правки агентом-редактором."
     )
     retry_count: int = Field(description="Число выполненных попыток исправления.")
     failure_reason: str | None = Field(

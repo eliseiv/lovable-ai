@@ -54,8 +54,9 @@ async def _load_owned_job(session: SessionDep, user_id: str, job_id: str) -> Gen
     summary="Статус задачи",
     description=(
         "Возвращает текущий статус задачи генерации или правки. Поле `state` отражает этап "
-        "(`CREATED`, `INTERVIEWING`, `AWAITING_CLARIFICATION`, `SPECCING`, `BUILDING`, "
-        "`DEPLOYING`, `LIVE`, `FIXING`, `FAILED`). По завершении (`LIVE`) заполняется "
+        "(`CREATED`, `INTERVIEWING`, `AWAITING_CLARIFICATION`, `SPECCING`, `EDITING`, "
+        "`BUILDING`, `DEPLOYING`, `LIVE`, `FIXING`, `FAILED`). `EDITING` — применение правки "
+        "агентом-редактором. По завершении (`LIVE`) заполняется "
         "`live_url`; при неудаче (`FAILED`) — `failure_reason`. Чужая или несуществующая "
         "задача → `404`. Требуется заголовок `Authorization: Bearer <api-key>`."
     ),

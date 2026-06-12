@@ -832,7 +832,15 @@ async def _edit(job_id: str) -> None:
     storage = get_storage()
     async with session_scope() as session:
         job = await load_job(session, job_id)
-        if job is None or job.state != JobState.CREATED or job.kind != "edit":
+        # ADR-030 §C: guard принимает CREATED (первый вход) И EDITING (crash-resume editor'а).
+        # Первый вход переводит CREATED → EDITING (видимый статус), повторный вход после
+        # crash-resume (acks_late/retry/reconciler-ре-диспетчеризация по state=EDITING)
+        # идемпотентно переобрабатывает Agent 4 editor (тот же job_id).
+        if (
+            job is None
+            or job.state not in (JobState.CREATED, JobState.EDITING)
+            or job.kind != "edit"
+        ):
             logger.info("edit_skip", extra={"job_id": job_id})
             return
         if await _abort_if_project_deleted(session, job):
@@ -846,6 +854,20 @@ async def _edit(job_id: str) -> None:
             await fail_job(session, job, failure_reason="invalid_agent_output")
             logger.warning("edit_no_base", extra={"job_id": job_id})
             return
+
+        # ADR-030 §A: первым делом, ДО долгого Agent 4 editor, видимый переход CREATED → EDITING —
+        # клиент сразу видит «обработка правки», last_transition_at двигается (heartbeat → нет
+        # ложного fail-stuck в CREATED). Resume из EDITING (job.state уже EDITING) — переход
+        # пропускаем (no-op): не дублируем heartbeat/событие, идём сразу к editor'у. CAS-барьер
+        # transition() (ADR-029) держит терминальность; EDITING — нетерминал.
+        if job.state != JobState.EDITING:
+            await transition(
+                session,
+                job,
+                JobState.EDITING,
+                event_type="state_changed",
+                payload={"reason": "edit_processing"},
+            )
 
         # Инкремент edit_usage на успешном старте edit-джобы (идемпотентно по job_id).
         await count_edit_start(session, job)

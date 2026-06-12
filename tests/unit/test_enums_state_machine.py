@@ -34,3 +34,14 @@ def test_terminal_states_only_failed():
 def test_state_str_value_roundtrip():
     assert JobState.SPECCING.value == "SPECCING"
     assert JobState("LIVE") is JobState.LIVE
+
+
+def test_editing_state_present_and_nonterminal():
+    # ADR-030: EDITING — видимый промежуточный статус edit-джобы (CREATED → EDITING → BUILDING).
+    assert hasattr(JobState, "EDITING")
+    assert JobState.EDITING.value == "EDITING"
+    assert JobState("EDITING") is JobState.EDITING
+    # EDITING — активное нетерминальное LLM-фазное состояние (как INTERVIEWING/SPECCING):
+    # НЕ терминал и НЕ устойчивая пауза.
+    assert JobState.EDITING not in TERMINAL_STATES
+    assert JobState.EDITING not in PAUSED_STATES

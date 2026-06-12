@@ -139,3 +139,18 @@ async def test_healthz_no_auth(client):
     resp = await client.get("/healthz")
     assert resp.status_code == 200
     assert resp.json()["status"] == "ok"
+
+
+async def test_openapi_state_description_lists_editing():
+    """ADR-030 §9: публичная OpenAPI-схема описывает EDITING в перечне state job-status-модели.
+
+    Граница: чистая сериализация app.openapi() (без БД/сети). Клиент iOS, читающий контракт,
+    обязан знать про статус EDITING (видимая «обработка правки»). Денилист §B.7 не задет —
+    EDITING пояснён по-русски («агентом-редактором»), без внутренних маркеров.
+    """
+    import json
+
+    from app.api.main import app
+
+    schema_text = json.dumps(app.openapi(), ensure_ascii=False)
+    assert "EDITING" in schema_text

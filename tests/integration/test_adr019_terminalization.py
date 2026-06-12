@@ -98,7 +98,12 @@ async def _setup() -> None:
             await s.commit()
 
 
-async def _make_job(state: JobState, *, last_transition_at: datetime | None = None) -> str:
+async def _make_job(
+    state: JobState,
+    *,
+    last_transition_at: datetime | None = None,
+    kind: str = "generation",
+) -> str:
     pid = new_project_id()
     jid = new_job_id()
     async with worker_engine_scope(), session_scope() as s:
@@ -108,7 +113,7 @@ async def _make_job(state: JobState, *, last_transition_at: datetime | None = No
             project_id=pid,
             user_id=UID,
             state=state,
-            kind="generation",
+            kind=kind,
             budget_usd=Decimal("5.0000"),
             spend_usd=Decimal("0.0000"),
         )
@@ -309,6 +314,47 @@ def test_reconcile_stuck_idempotent_second_run_noop(_env):
     state, reason, _ = _run_sync(lambda: _state_and_slot(jid))
     assert state == JobState.FAILED
     assert reason == "stuck_timeout"
+
+
+def test_reconcile_terminalizes_stuck_editing_job(_env):
+    """ADR-030 §D: stale EDITING (LLM-фаза, kind=edit) → FAILED(stuck_timeout), слот свободен.
+
+    EDITING добавлен в reconciler stuck-скоуп как активное нетерминальное LLM-фазное состояние
+    (Agent 4 editor). Провисание дольше STUCK_THRESHOLD_S без живой таски → ветвь (2) fail-stuck
+    (как INTERVIEWING/SPECCING), а НЕ ре-диспетчеризация — предохранитель concurrency-leak.
+    """
+    from app.workers.beat_tasks import reconcile_stuck
+
+    threshold = get_settings().stuck_threshold_s
+    stale = datetime.now(UTC) - timedelta(seconds=threshold + 60)
+    jid = _run_sync(lambda: _make_job(JobState.EDITING, last_transition_at=stale, kind="edit"))
+
+    handled = _run_task_in_thread(reconcile_stuck.run)
+    assert handled == 1
+
+    state, reason, active = _run_sync(lambda: _state_and_slot(jid))
+    assert state == JobState.FAILED
+    assert reason == "stuck_timeout"
+    assert active == 0
+
+
+def test_fresh_editing_not_reconciled_as_stuck(_env):
+    """Свежая EDITING (last_transition_at недавно) НЕ подпадает под fail-stuck — heartbeat жив.
+
+    Вход в EDITING двигает last_transition_at (heartbeat) → живой editor не получает ложный
+    stuck_timeout. Здесь last_transition_at свежий → reconciler не трогает (0 обработано).
+    """
+    from app.workers.beat_tasks import reconcile_stuck
+
+    jid = _run_sync(
+        lambda: _make_job(JobState.EDITING, last_transition_at=datetime.now(UTC), kind="edit")
+    )
+    handled = _run_task_in_thread(reconcile_stuck.run)
+    assert handled == 0
+    state, reason, active = _run_sync(lambda: _state_and_slot(jid))
+    assert state == JobState.EDITING
+    assert reason is None
+    assert active == 1  # слот всё ещё держится (активная нетерминальная джоба)
 
 
 # ---------------------------------------------------------------------------
