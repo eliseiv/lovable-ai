@@ -38,7 +38,7 @@ from app.db.enums import JobState
 from app.db.models import GenerationJob
 from app.db.session import task_engine_scope
 from app.observability.redis_pool import worker_redis_scope
-from app.pipeline.dispatcher import dispatch_for_state
+from app.pipeline.dispatcher import dispatch_for_state, job_task_key
 from app.pipeline.events import fail_job
 from app.workers.celery_app import celery_app
 
@@ -108,6 +108,32 @@ async def _acquire_dispatch_lock(client: aioredis.Redis, job_id: str) -> bool:
     """
     acquired = await client.set(f"dispatch:{job_id}", "1", nx=True, ex=_DISPATCH_LOCK_TTL_S)
     return bool(acquired)
+
+
+async def _maybe_revoke_live_task(client: aioredis.Redis, job_id: str) -> None:
+    """Best-effort revoke живой Celery-таски джобы при терминализации reconciler'ом (ADR-029 §C).
+
+    Читает task_id из Redis job_task:{job_id} (пишется dispatch_for_state при постановке таски,
+    ADR-029 §C) и делает `revoke(task_id, terminate=True, signal='SIGTERM')`. Назначение —
+    прекратить бесполезный compute/деплой уже-терминализированной (FAILED) джобы, а НЕ
+    корректность: барьер терминальности transition() (ADR-029 §A) всё равно не даст добежавшей
+    таске перезаписать FAILED. Поэтому revoke best-effort: отсутствие ключа (TTL истёк / таски
+    не было) или ошибка Redis/брокера НЕ валит fail-stuck.
+    """
+    try:
+        raw = await client.get(job_task_key(job_id))
+    except (aioredis.RedisError, OSError) as exc:
+        logger.warning("revoke_task_id_read_failed", extra={"job_id": job_id, "error": str(exc)})
+        return
+    if raw is None:
+        # Ключ истёк по TTL или таска не ставилась — нечего ревокать (барьер A держит корректность).
+        return
+    task_id = raw.decode() if isinstance(raw, bytes) else str(raw)
+    try:
+        celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+        logger.info("reconcile_revoke", extra={"job_id": job_id, "task_id": task_id})
+    except Exception as exc:  # noqa: BLE001 — revoke best-effort, любой сбой брокера не валит fail-stuck
+        logger.warning("revoke_failed", extra={"job_id": job_id, "error": str(exc)})
 
 
 def _wall_clock_expired(job: GenerationJob, now: datetime) -> bool:
@@ -193,6 +219,9 @@ async def _reconcile_one(
         # штатный FAILED(wall_clock_exceeded), освобождая слот (fail_job→transition коммитит).
         if _wall_clock_expired(job, now):
             await fail_job(session, job, failure_reason="wall_clock_exceeded")
+            # ADR-029 §C: best-effort revoke живой таски (прекратить бесполезный compute/деплой
+            # терминализированной джобы). Промах не валит fail-stuck (барьер A держит корректность).
+            await _maybe_revoke_live_task(client, job.id)
             logger.info("reconcile_wall_clock", extra={"job_id": job.id})
             return True
 
@@ -215,6 +244,9 @@ async def _reconcile_one(
         # слот. Предохранитель: даже если graceful-fail (§G) не сработал (смерть воркера до
         # записи перехода), reconciler терминализирует. fail_job→transition коммитит.
         await fail_job(session, job, failure_reason="stuck_timeout")
+        # ADR-029 §C: best-effort revoke живой таски (прекратить бесполезный compute/деплой
+        # терминализированной джобы). Промах не валит fail-stuck (барьер A держит корректность).
+        await _maybe_revoke_live_task(client, job.id)
         logger.info(
             "reconcile_fail_stuck",
             extra={"job_id": job.id, "state": job.state.value},

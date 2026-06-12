@@ -57,7 +57,7 @@ from app.pipeline.agents.structured import (
 )
 from app.pipeline.cost import record_usage
 from app.pipeline.dispatcher import dispatch_for_state
-from app.pipeline.events import fail_job, load_job, record_event, transition
+from app.pipeline.events import fail_job, load_job, record_event, touch_heartbeat, transition
 from app.pipeline.failure_signature import (
     build_failure_log,
     compute_failure_signature,
@@ -618,6 +618,25 @@ async def _deploy(job_id: str) -> None:
             )
             return
 
+        # ADR-029 §B — re-read state-guard перед записью LIVE. docker run + wait_until_live
+        # длятся минуты; in-memory job.state остался DEPLOYING с момента загрузки, но reconciler
+        # в ОТДЕЛЬНОЙ сессии мог за это время записать FAILED(stuck_timeout/wall_clock_exceeded)
+        # (ADR-019 §E2). Перечитываем job.state из БД (по аналогии с project.deleted_at-перечиткой
+        # выше) и пишем LIVE ТОЛЬКО если джоба ещё DEPLOYING. Иначе — джоба уже терминализирована:
+        # снимаем deploy-контейнер тем же teardown-инвариантом (как project_deleted-ветка) и НЕ
+        # пишем LIVE. B — оптимизация (таска раньше узнаёт, что результат не нужен, не плодит
+        # orphan-эффект); корректность держит CAS-барьер A в transition() даже без этого guard'а.
+        await session.refresh(job, attribute_names=["state"])
+        if job.state != JobState.DEPLOYING:
+            docker_deploy.teardown_container(deploy_result.container_name)
+            deployment.status = "failed"
+            await session.commit()
+            logger.info(
+                "deploy_skip_terminalized",
+                extra={"job_id": job_id, "state": job.state.value, "subdomain": subdomain},
+            )
+            return
+
         deployment.status = "active"
 
         project.current_revision_id = revision.id
@@ -1112,6 +1131,12 @@ async def _handle_invalid_patch(
     # чтобы повтор той же agent_output_invalid-сигнатуры на новом витке ловился, а
     # crash-resume того же события — нет.
     job.failure_event_pending = True
+    # ADR-029 §Связь с watchdog / pipeline §E2: distinct failure-event витка БЕЗ смены state
+    # двигает heartbeat прогресса (last_transition_at) — иначе живая прогрессирующая fix/edit-
+    # джоба (LLM-вызовы идут, но state остаётся FIXING) получила бы ложный FAILED(stuck_timeout)
+    # от reconciler'а (корень прод-инцидента race FAILED↔LIVE). Гарантия от вечного зацикливания —
+    # wall-clock §C(c) / no-progress §C(d), не stuck-таймер.
+    await touch_heartbeat(session, job)
     await record_event(
         session,
         job.id,

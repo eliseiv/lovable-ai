@@ -20,12 +20,24 @@ from app.db.enums import JobState
 from app.pipeline import dispatcher
 
 
+class _FakeResult:
+    """Имитация celery AsyncResult: dispatch_for_state читает result.id для записи
+    job_task:{job_id} в Redis (ADR-029 §C — best-effort revoke-точка)."""
+
+    def __init__(self, task_id: str) -> None:
+        self.id = task_id
+
+
 class _FakeTask:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple, dict]] = []
 
     def apply_async(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN202
         self.calls.append((args, kwargs))
+        # apply_async реального celery-таска возвращает AsyncResult с .id — после ADR-029 §C
+        # dispatch_for_state дёргает result.id (_record_job_task). Фейк обязан вернуть объект
+        # с .id, иначе AttributeError ('NoneType' has no attribute 'id') — стейл-контракт.
+        return _FakeResult(f"task-{len(self.calls)}")
 
 
 @pytest.fixture

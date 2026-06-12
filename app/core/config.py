@@ -67,13 +67,14 @@ class Settings(BaseSettings):
     # env-контракт docs/07-deployment.md. Каждый cap ≤ ceiling модели агента (Opus 128K /
     # Sonnet 64K); Builder/Fixer (Sonnet) держат запас 56000 < 64000. thinking-mode пер-агентный
     # живёт в конфиге (маппинг агент→mode), не в коде агента (как model-tiering): Agent 3
-    # (Builder) disabled (весь cap детерминированно под вывод), агенты 1/2/4 adaptive.
+    # (Builder) и Agent 4 (Fixer/Editor) disabled (весь cap детерминированно под вывод полного
+    # дерева — оба возвращают file-tree, R2 ADR-023 §Decision (4)), агенты 1/2 adaptive.
     agent1_max_tokens: int = Field(default=16000)  # Interviewer (Sonnet ≤64K)
     agent2_max_tokens: int = Field(default=32000)  # Spec writer (Opus ≤128K)
     agent3_max_tokens: int = Field(default=56000)  # Builder (Sonnet ≤64K, самый большой)
     agent4_max_tokens: int = Field(default=56000)  # Fixer/Editor (Sonnet ≤64K)
-    # effort из output_config — adaptive thinking у агентов 1/2/4; на Agent 3 (thinking
-    # disabled) не действует (ADR-023 §Decision (2)).
+    # effort из output_config — adaptive thinking у агентов 1/2; на Agent 3 и Agent 4 (thinking
+    # disabled) не действует (ADR-023 §Decision (2), R2 §Decision (4)).
     agent_effort: str = Field(default="high")
     # --- Structured-output всех 4 агентов (ADR-020, docs pipeline §I; env-контракт 07) ---
     # Bounded retry ВНУТРИ шага агента на parse/schema-фейл (re-семплирование форсированного
@@ -433,12 +434,14 @@ class Settings(BaseSettings):
     def agent_thinking(self, agent: str) -> dict[str, str]:
         """Пер-агентный thinking-mode по имени агента (ADR-023, маппинг в конфиге, не в агенте).
 
-        Agent 3 (Builder) → {"type":"disabled"} (детерминированная комната под вывод полного
-        file-tree); агенты 1/2/4 → {"type":"adaptive"} (thinking ценен). НИКОГДА не собирается
-        {"type":"enabled","budget_tokens":...} — HTTP 400 на Opus 4.8/4.7, deprecated на Sonnet
-        (ADR-023 §Ограничение API). Нормативный single source — docs pipeline §Token-бюджет.
+        Agent 3 (Builder) и Agent 4 (Fixer/Editor) → {"type":"disabled"} (детерминированная
+        комната под вывод полного file-tree — оба возвращают полное дерево, ревизия R2 ADR-023
+        §Decision (4) для Agent 4); агенты 1/2 → {"type":"adaptive"} (thinking ценен). НИКОГДА не
+        собирается {"type":"enabled","budget_tokens":...} — HTTP 400 на Opus 4.8/4.7, deprecated
+        на Sonnet (ADR-023 §Ограничение API). Нормативный single source — docs pipeline
+        §Token-бюджет агентов (ADR-023): 3 и 4 disabled, 1/2 adaptive.
         """
-        if agent == "agent3":
+        if agent in ("agent3", "agent4"):
             return {"type": "disabled"}
         return {"type": "adaptive"}
 

@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import redis.asyncio as aioredis
-from sqlalchemy import select
+from sqlalchemy import CursorResult, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
@@ -118,18 +118,73 @@ async def transition(
     *,
     event_type: str = "state_changed",
     payload: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     """Транзакционный переход: обновить state + записать job_events + commit + publish.
 
+    Возвращает True, если переход применён (1 строка CAS), False — если no-op (джоба уже
+    терминальна, 0 строк CAS). Вызывающий (fail_job) использует возврат, чтобы не дублировать
+    terminal-метрики на проигравшем писателе.
+
     Публикация в Redis — после commit, чтобы SSE не видел незакоммиченный переход.
+
+    ADR-029 §A — CAS-барьер терминальности (единый барьер, корень). Запись state выполняется
+    как conditional UPDATE: `UPDATE ... SET state=:to WHERE id=:id AND state NOT IN (LIVE,FAILED)`
+    (_TERMINAL_JOB_STATES = {LIVE, FAILED}) в той же транзакции, что job_events+commit.
+    `transition()` — ЕДИНСТВЕННЫЙ писатель state БЕЗ предусловия на конкретное исходное состояние
+    (универсальный путь всех тасок + reconciler), поэтому барьер A покрывает все идущие через него
+    переходы разом. Гонка двух писателей-ПЕРЕХОДОВ разрешается в Postgres: ровно один UPDATE
+    затронет строку. 0 затронутых строк ⇒ джоба уже терминальна ⇒ переход — no-op (job_events НЕ
+    пишется, publish/push/terminal-метрики НЕ выполняются), лог transition_skip_terminal, возврат
+    False. Так конкурирующий писатель-ПЕРЕХОД не может перезатереть терминал: кто записал терминал
+    первым, тот зафиксировал результат, второй — тихий no-op (идемпотентно).
+
+    `transition()` — не единственная строка, физически пишущая generation_jobs.state. Существуют
+    санкционированные прямые писатели вне барьера A, каждый несёт собственный предикат/обоснование
+    (см. pipeline §Инвариант терминальности → список писателей, ADR-029 §A):
+      - answers_service.submit_answers (AWAITING_CLARIFICATION → SPECCING): несёт собственный
+        non-terminal-предикат на исходном AWAITING_CLARIFICATION (исключает оба терминала);
+      - project_gc._cancel_inflight_jobs (* → FAILED при удалении проекта): отбор по
+        TERMINAL_STATES = {FAILED} (НЕ {LIVE,FAILED}), поэтому НАМЕРЕННО перезаписывает
+        LIVE → FAILED как санкционированное исключение по ADR-011 (удаление проекта снимает
+        живой сайт), а НЕ нарушение инварианта.
     """
     from_state = job.state.value
+    # job_id захватываем в локаль ДО session.execute/rollback: в no-op ветке CAS-барьера
+    # session.rollback() экспайрит ORM-инстанс job, и последующее чтение job.id из синхронного
+    # контекста аргументов логгера триггерит ленивую async-загрузку → MissingGreenlet.
+    job_id = job.id
+    now = datetime.now(UTC)
+    # CAS-барьер: атомарная запись state ТОЛЬКО если джоба ещё НЕ терминальна. last_transition_at
+    # (heartbeat прогресса, ADR-019) обновляется РОВНО при смене state в этой же точке, не при
+    # cost-ledger/guard-state апдейтах. now() — Python-сторона; консистентно с server_default.
+    result: CursorResult[Any] = await session.execute(  # type: ignore[assignment]
+        update(GenerationJob)
+        .where(
+            GenerationJob.id == job_id,
+            GenerationJob.state.not_in(_TERMINAL_JOB_STATES),
+        )
+        .values(state=to_state, last_transition_at=now)
+    )
+    if result.rowcount == 0:
+        # 0 строк ⇒ джоба уже терминальна (LIVE/FAILED записан конкурентным писателем) ⇒ no-op:
+        # НЕ пишем job_events, НЕ публикуем, НЕ дублируем terminal-метрики/push. Откатываем любые
+        # незакоммиченные изменения этой сессии (например, выставленные fail_job-полем
+        # failure_reason на ORM-объекте), чтобы не утёк partial-write мимо барьера.
+        await session.rollback()
+        logger.info(
+            "transition_skip_terminal",
+            extra={
+                "job_id": job_id,
+                "from_terminal": from_state,
+                "attempted_to": to_state.value,
+            },
+        )
+        return False
+    # 1 строка ⇒ переход применён штатно. Синхронизируем ORM-объект с записанным CAS-значением
+    # (UPDATE по таблице не трогает атрибуты загруженного объекта) — для _record_terminal_metrics
+    # и вызывающего кода ниже.
     job.state = to_state
-    # ADR-019: heartbeat прогресса — last_transition_at обновляется РОВНО при смене state
-    # (эта единственная транзакционная точка), не при cost-ledger/guard-state апдейтах. Так
-    # reconciler (docs §E2) детектит зависание по простою в одном state, не ложно сброшенному
-    # cost-ledger'ом. now() — серверное время БД (консистентно с server_default).
-    job.last_transition_at = datetime.now(UTC)
+    job.last_transition_at = now
     await record_event(
         session,
         job.id,
@@ -153,6 +208,7 @@ async def transition(
     from app.notify.trigger import enqueue_push_if_significant
 
     enqueue_push_if_significant(job.id, to_state.value)
+    return True
 
 
 async def fail_job(
@@ -163,22 +219,45 @@ async def fail_job(
     failure_log_ref: str | None = None,
     last_failure_signature: str | None = None,
 ) -> None:
-    """Перевод в FAILED с машинным failure_reason (docs/03-data-model.md)."""
+    """Перевод в FAILED с машинным failure_reason (docs/03-data-model.md).
+
+    ADR-029 §A: job_failed_total пишется ТОЛЬКО если CAS-барьер transition() реально применил
+    переход (джоба не была терминальна). Иначе reconciler/проигравший писатель, попытавшийся
+    FAILED поверх уже-LIVE (или дубль FAILED), ложно инкрементировал бы failure-метрику на no-op.
+    """
     job.failure_reason = failure_reason
     if failure_log_ref is not None:
         job.failure_log_ref = failure_log_ref
     if last_failure_signature is not None:
         job.last_failure_signature = last_failure_signature
-    # Sprint 6 (ADR-015 §2.1): FAILED по failure_reason (kind). jobs_total/job_cost_usd/
-    # fix_loop_depth — общий терминальный путь в transition ниже.
-    metrics.job_failed_total.labels(reason=failure_reason, kind=job.kind).inc()
-    await transition(
+    applied = await transition(
         session,
         job,
         JobState.FAILED,
         event_type="failed",
         payload={"failure_reason": failure_reason},
     )
+    # Sprint 6 (ADR-015 §2.1): FAILED по failure_reason (kind). jobs_total/job_cost_usd/
+    # fix_loop_depth — общий терминальный путь в transition. Не дублируем на no-op (ADR-029).
+    if applied:
+        metrics.job_failed_total.labels(reason=failure_reason, kind=job.kind).inc()
+
+
+async def touch_heartbeat(session: AsyncSession, job: GenerationJob) -> None:
+    """Обновляет last_transition_at на distinct failure-event витка БЕЗ смены state (ADR-029).
+
+    ADR-029 §Связь с watchdog / pipeline §E2 «Heartbeat на distinct failure-event»: витки,
+    прогрессирующие без смены state (отклонённый патч Agent 4 в FIXING → agent_output_invalid,
+    _handle_invalid_patch — остаётся в FIXING без инкремента retry_count), двигают heartbeat
+    прогресса наравне со сменой state. Так живая прогрессирующая (LLM-вызовы идут) edit/fix-джоба
+    НЕ получает ложный FAILED(stuck_timeout) reconciler'ом (§E2) только из-за того, что state не
+    меняется между витками. Триггеров прогресса два: смена state (transition()) И новый distinct
+    failure-event витка (эта функция). cost-ledger (spend_usd) heartbeat НЕ трогает (ложный
+    «живой» сигнал от Celery-ретраев исключён, как в ADR-019). Коммит — на стороне вызывающего
+    (в той же транзакции, что failure_event_pending/failure_log_ref/fix_rejected).
+    Защита от вечного зацикливания живой джобы остаётся за wall-clock §C(c) и no-progress §C(d).
+    """
+    job.last_transition_at = datetime.now(UTC)
 
 
 async def load_job(session: AsyncSession, job_id: str) -> GenerationJob | None:

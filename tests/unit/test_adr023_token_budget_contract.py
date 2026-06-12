@@ -10,8 +10,8 @@
 
 - (а) max_tokens КАЖДОГО агента == его AGENTn_MAX_TOKENS (agent1=16000, agent2=32000,
   agent3=56000, agent4=56000) И ≤ ceiling модели агента (Opus 128K / Sonnet 64K);
-- (б) Agent 3 (Builder) → thinking={"type":"disabled"} (детерминированная комната под вывод);
-  агенты 1/2/4 → thinking={"type":"adaptive"};
+- (б) Agent 3 (Builder) И Agent 4 (Fixer/Editor) → thinking={"type":"disabled"} (детерминированная
+  комната под вывод полного file-tree, R2 ADR-023 §Decision (4)); агенты 1/2 → adaptive;
 - (в) НИГДЕ не собирается budget_tokens / {"type":"enabled",...} (HTTP 400 на Opus 4.8/4.7,
   deprecated на Sonnet 4.6).
 
@@ -40,11 +40,16 @@ _MODEL_CEILING = {
 # Нормативный маппинг агент → (env-ключ модели, ожидаемый thinking-mode).
 # Модель берётся из реального Settings (AGENTn_MODEL) — НЕ хардкодим, чтобы тест следовал
 # конфиг-маппингу (в т.ч. ревизии R1: agent3 → Sonnet).
+# ADR-023 R2 (2026-06-12, §Decision (4)): Agent 4 (Fixer/Editor) thinking adaptive→disabled
+# (как Builder) — детерминированная комната под вывод полного file-tree, против усечения дерева
+# Agent 4 (прод-инцидент 31-мин правки agent_output_invalid). Agent 3 И Agent 4 → disabled,
+# агенты 1/2 → adaptive (нормативный single source — docs/02-tech-stack §LLM ADR-023 R2,
+# docs/modules/pipeline/03-architecture §Token-бюджет агентов, app/core/config.agent_thinking).
 _AGENT_THINKING = {
     "agent1": {"type": "adaptive"},
     "agent2": {"type": "adaptive"},
     "agent3": {"type": "disabled"},
-    "agent4": {"type": "adaptive"},
+    "agent4": {"type": "disabled"},
 }
 
 
@@ -143,7 +148,7 @@ async def test_max_tokens_within_model_ceiling(agent):
 
 @pytest.mark.parametrize("agent", ["agent1", "agent2", "agent3", "agent4"])
 async def test_thinking_mode_per_agent(agent):
-    """(б) Agent 3 → thinking=disabled (комната под вывод); агенты 1/2/4 → thinking=adaptive."""
+    """(б) Agent 3 И Agent 4 → thinking=disabled (комната под вывод, R2); агенты 1/2 → adaptive."""
     captured = await _capture_for(agent)
     assert captured["thinking"] == _AGENT_THINKING[agent], (
         f"{agent}: thinking {captured['thinking']!r} != {_AGENT_THINKING[agent]!r} (ADR-023 §2)"
