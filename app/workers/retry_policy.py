@@ -30,6 +30,19 @@ from anthropic import (
     PermissionDeniedError,
     RateLimitError,
 )
+
+# ADR-032 §5: оба SDK всегда установлены в образе (провайдер выбирается рантаймом, НЕ условным
+# импортом по LLM_PROVIDER). Имена классов openai совпадают с anthropic, но это РАЗНЫЕ классы из
+# разных пакетов (anthropic.RateLimitError ≠ openai.RateLimitError) — классификатор обязан
+# распознавать исключения ОБОИХ SDK независимо от выбранного провайдера. Импорт под алиасами.
+from openai import APIConnectionError as OpenAIAPIConnectionError
+from openai import APIError as OpenAIAPIError
+from openai import APIStatusError as OpenAIAPIStatusError
+from openai import APITimeoutError as OpenAIAPITimeoutError
+from openai import AuthenticationError as OpenAIAuthenticationError
+from openai import BadRequestError as OpenAIBadRequestError
+from openai import PermissionDeniedError as OpenAIPermissionDeniedError
+from openai import RateLimitError as OpenAIRateLimitError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
@@ -72,16 +85,20 @@ class LLMCredentialError(RuntimeError):
 # Множество ретраябельных (транзиентных инфра) исключений — единственный источник
 # истины (ADR-006). Доменные исключения сюда НЕ входят сознательно.
 TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
-    # Сеть/транспорт к S3/Anthropic/Docker.
+    # Сеть/транспорт к S3/LLM/Docker.
     httpx.TransportError,
     APIConnectionError,
     APITimeoutError,
+    # OpenAI SDK-эквиваленты (ADR-032 §5): оба провайдера в одном образе.
+    OpenAIAPIConnectionError,
+    OpenAIAPITimeoutError,
     ConnectionError,
     TimeoutError,
     socket.timeout,
     asyncio.TimeoutError,
-    # Anthropic rate-limit / временные server-ошибки.
+    # Anthropic + OpenAI rate-limit / временные server-ошибки.
     RateLimitError,
+    OpenAIRateLimitError,
     # Redis-брокер/счётчики.
     RedisConnectionError,
     RedisTimeoutError,
@@ -98,9 +115,12 @@ def is_transient(exc: BaseException) -> bool:
     """True, если исключение — транзиентный инфра-сбой (ретраить Celery), иначе доменное.
 
     `APIStatusError` ретраябелен только на 429/5xx (server-side/rate-limit); 4xx (кроме
-    429) — детерминированная ошибка запроса, не ретраится (ADR-006).
+    429) — детерминированная ошибка запроса, не ретраится (ADR-006). Проверка покрывает
+    APIStatusError/RateLimitError ОБОИХ SDK (anthropic + openai, ADR-032 §5).
     """
-    if isinstance(exc, APIStatusError) and not isinstance(exc, RateLimitError):
+    if isinstance(exc, (APIStatusError, OpenAIAPIStatusError)) and not isinstance(
+        exc, (RateLimitError, OpenAIRateLimitError)
+    ):
         status = getattr(exc, "status_code", None)
         return status == 429 or (isinstance(status, int) and 500 <= status < 600)
     return isinstance(exc, TRANSIENT_EXCEPTIONS)
@@ -115,9 +135,15 @@ NON_RETRYABLE_LLM_EXCEPTIONS: tuple[type[BaseException], ...] = (
     AuthenticationError,  # 401 — ANTHROPIC_API_KEY отсутствует/невалиден
     PermissionDeniedError,  # 403
     BadRequestError,  # 400, не зависящий от входных данных
-    # ADR-019 §Fix round 3 (подстраховка): client-side auth-resolution TypeError SDK
-    # (поднят фабрикой клиента агента как LLMCredentialError) — невалидный credential,
-    # детерминированно-падающий ДО HTTP. Не ретраить → немедленный agent_unavailable.
+    # OpenAI SDK-эквиваленты (ADR-032 §5): те же 401/403/400 активного провайдера в одном образе.
+    OpenAIAuthenticationError,
+    OpenAIPermissionDeniedError,
+    OpenAIBadRequestError,
+    # ADR-019 §Fix round 3 (подстраховка): client-side auth-resolution-сбой Anthropic SDK
+    # (поднят ClaudeAgentClient как LLMCredentialError из встроенного stdlib-TypeError) —
+    # невалидный credential, детерминированно-падающий ДО HTTP. Не ретраить → agent_unavailable.
+    # OpenAI-клиент (ADR-032 §5) сюда НЕ маппит: невалидный ключ у openai SDK не валидируется
+    # client-side, а даёт request-time OpenAIAuthenticationError(401) — уже покрыта выше.
     LLMCredentialError,
 )
 
@@ -141,23 +167,25 @@ def is_llm_failure(exc: BaseException) -> bool:
     FAILED(agent_unavailable); исчерпание на не-LLM инфра (Docker/S3/БД/Redis) →
     FAILED(infra_error). Anthropic SDK поднимает подклассы APIError на все сбои Claude
     (включая APIConnectionError/APITimeoutError/RateLimitError/APIStatusError).
-    `LLMCredentialError` (client-side auth-resolution TypeError SDK, ADR-019 §Fix round 3) —
-    тоже LLM-недоступность, хотя и вне иерархии APIError.
+    `LLMCredentialError` (client-side auth-resolution-сбой SDK, ADR-019 §Fix round 3) —
+    тоже LLM-недоступность, хотя и вне иерархии APIError. OpenAI SDK (ADR-032 §5) тоже поднимает
+    подклассы своего `APIError` на все сбои LLM — классификатор покрывает ОБА SDK.
     """
-    return isinstance(exc, (APIError, LLMCredentialError))
+    return isinstance(exc, (APIError, OpenAIAPIError, LLMCredentialError))
 
 
 # --- ADR-019 §Fix round 3: per-job fail-fast preflight LLM-credential (основной путь) ---
 
 
 def llm_credential_present(api_key: str | None) -> bool:
-    """True, если LLM-credential (ANTHROPIC_API_KEY) пригоден для SDK-вызова (ADR-019 §G).
+    """True, если LLM-credential АКТИВНОГО провайдера пригоден для SDK-вызова (ADR-019 §G).
 
     Непустой = не `None` и не whitespace-only строка. Принимает уже-распакованное значение
-    `Settings.anthropic_api_key.get_secret_value()` (не `SecretStr`), чтобы не логировать секрет
-    и не тащить зависимость от типа конфига в классификатор. При `False` агент-таска делает
-    fail-fast graceful-переход FAILED(agent_unavailable) ДО первого обращения к Anthropic SDK —
-    version-agnostic, детерминированно ловит самый частый прод-кейс (пустой ключ), не завися от
-    типа/текста встроенного `TypeError` SDK (§Fix round 3, п.1).
+    credential активного провайдера (`Settings.active_llm_api_key()` — ANTHROPIC_API_KEY либо
+    OPENAI_API_KEY по LLM_PROVIDER, ADR-032 §5), не `SecretStr`, чтобы не логировать секрет и не
+    тащить зависимость от типа конфига в классификатор. При `False` агент-таска делает fail-fast
+    graceful-переход FAILED(agent_unavailable) ДО первого обращения к LLM SDK — version-agnostic,
+    детерминированно ловит самый частый прод-кейс (пустой ключ), не завися от типа/текста
+    встроенного auth-resolution-сбоя SDK (§Fix round 3, п.1).
     """
     return bool(api_key and api_key.strip())

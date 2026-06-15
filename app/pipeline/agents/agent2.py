@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import Settings
-from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
+from app.pipeline.agents.base import AgentCall, build_agent_client
 from app.pipeline.agents.structured import (
     FAIL_CLASS_SCHEMA,
     DiagnosticsHook,
@@ -104,7 +104,7 @@ async def run_agent2(
     Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4).
     На исчерпании ретраев бросает StructuredOutputError → task → FAILED(invalid_agent_output).
     """
-    client = ClaudeAgentClient(settings)
+    client = build_agent_client(settings)
     result = await run_structured_agent(
         settings,
         client,

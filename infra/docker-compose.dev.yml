@@ -50,7 +50,18 @@ x-app-env: &app-env
   S3_BUCKET: ${S3_BUCKET}
   S3_USE_SSL: "false"
   # --- LLM ---
+  # ADR-032: абстракция LLM-провайдера. ОДИН образ, провайдер per-instance env.
+  # Дефолт anthropic (dev≈prod, без регрессий). Имена/дефолты — символ-в-символ
+  # docs/07-deployment.md env-контракт (стр. 43/45/46). LLM_PROVIDER /
+  # OPENAI_AGENT_EFFORT — app-env worker (Settings) -> ОБЯЗАНЫ быть в x-app-env,
+  # иначе extra=ignore молча отдаст дефолт config.py.
+  LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # ADR-032: ключ OpenAI API (провайдер openai). Пуст при anthropic — норма.
+  # СЕКРЕТ (SecretStr), реальное значение НЕ коммитится (.env.example — плейсхолдер).
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  # ADR-032: reasoning.effort агентов 1/2 при openai (из {medium,high,xhigh}). Дефолт high.
+  OPENAI_AGENT_EFFORT: ${OPENAI_AGENT_EFFORT:-high}
   # --- Auth (seeded ключ для MVP, docs/05-security.md) ---
   SEED_API_KEY: ${SEED_API_KEY}
   # --- Деплой сайтов ---

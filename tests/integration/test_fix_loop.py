@@ -256,7 +256,7 @@ def _wire(monkeypatch, storage):  # noqa: ANN001, ANN202
     monkeypatch.setattr(events, "publish_event", _noop_publish)
 
     _FakeClient.captured = []
-    monkeypatch.setattr(agent4_mod, "ClaudeAgentClient", _FakeClient)
+    monkeypatch.setattr(agent4_mod, "build_agent_client", _FakeClient)
     return tasks, dispatched
 
 

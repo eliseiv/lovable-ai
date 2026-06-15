@@ -406,7 +406,7 @@ async def test_agent4_unrecoverable_via_json_text(settings, monkeypatch):
     """Agent 4 unrecoverable выражается полями JSON в block.text (§A): дерево None, не ошибка
     валидации. Текстовый режим (revised) — структура из extract_json(block.text)."""
     signal = json.dumps({"unrecoverable": True, "reason": "irreparable", "explanation": "give up"})
-    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeTextClient([signal]))
+    monkeypatch.setattr(agent4, "build_agent_client", lambda s: _FakeTextClient([signal]))
     result = await agent4.run_agent4(
         settings,
         spec_markdown="# Spec",
@@ -460,7 +460,7 @@ async def test_agent3_domain_validation_over_extract_json_retries_then_raises(
     структуры, ретраится; на исчерпании = AgentOutputError (agent_output_invalid, §I.3)."""
     n = settings.agent_output_max_retries + 1
     client = _FakeTextClient([_tree_with_path(bad_path)] * n)
-    monkeypatch.setattr(agent3, "ClaudeAgentClient", lambda s: client)
+    monkeypatch.setattr(agent3, "build_agent_client", lambda s: client)
 
     after_calls = []
     failures = []
@@ -500,7 +500,7 @@ async def test_agent3_over_limit_tree_is_schema_fail(settings, monkeypatch):
     )
     n = settings.agent_output_max_retries + 1
     client = _FakeTextClient([oversized] * n)
-    monkeypatch.setattr(agent3, "ClaudeAgentClient", lambda s: client)
+    monkeypatch.setattr(agent3, "build_agent_client", lambda s: client)
     failures = []
 
     async def _fail(**kw):  # noqa: ANN003, ANN202

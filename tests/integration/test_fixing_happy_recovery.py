@@ -218,7 +218,7 @@ async def test_full_recovery_building_fix_building_deploying_live(
         return None
 
     monkeypatch.setattr("app.pipeline.events.publish_event", _noop_publish)
-    monkeypatch.setattr(agent4_mod, "ClaudeAgentClient", _FakeClient)
+    monkeypatch.setattr(agent4_mod, "build_agent_client", _FakeClient)
     _FakeClient._texts = [_valid_patch_json()]
 
     # dispatch_for_state — спай (в реальности ставит Celery; здесь гоняем стадии вручную).

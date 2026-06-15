@@ -31,7 +31,7 @@ from typing import Any
 from app.core.config import Settings
 from app.observability.sentry import scrub_text
 from app.observability.timing import timed_agent_call
-from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
+from app.pipeline.agents.base import AgentCall, LLMAgentClient
 
 # Классы фейла structured-output (§I.4): parse — структура не извлеклась; schema — извлеклась,
 # но не прошла доменную валидацию.
@@ -261,7 +261,7 @@ class StructuredResult[T]:
 
 async def run_structured_agent[T](
     settings: Settings,
-    client: ClaudeAgentClient,
+    client: LLMAgentClient,
     *,
     agent: str,
     model: str,

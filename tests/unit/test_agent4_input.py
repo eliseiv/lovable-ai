@@ -207,7 +207,7 @@ def _valid_tree_json() -> str:
 
 async def test_run_agent4_valid_patch_returns_tree(monkeypatch):
     settings = get_settings()
-    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient(_valid_tree_json()))
+    monkeypatch.setattr(agent4, "build_agent_client", lambda s: _FakeClient(_valid_tree_json()))
     src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
     result = await run_agent4(
         settings,
@@ -229,7 +229,7 @@ async def test_run_agent4_unrecoverable_signal(monkeypatch):
     signal_json = json.dumps(
         {"unrecoverable": True, "reason": "irreparable", "explanation": "give up"}
     )
-    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient(signal_json))
+    monkeypatch.setattr(agent4, "build_agent_client", lambda s: _FakeClient(signal_json))
     src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
     result = await run_agent4(
         settings,
@@ -252,7 +252,7 @@ async def test_run_agent4_invalid_patch_raises_after_retries_usage_recorded(monk
     вызов оплачен даже при невалидном output) — не через exc.call."""
     settings = get_settings()
     bad = json.dumps({"files": [], "entry": "x", "build": {"command": "vite build"}})
-    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient(bad))
+    monkeypatch.setattr(agent4, "build_agent_client", lambda s: _FakeClient(bad))
     src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
     after_calls = []
 
@@ -280,7 +280,7 @@ async def test_run_agent4_non_json_output_raises(monkeypatch):
     from app.pipeline.agents.structured import StructuredOutputError
 
     settings = get_settings()
-    monkeypatch.setattr(agent4, "ClaudeAgentClient", lambda s: _FakeClient("not json at all"))
+    monkeypatch.setattr(agent4, "build_agent_client", lambda s: _FakeClient("not json at all"))
     src = _tgz({"index.html": b"<html></html>", "package.json": b"{}"})
     with pytest.raises((AgentOutputError, StructuredOutputError)):
         await run_agent4(

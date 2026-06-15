@@ -122,7 +122,7 @@ async def test_agent3_heavy_spec_produces_full_valid_tree(monkeypatch):
     доменная валидация проходит, шаг НЕ уходит в AgentOutputError.
     """
     settings = get_settings()
-    monkeypatch.setattr(agent3, "ClaudeAgentClient", _FullTreeClient)
+    monkeypatch.setattr(agent3, "build_agent_client", _FullTreeClient)
 
     result = await run_agent3(
         settings,
@@ -159,7 +159,7 @@ async def test_agent3_heavy_spec_invoked_as_agent3_token_budget(monkeypatch):
                 agent=agent, model=model, system_prompt=system_prompt, user_content=user_content
             )
 
-    monkeypatch.setattr(agent3, "ClaudeAgentClient", _Capturing)
+    monkeypatch.setattr(agent3, "build_agent_client", _Capturing)
 
     await run_agent3(
         settings,

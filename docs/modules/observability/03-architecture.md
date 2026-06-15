@@ -58,6 +58,23 @@
 
 > **$/user dashboard:** дашборд $/user строится из БД-панели (Grafana Postgres-datasource → `SELECT user_id, SUM(...) FROM llm_usage`), **не** из Prometheus per-user label (кардинальность). Cross-ref §3 (cost-дашборд).
 
+> **Провайдер-агностичность cost-метрик ([ADR-032](../../adr/ADR-032-llm-provider-abstraction-openai.md)):** метрики §2.2 работают для **обоих** провайдеров на тех же 4 token-категориях (`input`/`output`/`cache_read`/`cache_write`). Label `model` (= значение env `AGENTn_MODEL`) несёт claude-ID при `LLM_PROVIDER=anthropic` и GPT-5-class ID при `openai`. Для OpenAI `lovable_llm_tokens_total{token_type="cache_write"}` = `0` (caching автоматический, без write-ставки — **ожидаемо, не баг**); `cache_read` = `usage.input_tokens_details.cached_tokens`. reasoning-токены OpenAI входят в `output_tokens` (биллятся по output-ставке), отдельной метрики не имеют — как thinking-токены Anthropic.
+
+### 2.2A OpenAI pricing провайдер openai ADR-032
+
+Провайдер `openai` ([ADR-032](../../adr/ADR-032-llm-provider-abstraction-openai.md)). Аналог `_MODEL_PRICING` Anthropic — pricing-таблица OpenAI-моделей для cost-ledger (per-1M USD). `cache_write` = `0` (OpenAI caching автоматический, без отдельной write-ставки). Неизвестная модель → консервативный fallback (как Anthropic-fallback на Opus-тариф). Cross-ref [02-tech-stack → LLM](../../02-tech-stack.md#llm).
+
+| Модель (env `AGENTn_MODEL`) | input | cached_input (cache_read) | output | cache_write |
+|---|---|---|---|---|
+| `gpt-5.5` (Agent 2 дефолт) | `$5.00` | `$0.50` | `$30.00` | `0` |
+| `gpt-5.5-pro` (опц.) | `$30.00` | — | `$180.00` | `0` |
+| `gpt-5.4` (опц.) | `$2.50` | `$0.25` | `$15.00` | `0` |
+| `gpt-5.4-mini` (Agent 1/3/4 дефолт) | `$0.75` | `$0.075` | `$4.50` | `0` |
+| `gpt-5.4-nano` (опц.) | `$0.20` | `$0.02` | `$1.25` | `0` |
+| `gpt-5.4-pro` (опц.) | `$30.00` | — | `$180.00` | `0` |
+
+> **Числа — нормативные, верифицированы по каталогу OpenAI (Standard-tier, USD за 1M токенов; источники: developers.openai.com/api/docs/pricing и .../models/gpt-5.5; дата верификации 2026-06-15, [Q-LLM-1](../../99-open-questions.md#q-llm-1) resolved).** Это **единственный нормативный источник** OpenAI-pricing чисел (02-tech-stack §LLM ссылается сюда). Дефолтные per-agent модели — `gpt-5.5` (Agent 2) и `gpt-5.4-mini` (Agent 1/3/4); остальные строки — справочно для operator-tunable env `AGENTn_MODEL` (без релиза). `cache_write`=`0` для всех (OpenAI caching автоматический, без write-ставки); `gpt-5.5-pro`/`gpt-5.4-pro` без cached-input-ставки (прочерк). reasoning.effort: Agent 1/2 — `OPENAI_AGENT_EFFORT` (`high`, из {`medium`,`high`,`xhigh`}); Agent 3/4 — `none` (наименьший уровень реального набора `none`/`low`/`medium`/`high`/`xhigh`, весь `max_output_tokens` под вывод, перенос мотива [ADR-023](../../adr/ADR-023-agent3-token-budget-thinking-room.md)). Модельный потолок `gpt-5.5` `max_output_tokens=128000` ≥ per-agent cap (макс. 56000).
+
 ### 2.3 SSE / realtime (api)
 
 | Метрика | Тип | Labels | Что измеряет | Cross-ref |

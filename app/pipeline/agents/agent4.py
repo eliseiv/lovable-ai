@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from app.core.config import Settings
 from app.core.logging import get_logger
-from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
+from app.pipeline.agents.base import AgentCall, build_agent_client
 from app.pipeline.agents.structured import (
     DiagnosticsHook,
     GuardHook,
@@ -279,7 +279,7 @@ async def _run_agent4(
 ) -> Agent4Result:
     """Общий structured-вызов Agent 4 (fixer/editor): текстовый режим + extract_json + retry +
     доменная валидация."""
-    client = ClaudeAgentClient(settings)
+    client = build_agent_client(settings)
     result = await run_structured_agent(
         settings,
         client,

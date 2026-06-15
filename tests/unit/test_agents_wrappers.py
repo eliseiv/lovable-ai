@@ -85,13 +85,13 @@ def settings():  # noqa: ANN201
 
 def _wire2(monkeypatch, responses):  # noqa: ANN001, ANN202
     client = _FakeTextClient(responses)
-    monkeypatch.setattr(agent2, "ClaudeAgentClient", lambda s: client)
+    monkeypatch.setattr(agent2, "build_agent_client", lambda s: client)
     return client
 
 
 def _wire3(monkeypatch, responses):  # noqa: ANN001, ANN202
     client = _FakeTextClient(responses)
-    monkeypatch.setattr(agent3, "ClaudeAgentClient", lambda s: client)
+    monkeypatch.setattr(agent3, "build_agent_client", lambda s: client)
     return client
 
 

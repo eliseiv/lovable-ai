@@ -117,13 +117,12 @@ def run_agent_task(
     """
 
     # Per-job fail-fast preflight LLM-credential (§Fix round 3 п.1, основной путь): для
-    # LLM-тасок отсекаем пустой/whitespace-only ANTHROPIC_API_KEY ДО вызова тела/SDK —
-    # немедленный graceful FAILED(agent_unavailable) без ретраев, освобождая слот за секунды
-    # (а не через reconciler-TTL). Read-only Settings (без секретов в логе) — get_settings()
-    # вне worker_engine_scope: _graceful_fail_job сам открывает per-task engine/redis-scope.
-    if requires_llm and not llm_credential_present(
-        get_settings().anthropic_api_key.get_secret_value()
-    ):
+    # LLM-тасок отсекаем пустой/whitespace-only credential АКТИВНОГО провайдера (ANTHROPIC_API_KEY
+    # либо OPENAI_API_KEY по LLM_PROVIDER, ADR-032 §5) ДО вызова тела/SDK — немедленный graceful
+    # FAILED(agent_unavailable) без ретраев, освобождая слот за секунды (а не через reconciler-TTL).
+    # Read-only Settings (без секретов в логе) — get_settings() вне worker_engine_scope:
+    # _graceful_fail_job сам открывает per-task engine/redis-scope.
+    if requires_llm and not llm_credential_present(get_settings().active_llm_api_key()):
         logger.warning("agent_preflight_no_credential", extra={"job_id": job_id})
         asyncio.run(_graceful_fail_job(job_id, "agent_unavailable"))
         return

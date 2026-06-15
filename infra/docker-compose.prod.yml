@@ -98,7 +98,26 @@ x-app-env: &app-env
   # Self-hosted MinIO по http в internal-сети -> false. На AWS S3 -> true.
   S3_USE_SSL: ${S3_USE_SSL:-false}
   # --- LLM ---
+  # ADR-032: абстракция LLM-провайдера. ОДИН образ работает на anthropic (дефолт,
+  # без регрессий 4 живых инстансов) или openai (будущий клон). Дефолт провайдера
+  # = anthropic -> существующие .env без LLM_PROVIDER сохраняют текущее поведение.
+  # Имена/дефолты — символ-в-символ docs/07-deployment.md env-контракт (стр. 43/45/46
+  # + примечание провайдер-специфичности AGENTn_MODEL стр. 52). Потребитель — worker.
+  # LLM_PROVIDER / OPENAI_AGENT_EFFORT — app-env worker (читаются Settings:
+  # фабрика build_agent_client, OpenAIAgentClient) -> ОБЯЗАНЫ быть в x-app-env,
+  # иначе extra=ignore молча отдаст дефолт config.py (фичу нельзя сконфигурировать).
+  LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+  # СЕКРЕТ (SecretStr, стиль ANTHROPIC_API_KEY символ-в-символ). Пуст при
+  # LLM_PROVIDER=anthropic — норма. Реальное значение из .env (secret-manager),
+  # в git НЕ коммитится (.env.prod.example — плейсхолдер).
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  # ADR-032: ключ OpenAI API (провайдер openai). Пуст при anthropic — норма.
+  # Невалидный/пустой при openai -> preflight graceful FAILED(agent_unavailable)
+  # (ADR-019 §G / ADR-032 §5). Реальное значение НЕ коммитится.
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  # ADR-032: reasoning.effort агентов 1/2 при openai (из {medium,high,xhigh}).
+  # Агенты 3/4 -> none (не из этого ключа). На anthropic-путь не влияет. Дефолт high.
+  OPENAI_AGENT_EFFORT: ${OPENAI_AGENT_EFFORT:-high}
   # --- Auth ---
   SEED_API_KEY: ${SEED_API_KEY}
   # ADR-021: секрет админ-плоскости (X-Admin-Key для /v1/admin/*: login-as,
@@ -134,6 +153,10 @@ x-app-env: &app-env
   # обязаны быть здесь, иначе extra=ignore молча отдаст дефолт config.py. ---
   # Модели агентов (tiering; AGENT3 переведён Opus→Sonnet в ADR-023 R1,
   # env-override = откат на Opus без релиза). Дефолты = docs/07 стр. 43-46.
+  # ADR-032 (примечание провайдер-специфичности docs/07 стр. 52): AGENTn_MODEL
+  # ПЕРЕИСПОЛЬЗУЮТСЯ обоими провайдерами — меняется ЗНАЧЕНИЕ, не ключ/механизм.
+  # Compose-дефолты остаются claude (backward-compat 4 живых инстансов); OpenAI-IDs
+  # (gpt-5.4-mini / gpt-5.5) НЕ зашиваются в образ — клон задаёт их в своём .env.
   AGENT1_MODEL: ${AGENT1_MODEL:-claude-sonnet-4-6}
   AGENT2_MODEL: ${AGENT2_MODEL:-claude-opus-4-8}
   AGENT3_MODEL: ${AGENT3_MODEL:-claude-sonnet-4-6}

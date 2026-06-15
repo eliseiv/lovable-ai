@@ -47,8 +47,32 @@ class Settings(BaseSettings):
     s3_bucket: str = Field(default="lovable-artifacts")
     s3_use_ssl: bool = Field(default=False)
 
+    # --- LLM-провайдер (ADR-032, docs/07-deployment.md env-контракт) ---
+    # Выбор провайдера: anthropic (дефолт, без регрессий) / openai. Фабрика клиента агента
+    # (app/pipeline/agents/base.build_agent_client) читает settings.llm_provider; иное значение
+    # → fail-fast LLMProviderConfigError на старте (не молчаливый дефолт). app-env worker.
+    llm_provider: str = Field(
+        default="anthropic",
+        description="LLM-провайдер: anthropic (дефолт) / openai. Фабрика клиента агента читает "
+        "это поле; иное значение → fail-fast. env LLM_PROVIDER (ADR-032).",
+    )
+
     # --- Anthropic ---
     anthropic_api_key: SecretStr = Field(default=SecretStr(""))
+
+    # --- OpenAI (ADR-032, провайдер openai) ---
+    # Ключ OpenAI API. Стиль секрета символ-в-символ как anthropic_api_key (SecretStr,
+    # default SecretStr("")). Пустой при LLM_PROVIDER=anthropic — норма; невалидный/пустой при
+    # openai → preflight graceful FAILED(agent_unavailable) (ADR-019 §G, ADR-032 §5).
+    openai_api_key: SecretStr = Field(default=SecretStr(""))
+    # reasoning.effort агентов 1/2 при LLM_PROVIDER=openai (аналог agent_effort), из
+    # {medium,high,xhigh}. Агенты 3/4 → none (не из этого ключа — весь max_output_tokens под
+    # вывод полного file-tree, ADR-032 §2). На anthropic-путь не влияет. env OPENAI_AGENT_EFFORT.
+    openai_agent_effort: str = Field(
+        default="high",
+        description="reasoning.effort агентов 1/2 (OpenAI), из {medium,high,xhigh}. Агенты 3/4 → "
+        "none (весь cap под вывод). env OPENAI_AGENT_EFFORT (ADR-032 §2).",
+    )
     # Tiering моделей агент→модель — ЕДИНЫЙ нормативный маппинг (docs/modules/pipeline/
     # 03-architecture.md §Агенты → Tiering, docs/02-tech-stack.md → Модели): Opus для
     # Spec/Builder (качество), Sonnet для Interviewer/Fixer (дешевле). Меняется только
@@ -444,6 +468,19 @@ class Settings(BaseSettings):
         if agent in ("agent3", "agent4"):
             return {"type": "disabled"}
         return {"type": "adaptive"}
+
+    def active_llm_api_key(self) -> str:
+        """Распакованный credential АКТИВНОГО LLM-провайдера (ADR-032 §5, preflight §G).
+
+        Какой ключ проверять — определяется llm_provider: openai → OPENAI_API_KEY, иначе
+        (anthropic/дефолт) → ANTHROPIC_API_KEY. Возвращает уже-распакованную строку (не
+        SecretStr), чтобы preflight (llm_credential_present) был провайдер-агностичен и не
+        логировал секрет. Для невалидного llm_provider фабрика всё равно fail-fast'нет на старте
+        клиента — preflight здесь не маскирует мисконфиг, лишь не падает на чтении ключа.
+        """
+        if self.llm_provider == "openai":
+            return self.openai_api_key.get_secret_value()
+        return self.anthropic_api_key.get_secret_value()
 
     @property
     def is_prod(self) -> bool:

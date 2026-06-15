@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, cast
 
@@ -16,7 +15,13 @@ from anthropic import AsyncAnthropic
 from anthropic.types import OutputConfigParam
 
 from app.core.config import Settings
+from app.pipeline.agents.base import AgentCall
 from app.workers.retry_policy import LLMCredentialError
+
+# `AgentCall` — провайдер-нейтральный тип, перенесён в base.py (ADR-032 §1, единый источник для
+# обоих клиентов и structured.py). Ре-экспорт здесь сохраняет существующий импорт-путь
+# `from app.pipeline.agents.claude_client import AgentCall` (обратная совместимость).
+__all__ = ["AgentCall", "ClaudeAgentClient"]
 
 # Себестоимость per-1M токенов (USD), по модели (skill claude-api → Current Models).
 # input / output / cache_read (~0.1x input) / cache_write (~1.25x input).
@@ -35,19 +40,6 @@ _MODEL_PRICING: dict[str, dict[str, Decimal]] = {
     },
 }
 _PER_MILLION = Decimal("1000000")
-
-
-@dataclass(frozen=True)
-class AgentCall:
-    """Результат вызова агента: текст ответа + учёт токенов/стоимости."""
-
-    text: str
-    model: str
-    input_tokens: int
-    output_tokens: int
-    cache_read_tokens: int
-    cache_write_tokens: int
-    cost_usd: Decimal
 
 
 def _compute_cost(

@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.config import Settings
-from app.pipeline.agents.claude_client import AgentCall, ClaudeAgentClient
+from app.pipeline.agents.base import AgentCall, build_agent_client
 from app.pipeline.agents.structured import (
     DiagnosticsHook,
     GuardHook,
@@ -49,7 +49,7 @@ async def run_agent3(
     (traversal/encoding/лимиты/allowlist).
     На исчерпании ретраев бросает AgentOutputError → task → agent_output_invalid-семантика (§I.3).
     """
-    client = ClaudeAgentClient(settings)
+    client = build_agent_client(settings)
     result = await run_structured_agent(
         settings,
         client,
