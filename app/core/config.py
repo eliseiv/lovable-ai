@@ -213,6 +213,14 @@ class Settings(BaseSettings):
     max_files: int = Field(default=300)
     max_file_bytes: int = Field(default=2 * 1024 * 1024)  # 2 MiB
     max_tree_bytes: int = Field(default=20 * 1024 * 1024)  # 20 MiB
+    # --- ADR-034: лимиты приложенных изображений (POST /projects·/edits) ---
+    # Поля Settings стилем соседних int-лимитов MAX_FILES/MAX_*_BYTES (worker, extra=ignore,
+    # env-контракт docs/07-deployment.md D8). Sniff magic bytes + лимиты — первичная защита
+    # (ADR-034 §D2). Имена/дефолты символ-в-символ с каноническим списком docs/07.
+    max_images_per_job: int = Field(default=6)  # MAX_IMAGES_PER_JOB
+    max_image_bytes: int = Field(default=5 * 1024 * 1024)  # MAX_IMAGE_BYTES, 5 MiB
+    max_images_total_bytes: int = Field(default=20 * 1024 * 1024)  # MAX_IMAGES_TOTAL_BYTES, 20 MiB
+    max_image_dimension_px: int = Field(default=2048)  # MAX_IMAGE_DIMENSION_PX
     spec_inline_max_bytes: int = Field(
         default=16 * 1024,
         description="Спека ≤ 16 KB — inline в spec_tz, иначе spec_ref в S3.",

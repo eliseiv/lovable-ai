@@ -22,6 +22,8 @@ from app.db.enums import JobState
 from app.db.models import GenerationJob, Project, Revision, SiteDeployment
 from app.pipeline.dispatcher import dispatch_for_state
 from app.pipeline.events import record_event
+from app.services.attachments_service import ValidatedImage, persist_images
+from app.storage.s3 import get_storage
 
 logger = get_logger(__name__)
 
@@ -40,6 +42,7 @@ async def create_project_with_job(
     prompt: str,
     title: str | None,
     idempotency_key: str,
+    images: list[ValidatedImage] | None = None,
 ) -> CreatedProject:
     """Создаёт project + generation_job (CREATED) и ставит task_interview.
 
@@ -53,12 +56,17 @@ async def create_project_with_job(
          превышение entitlement/projects/concurrency/quota → 402 (RFC-7807) с reason.
     Это единая idempotency-aware точка энфорса (S3.5-gate перенесён из FastAPI-dependency
     внутрь сервиса ПОСЛЕ idempotency-чека — иначе replay free-юзера ложно ловил 402).
+
+    `images` (ADR-034 §D9): валидированные приложенные изображения пишутся в S3 + строки
+    attachments ТОЛЬКО на реально новой джобе (created=True), в той же транзакции — replay
+    того же Idempotency-Key (created=False) сюда не доходит, повторных строк/объектов нет.
     """
     settings = get_settings()
 
     existing_job = await _find_existing_job(session, user_id, idempotency_key)
     if existing_job is not None:
-        # Идемпотентный replay: возвращаем существующую джобу без quota-gate.
+        # Идемпотентный replay: возвращаем существующую джобу без quota-gate и БЕЗ повторной
+        # записи attachments/S3 (ADR-034 §D9).
         return CreatedProject(
             project_id=existing_job.project_id,
             job_id=existing_job.id,
@@ -93,6 +101,18 @@ async def create_project_with_job(
     )
     session.add(project)
     session.add(job)
+    # ADR-034 §D4/§D9: запись изображений (S3 + строки attachments) на новой джобе, в той же
+    # транзакции, что project/job — replay (created=False) сюда не доходит → не дублируется.
+    if images:
+        # FK-порядок parent-before-child: Attachment имеет column-level FK на projects/
+        # generation_jobs БЕЗ ORM relationship() (в отличие от JobEvent/Question/Answer),
+        # поэтому UoW-сортировка INSERT не гарантирует материализацию project/job до
+        # attachments. Явный flush детерминированно вставляет parent-строки ДО persist_images,
+        # иначе любой POST с изображениями падает ForeignKeyViolation (fk_attachments_*).
+        await session.flush()
+        await persist_images(
+            session, get_storage(), project_id=project.id, job_id=job.id, images=images
+        )
     await record_event(session, job.id, "job_created", to_state=JobState.CREATED.value)
     try:
         await session.commit()

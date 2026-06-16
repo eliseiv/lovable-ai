@@ -8,14 +8,13 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, File, Form, Header, UploadFile, status
 
 from app.api.dependencies import CurrentUser, SessionDep
 from app.api.errors import not_found, problem_responses, unprocessable
+from app.core.config import get_settings
 from app.schemas.api import (
-    CreateEditRequest,
     CreateEditResponse,
-    CreateProjectRequest,
     CreateProjectResponse,
     DeleteProjectResponse,
     ProjectListResponse,
@@ -24,9 +23,25 @@ from app.schemas.api import (
     RevisionsListResponse,
     RollbackResponse,
 )
-from app.services import edit_service, project_service
+from app.services import attachments_service, edit_service, project_service
 
 router = APIRouter(prefix="/projects")
+
+
+async def _read_uploads(images: list[UploadFile]) -> list[tuple[str | None, bytes]]:
+    """Читает multipart UploadFile'ы в (filename, bytes) для валидации (ADR-034 §D2).
+
+    Пустые части (без имени и без содержимого — браузеры/клиенты иногда шлют пустой `images`
+    как одну пустую часть) отбрасываются, чтобы 0 приложенных фото не считались за один файл.
+    filename — аудит (НЕ для путей/типа: тип выводится из magic bytes).
+    """
+    out: list[tuple[str | None, bytes]] = []
+    for upload in images:
+        data = await upload.read()
+        if not data and not upload.filename:
+            continue
+        out.append((upload.filename, data))
+    return out
 
 
 @router.post(
@@ -52,19 +67,28 @@ router = APIRouter(prefix="/projects")
     # с reason. 429 остаётся только за rate-limit (60/min), не за concurrency.
 )
 async def create_project(
-    body: CreateProjectRequest,
     user: CurrentUser,
     session: SessionDep,
+    prompt: Annotated[str, Form(min_length=1, description="Текстовое описание желаемого сайта.")],
+    title: Annotated[str | None, Form(description="Необязательное название проекта.")] = None,
+    images: Annotated[
+        list[UploadFile],
+        File(description="Приложенные изображения (PNG/JPEG/WebP/GIF, опц.)."),
+    ] = [],  # noqa: B006 — FastAPI File-дефолт: пустой список = 0 файлов (ADR-034 §D11).
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> CreateProjectResponse:
+    # ADR-034 §D11: multipart (prompt+title как Form, images как list[UploadFile]).
     if not idempotency_key:
         raise unprocessable("Idempotency-Key header is required.")
+    # ADR-034 §D2: валидация (sniff magic bytes + лимиты) ДО создания джобы. Нарушение → 422.
+    validated = attachments_service.validate_images(get_settings(), await _read_uploads(images))
     result = await project_service.create_project_with_job(
         session,
         user_id=user.id,
-        prompt=body.prompt,
-        title=body.title,
+        prompt=prompt,
+        title=title,
         idempotency_key=idempotency_key,
+        images=validated,
     )
     return CreateProjectResponse(project_id=result.project_id, job_id=result.job_id)
 
@@ -151,24 +175,34 @@ async def delete_project(
 )
 async def create_edit(
     project_id: str,
-    body: CreateEditRequest,
     user: CurrentUser,
     session: SessionDep,
+    instruction: Annotated[
+        str, Form(min_length=1, description="Текстовая инструкция к правке сайта.")
+    ],
+    images: Annotated[
+        list[UploadFile],
+        File(description="Приложенные изображения правки (PNG/JPEG/WebP/GIF, опц.)."),
+    ] = [],  # noqa: B006 — FastAPI File-дефолт: пустой список = 0 файлов (ADR-034 §D11).
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> CreateEditResponse:
     """Создаёт задачу правки опубликованного сайта по инструкции. Возвращает job_id.
 
-    Idempotency-Key обязателен. Правка только над работающим сайтом → иначе 409. Лимит
-    исчерпан/нет подписки → 402. Чужой/несуществующий проект → 404.
+    ADR-034 §D11: multipart (instruction как Form, images как list[UploadFile]). Idempotency-Key
+    обязателен. Правка только над работающим сайтом → иначе 409. Лимит исчерпан/нет подписки →
+    402. Чужой/несуществующий проект → 404.
     """
     if not idempotency_key:
         raise unprocessable("Idempotency-Key header is required.")
+    # ADR-034 §D2: те же image-правила/лимиты/коды, что POST /projects. Валидация ДО создания.
+    validated = attachments_service.validate_images(get_settings(), await _read_uploads(images))
     result = await edit_service.create_edit_job(
         session,
         user_id=user.id,
         project_id=project_id,
-        instruction=body.instruction,
+        instruction=instruction,
         idempotency_key=idempotency_key,
+        images=validated,
     )
     return CreateEditResponse(job_id=result.job_id)
 

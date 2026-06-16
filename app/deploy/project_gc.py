@@ -37,6 +37,7 @@ from app.core.logging import get_logger
 from app.db.enums import TERMINAL_STATES, JobState
 from app.db.models import (
     Answer,
+    Attachment,
     GenerationJob,
     JobEvent,
     LlmUsage,
@@ -129,6 +130,9 @@ async def _delete_s3_artifacts(
     for job_id in job_ids:
         for prefix in s3.job_artifact_prefixes(job_id):
             deleted += await storage.delete_prefix(prefix, batch_size=batch_size)
+    # ADR-034 §D7: project-scoped префикс приложенных изображений uploads/{project_id}/ —
+    # добавляется ОТДЕЛЬНО от per-job job_artifact_prefixes (один вызов на проект, не на job).
+    deleted += await storage.delete_prefix(s3.uploads_prefix(project_id), batch_size=batch_size)
     if deleted:
         logger.info(
             "project_gc_s3_deleted", extra={"project_id": project_id, "deleted_keys": deleted}
@@ -165,6 +169,10 @@ async def _hard_delete_db_rows(session: AsyncSession, project_id: str) -> None:
     await session.execute(delete(SiteDeployment).where(SiteDeployment.project_id == project_id))
     # revisions (FK→projects, →generation_jobs) — после снятия current_revision_id.
     await session.execute(delete(Revision).where(Revision.project_id == project_id))
+
+    # ADR-034 §D7: attachments удаляются ДО generation_jobs (FK attachments.job_id) и ДО
+    # projects (FK attachments.project_id). Скоуп — project_id (берутся все фото проекта).
+    await session.execute(delete(Attachment).where(Attachment.project_id == project_id))
 
     if job_ids:
         # Дочерние generation_jobs (FK→generation_jobs.id) — до самих джоб.

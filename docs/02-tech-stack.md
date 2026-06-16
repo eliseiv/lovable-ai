@@ -14,6 +14,7 @@
 |---|---|---|
 | FastAPI | **0.115.x** | Async-first, OpenAPI из коробки, Pydantic v2, SSE. |
 | Uvicorn | **0.32.x** | ASGI-сервер для FastAPI. |
+| python-multipart | **>=0.0.12** (актуальная мажорная `0.0.x`; PyPI-имя — `python-multipart`, импорт-имя `multipart`) | **Рантайм-зависимость multipart-парсинга на api-стороне** для `Form`/`File`/`UploadFile`-роутов FastAPI. Требуется D11-эндпоинтами `POST /v1/projects` и `POST /v1/projects/{pid}/edits`, которые переведены на `multipart/form-data` ([ADR-034 §D11](adr/ADR-034-user-image-attachments-vision-site-assets.md)). **Без пакета импорт роутера с `Form(...)`/`UploadFile` падает `RuntimeError` ещё на старте процесса (app/worker не поднимается)** — FastAPI не лениво, а на регистрации роута требует наличие парсера. **Прямая зависимость** — обязана быть объявлена в `pyproject.toml` явно, **не** полагаться на транзитивную доступность через starlette/другие пакеты (starlette не тянет её жёстко). Отлична от зависимости image-**валидации** ([ADR-034 §Q-IMG-3](adr/ADR-034-user-image-attachments-vision-site-assets.md): sniff magic bytes без библиотеки, Pillow — follow-up) — это парсер самого транспорта тела, не валидатор содержимого. |
 | Pydantic | **2.x** | Валидация схем API, settings. |
 | SQLAlchemy | **2.0.x (async)** | ORM, async-движок (`asyncpg`). System of record — Postgres. |
 | asyncpg | **0.30.x** | Async-драйвер Postgres (рантайм приложения: FastAPI/Celery, `DATABASE_URL`). |

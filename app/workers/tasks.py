@@ -34,6 +34,7 @@ from app.core.logging import get_logger
 from app.db.enums import JobState
 from app.db.models import (
     Answer,
+    Attachment,
     GenerationJob,
     Project,
     Question,
@@ -45,9 +46,10 @@ from app.deploy import docker_deploy, health, routing, sandbox, workspace
 from app.deploy.traefik import live_url
 from app.observability import metrics
 from app.pipeline.agents.agent1 import run_agent1
-from app.pipeline.agents.agent2 import run_agent2
+from app.pipeline.agents.agent2 import AssetManifestEntry, run_agent2
 from app.pipeline.agents.agent3 import run_agent3
 from app.pipeline.agents.agent4 import run_agent4, run_agent4_editor
+from app.pipeline.agents.base import ImageInput
 from app.pipeline.agents.claude_client import AgentCall
 from app.pipeline.agents.structured import (
     DiagnosticsHook,
@@ -161,6 +163,7 @@ def _make_agent_hooks(
 
 async def _interview(job_id: str) -> None:
     settings = get_settings()
+    storage = get_storage()
     async with session_scope() as session:
         job = await load_job(session, job_id)
         if job is None or job.state != JobState.CREATED:
@@ -192,6 +195,13 @@ async def _interview(job_id: str) -> None:
             event_type="agent_started",
             payload={"agent": "agent1", "content_language": language.bcp47},
         )
+        # ADR-034 §D3: vision-вход Agent 1 — ВСЕ приложенные изображения проекта (скоуп
+        # project_id, чтобы фото генерации не терялись). Пусто → текстовый путь байт-в-байт.
+        from app.services.attachments_service import list_project_attachments
+
+        attachments = await list_project_attachments(session, job.project_id)
+        vision_images = await _load_vision_images(storage, attachments)
+
         # ADR-020 §I: usage пишется хуком after_call ПОСЛЕ каждого LLM-вызова (включая retry).
         before_call, after_call, on_fail = _make_agent_hooks(session, job, "agent1")
         try:
@@ -202,6 +212,7 @@ async def _interview(job_id: str) -> None:
                 before_call=before_call,
                 after_call=after_call,
                 on_attempt_failure=on_fail,
+                images=vision_images,
             )
         except PreCallGuardTripped as exc:
             # Budget/wall-clock §C(b)/(c) исчерпан перед/между retry-вызовами (ADR-020 §I.3).
@@ -282,6 +293,15 @@ async def _spec(job_id: str) -> None:
         # промпта, переживший рестарт воркера между фазами). Инжектируется в директиву Agent 2.
         language = language_from_bcp47(job.content_language)
 
+        # ADR-034 §D3/§D5: vision-вход Agent 2 + серверный манифест ассетов — ВСЕ фото проекта
+        # (скоуп project_id). Манифест детерминированный (относительные пути uploads/...);
+        # инжект тех же фото в дерево — ниже, после Agent 3 (§D4).
+        from app.services.attachments_service import list_project_attachments
+
+        attachments = await list_project_attachments(session, job.project_id)
+        vision_images = await _load_vision_images(storage, attachments)
+        asset_manifest = _asset_manifest_entries(attachments)
+
         # Agent 2: спека. usage пишется хуком after_call (ADR-020 §I) — без отдельного record.
         a2_before, a2_after, a2_fail = _make_agent_hooks(session, job, "agent2")
         try:
@@ -293,6 +313,8 @@ async def _spec(job_id: str) -> None:
                 before_call=a2_before,
                 after_call=a2_after,
                 on_attempt_failure=a2_fail,
+                images=vision_images,
+                assets=asset_manifest,
             )
         except PreCallGuardTripped as exc:
             await fail_job(session, job, failure_reason=exc.reason)
@@ -356,8 +378,11 @@ async def _spec(job_id: str) -> None:
             logger.warning("agent3_failed", extra={"job_id": job_id, "error": str(exc)})
             return
 
-        # Упаковка source.tgz → S3.
-        source_tgz = workspace.pack_source_tgz(build_result.tree)
+        # Упаковка source.tgz → S3. ADR-034 §D4: детерминированный инжект ВСЕХ фото проекта в
+        # дерево как public/uploads/{att_id}.{ext} — ПОСЛЕ валидации agent_output, ДО pack
+        # (поверх дерева Agent 3, в обход LLM). Пусто → pack байт-в-байт как без ассетов.
+        injected = await _injected_assets(storage, attachments)
+        source_tgz = workspace.pack_source_tgz_with_assets(build_result.tree, injected)
         source_ref = await storage.put_bytes(s3.source_key(job_id), source_tgz, "application/gzip")
         await record_event(session, job.id, "source_packed", payload={"source_ref": source_ref})
         await transition(
@@ -877,6 +902,24 @@ async def _edit(job_id: str) -> None:
         spec_md = await _load_spec(session, storage, job)
         source_tgz = await storage.get_bytes(base_revision.source_artifact_ref)
 
+        # ADR-034 §D3/§D4: vision Agent 4 editor — НОВЫЕ фото правки (этой edit-джобы); в ИНЖЕКТ
+        # ниже — ВСЕ фото проекта (скоуп project_id). Разделение: editor «видит» новые картинки,
+        # дерево несёт все ассеты проекта.
+        from app.services.attachments_service import list_project_attachments
+
+        new_edit_attachments = (
+            (
+                await session.execute(
+                    select(Attachment)
+                    .where(Attachment.job_id == job_id)
+                    .order_by(Attachment.created_at, Attachment.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        edit_vision_images = await _load_vision_images(storage, list(new_edit_attachments))
+
         # usage пишется хуком after_call ПОСЛЕ каждого вызова (включая retry), ADR-020 §I.3.
         ed_before, ed_after, ed_fail = _make_agent_hooks(session, job, "agent4")
         try:
@@ -888,6 +931,7 @@ async def _edit(job_id: str) -> None:
                 before_call=ed_before,
                 after_call=ed_after,
                 on_attempt_failure=ed_fail,
+                images=edit_vision_images,
             )
         except PreCallGuardTripped as exc:
             # Budget/wall-clock исчерпан перед/между retry-вызовами editor → авто-rollback.
@@ -912,7 +956,11 @@ async def _edit(job_id: str) -> None:
             return
 
         assert result.tree is not None
-        source_tgz_new = workspace.pack_source_tgz(result.tree)
+        # ADR-034 §D4: инжект ВСЕХ фото проекта (новые правки + прежние генерации) в дерево
+        # editor'а — public/uploads/{att_id}.{ext}, поверх дерева, в обход LLM.
+        project_attachments = await list_project_attachments(session, job.project_id)
+        injected = await _injected_assets(storage, project_attachments)
+        source_tgz_new = workspace.pack_source_tgz_with_assets(result.tree, injected)
         source_ref = await storage.put_bytes(
             s3.source_key(job_id), source_tgz_new, "application/gzip"
         )
@@ -981,6 +1029,60 @@ async def _resolve_site_id(session: AsyncSession, job_id: str) -> str:
     site_id = new_subdomain()
     await record_event(session, job_id, _SITE_ID_ASSIGNED_EVENT, payload={"site_id": site_id})
     return site_id
+
+
+async def _load_vision_images(
+    storage: S3Storage, attachments: list[Attachment]
+) -> list[ImageInput]:
+    """Загружает байты приложенных изображений из S3 → vision-вход агентов (ADR-034 §D3).
+
+    `media_type` = attachments.mime (выведенный из sniff magic bytes, не заголовка multipart).
+    Порядок сохраняется (детерминизм). Пустой список → пустой результат (текстовый путь агента).
+    """
+    images: list[ImageInput] = []
+    for att in attachments:
+        data = await storage.get_bytes(att.s3_ref)
+        images.append(ImageInput(data=data, media_type=att.mime))
+    return images
+
+
+def _asset_manifest_entries(attachments: list[Attachment]) -> list[AssetManifestEntry]:
+    """Серверный манифест ассетов (ADR-034 §D5): относительный путь uploads/{att_id}.{ext}.
+
+    ОДНА нормативная относительная форма (БЕЗ public/, БЕЗ ведущего /). `description` —
+    оригинальное имя файла из multipart (аудит-подсказка «что на фото»), формируется сервером.
+    """
+    from app.services.attachments_service import ext_for_mime
+
+    return [
+        AssetManifestEntry(
+            rel_path=f"uploads/{att.id}.{ext_for_mime(att.mime)}",
+            description=att.filename,
+        )
+        for att in attachments
+    ]
+
+
+async def _injected_assets(
+    storage: S3Storage, attachments: list[Attachment]
+) -> list[workspace.InjectedAsset]:
+    """Серверные ассеты для инжекта в дерево (ADR-034 §D4): public/uploads/{att_id}.{ext}.
+
+    Байты загружаются из S3, путь детерминирован сервером (traversal-safe by construction).
+    Инжект минует agent_output-валидатор (путь доверенный). Скоуп — ВСЕ фото проекта.
+    """
+    from app.services.attachments_service import ext_for_mime
+
+    assets: list[workspace.InjectedAsset] = []
+    for att in attachments:
+        data = await storage.get_bytes(att.s3_ref)
+        assets.append(
+            workspace.InjectedAsset(
+                server_path=f"public/uploads/{att.id}.{ext_for_mime(att.mime)}",
+                data=data,
+            )
+        )
+    return assets
 
 
 async def _abort_if_project_deleted(session: AsyncSession, job: GenerationJob) -> bool:

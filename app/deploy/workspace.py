@@ -143,6 +143,49 @@ def pack_source_tgz(tree: ValidatedTree) -> bytes:
     return buffer.getvalue()
 
 
+@dataclass(frozen=True)
+class InjectedAsset:
+    """Приложенный ассет для детерминированного инжекта в дерево (ADR-034 §D4).
+
+    `server_path` — серверный путь `public/uploads/{att_id}.{ext}` (traversal-safe by
+    construction: формируется сервером из att_id/ext, не из LLM-вывода/имени файла). `data` —
+    сырые байты изображения (из S3). Инжект минует agent_output-валидатор (путь сервера
+    доверенный).
+    """
+
+    server_path: str
+    data: bytes
+
+
+def pack_source_tgz_with_assets(tree: ValidatedTree, assets: list[InjectedAsset]) -> bytes:
+    """Упаковывает дерево + манифест сборки + инжект приложенных ассетов (ADR-034 §D4).
+
+    Поверх pack_source_tgz: каждый ассет материализуется как файл `public/uploads/{att_id}.{ext}`
+    ПОСЛЕ файлов дерева Agent 3 (инжект последним/поверх). Коллизия имени дерево↔ассет
+    разрешается в пользу серверного ассета: tar несёт оба члена, распаковщик (tar.extract во
+    втором проходе) применяет ПОСЛЕДНИЙ — т.е. ассет (детерминированный путь сервера, не агента).
+    Сырые байты (не через agent_output-валидатор: путь сервера доверенный, §D4). Пустой `assets`
+    ⇒ результат байт-в-байт как pack_source_tgz.
+    """
+    manifest = json.dumps(
+        {"command": tree.build_command, "output_dir": tree.build_output_dir},
+        ensure_ascii=False,
+        sort_keys=True,
+    ).encode("utf-8")
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        _add_regular_member(tar, _BUILD_MANIFEST_NAME, manifest)
+        for f in tree.files:
+            if f.path == _BUILD_MANIFEST_NAME:
+                raise ValueError(f"tree file collides with build manifest: {f.path!r}")
+            _add_regular_member(tar, f.path, f.content_bytes)
+        # Инжект ассетов ПОСЛЕ дерева (поверх): при совпадении имени серверный ассет применяется
+        # распаковщиком последним (§D4 — приоритет серверного ассета над деревом LLM).
+        for asset in assets:
+            _add_regular_member(tar, asset.server_path, asset.data)
+    return buffer.getvalue()
+
+
 def read_build_manifest(data: bytes) -> BuildManifest:
     """Читает ``.build.json`` из source.tgz; при отсутствии/повреждении — дефолты контракта.
 

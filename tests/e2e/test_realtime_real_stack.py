@@ -53,7 +53,7 @@ def test_sse_stream_real_stack():  # pragma: no cover - живой стек
     with httpx.Client(base_url=base, timeout=30.0) as c:
         r = c.post(
             "/v1/projects",
-            json={"prompt": "A one-page landing site"},
+            data={"prompt": "A one-page landing site"},
             headers={**headers, "Idempotency-Key": f"sse-e2e-{int(time.time())}"},
         )
         assert r.status_code == 202

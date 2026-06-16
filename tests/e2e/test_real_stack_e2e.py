@@ -62,7 +62,7 @@ def test_prompt_to_live_url_real_stack():
         # 1. POST /projects
         r = c.post(
             "/v1/projects",
-            json={"prompt": "A one-page landing site for a coffee shop"},
+            data={"prompt": "A one-page landing site for a coffee shop"},
             headers={**headers, "Idempotency-Key": f"e2e-{int(time.time())}"},
         )
         assert r.status_code == 202, r.text

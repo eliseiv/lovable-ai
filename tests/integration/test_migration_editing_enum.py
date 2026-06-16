@@ -123,10 +123,12 @@ async def test_editing_enum_real_ddl_applied_via_prod_sync_path(autonomous_db):
         assert r0.returncode == 0, f"alembic upgrade 0611 failed:\n{r0.stderr}"
         assert await _enum_label_count(base_url, tmp_db, "EDITING") == 0
 
-        # upgrade head через прод-путь (sync psycopg, env.py, DATABASE_URL_SYNC).
-        r1 = _alembic(env, "upgrade", "head")
+        # upgrade до EDITING-ревизии через прод-путь (sync psycopg, env.py, DATABASE_URL_SYNC).
+        # Пин на 20260612_0001 (НЕ head): head сместился на 20260616_0001 (ADR-034 attachments),
+        # а этот тест валидирует именно EDITING-enum DDL ревизии 0012.
+        r1 = _alembic(env, "upgrade", "20260612_0001")
         assert r1.returncode == 0, (
-            "alembic upgrade head (sync psycopg) failed — ADD VALUE внутри транзакции?\n"
+            "alembic upgrade 0612 (sync psycopg) failed — ADD VALUE внутри транзакции?\n"
             f"{r1.stderr}"
         )
         assert "cannot run inside a transaction block" not in r1.stderr
@@ -172,9 +174,12 @@ async def test_editing_enum_idempotent_on_db_where_value_exists(autonomous_db):
             await conn.close()
         assert await _enum_label_count(base_url, tmp_db, "EDITING") == 1
 
-        r2 = _alembic(env, "upgrade", "head")
+        # Повтор ровно EDITING-ревизии (НЕ head): тест валидирует идемпотентность ADD VALUE
+        # IF NOT EXISTS ревизии 0012. Гнать до head нельзя — схема БД уже на head (0016),
+        # повторный CREATE TABLE attachments (0016) упал бы DuplicateTable не по теме теста.
+        r2 = _alembic(env, "upgrade", "20260612_0001")
         assert r2.returncode == 0, (
-            "повторный upgrade head на БД с уже существующим EDITING упал — "
+            "повторный upgrade 0612 на БД с уже существующим EDITING упал — "
             f"ADD VALUE без IF NOT EXISTS?\n{r2.stderr}"
         )
         # Не дублируется и не теряется: ровно одно вхождение.
@@ -223,8 +228,8 @@ async def test_full_chain_upgrade_head_via_sync_psycopg(autonomous_db):
     try:
         r = _alembic(env, "upgrade", "head")
         assert r.returncode == 0, f"full-chain upgrade head (sync psycopg) failed:\n{r.stderr}"
-        # head = текущая последняя ревизия (EDITING).
-        assert await _alembic_version(base_url, tmp_db) == "20260612_0001"
+        # head = текущая последняя ревизия (ADR-034 attachments сместил head 0012→0016).
+        assert await _alembic_version(base_url, tmp_db) == "20260616_0001"
         # Несколько контрольных объектов из ранних ревизий существуют (цепочка реально
         # применилась, а не только последняя ревизия).
         conn = await asyncpg.connect(asyncpg_dsn(base_url, db=tmp_db))

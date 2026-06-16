@@ -54,6 +54,7 @@ class _FakeTextClient:
         model,
         system_prompt,
         user_content,  # noqa: ANN001
+        images=None,  # noqa: ANN001 — ADR-034 §D3: vision-вход (дефолт None = текстовый путь)
     ):
         self.calls += 1
         self.user_contents.append(user_content)

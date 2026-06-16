@@ -79,6 +79,10 @@
 | `MAX_FILES` | `max_files` | int | worker | Hard cap числа файлов output Agent 3. | `300` |
 | `MAX_FILE_BYTES` | `max_file_bytes` | int | worker | Hard cap размера одного файла. | `2097152` (2 MiB) |
 | `MAX_TREE_BYTES` | `max_tree_bytes` | int | worker | Hard cap размера всего дерева. | `20971520` (20 MiB) |
+| `MAX_IMAGES_PER_JOB` | `max_images_per_job` | int | worker | **[ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md), §D8.** Hard cap числа приложенных изображений на джобу (`POST /projects`·`/edits`). **Поле `Settings` символ-в-символ стилем соседних `MAX_FILES`/`MAX_FILE_BYTES`/`MAX_TREE_BYTES` (строки выше) — дефолт = прод-значение, в `x-app-env` НЕ проводится** (как и соседние; devops по этому ключу в compose ничего не делает). | `6` |
+| `MAX_IMAGE_BYTES` | `max_image_bytes` | int | worker | **[ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md), §D8.** Hard cap размера одного изображения. Механизм потребления — как `MAX_IMAGES_PER_JOB` выше (поле `Settings`, в `x-app-env` не проводится). | `5242880` (5 MiB) |
+| `MAX_IMAGES_TOTAL_BYTES` | `max_images_total_bytes` | int | worker | **[ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md), §D8.** Hard cap суммы размеров всех изображений джобы. Механизм потребления — как `MAX_IMAGES_PER_JOB` выше (поле `Settings`, в `x-app-env` не проводится). **Операторская заметка (edge-прокси, НЕ `x-app-env`):** прокси-лимит тела запроса (`client_max_body_size` nginx / max request body Traefik) на edge обязан быть **≥** этого значения, иначе multipart с фото отвергается до приложения. | `20971520` (20 MiB) |
+| `MAX_IMAGE_DIMENSION_PX` | `max_image_dimension_px` | int | worker | **[ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md), §D8.** Hard cap предельной стороны изображения (px). Механизм потребления — как `MAX_IMAGES_PER_JOB` выше (поле `Settings`, в `x-app-env` не проводится). | `2048` |
 | `SPEC_INLINE_MAX_BYTES` | `spec_inline_max_bytes` | int | both | Спека ≤ значения — inline в `spec_tz`, иначе `spec_ref` в S3. | `16384` (16 KB) |
 | `JOB_BUDGET_USD` | `job_budget_usd` | str | both | Cost cap джобы (USD, numeric-строкой). | `5.0000` |
 | `USER_MONTHLY_BUDGET_USD` | `user_monthly_budget_usd` | str | both | Технический потолок Claude-затрат юзера/мес. | `50.0000` |
@@ -187,6 +191,9 @@ Scrape-конфиг Prometheus и provisioning/дашборды Grafana — **к
 | Deploy/health-лог фейла (per-attempt) | `logs/{job_id}/deploy.{retry_count}.log` | `deploy_log_key(job_id, retry_count)` | `generation_jobs.failure_log_ref` |
 | Лог отклонённого патча Agent 4 (per-attempt) | `logs/{job_id}/agent.{retry_count}.log` | `agent_log_key(job_id, retry_count)` | `generation_jobs.failure_log_ref` |
 | Большая спека | `specs/{job_id}/spec.md` | `spec_key()` | `generation_jobs.spec_tz` (`spec_ref`) |
+| Приложенное изображение ([ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md)) | `uploads/{project_id}/{att_id}.{ext}` | (`put_bytes` по детерминированному ключу) | `attachments.s3_ref` |
+
+> **Приложенные изображения ([ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md)).** Префикс `uploads/{project_id}/` — **project-scoped** (не job-scoped): один на проект, переиспользует `S3Storage.put_bytes`. GC при удалении проекта (`project.gc`, [ADR-011](adr/ADR-011-project-delete-gc.md)) удаляет этот префикс `delete_prefix`-ом **отдельным** вызовом (не через per-job `job_artifact_prefixes`) + строки `attachments`. Env-ключи лимитов `MAX_IMAGES_PER_JOB`/`MAX_IMAGE_BYTES`/`MAX_IMAGES_TOTAL_BYTES`/`MAX_IMAGE_DIMENSION_PX` — **поля `Settings`** (`app/core/config.py`, уже реализованы), в `x-app-env`/compose/`.env*.example` **не проводятся** (дефолт = прод-значение); devops по этой группе в compose ничего не делает. Единственный нормативный источник правила провизии — **[ADR-034 §D8](adr/ADR-034-user-image-attachments-vision-site-assets.md)**.
 
 `minio-setup` (dev) создаёт ровно один бакет `${S3_BUCKET}` (idempotent), не три. Префиксы не требуют отдельного создания — S3 создаёт их неявно при `put_object`.
 

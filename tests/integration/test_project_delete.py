@@ -234,7 +234,7 @@ async def test_quota_gate_max_projects_ignores_soft_deleted_slot(
     # Контроль: пока проект активен, новый запрос упирается в project_limit (402).
     blocked = await client.post(
         "/v1/projects",
-        json={"prompt": "blocked"},
+        data={"prompt": "blocked"},
         headers={**auth_headers, "Idempotency-Key": "blocked-key"},
     )
     assert blocked.status_code == 402
@@ -248,7 +248,7 @@ async def test_quota_gate_max_projects_ignores_soft_deleted_slot(
     # Теперь новый POST /projects проходит gate (projects_used=0 < max=1).
     ok = await client.post(
         "/v1/projects",
-        json={"prompt": "after delete"},
+        data={"prompt": "after delete"},
         headers={**auth_headers, "Idempotency-Key": "after-key"},
     )
     assert ok.status_code == 202, f"после soft-delete слот свободен → 202: {ok.text}"

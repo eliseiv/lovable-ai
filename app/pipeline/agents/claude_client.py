@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import base64
 from decimal import Decimal
 from typing import Any, cast
 
@@ -15,7 +16,7 @@ from anthropic import AsyncAnthropic
 from anthropic.types import OutputConfigParam
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall
+from app.pipeline.agents.base import AgentCall, ImageInput
 from app.workers.retry_policy import LLMCredentialError
 
 # `AgentCall` — провайдер-нейтральный тип, перенесён в base.py (ADR-032 §1, единый источник для
@@ -76,6 +77,7 @@ class ClaudeAgentClient:
         model: str,
         system_prompt: str,
         user_content: str,
+        images: list[ImageInput] | None = None,
     ) -> AgentCall:
         """Один текстовый вызов агента (ADR-020 §I.1, revised): стабильный system кэшируется,
         user — волатильная часть. Стримим (длинный вывод) + собираем финальное сообщение —
@@ -90,15 +92,44 @@ class ClaudeAgentClient:
         `max_tokens`, `thinking`-mode и `model` собираются ПО АГЕНТУ из конфиг-маппинга
         (ADR-023, §Token-бюджет агентов) — `agent` ∈ {agent1..agent4}. Единого поля
         agent_max_tokens больше нет.
+
+        Vision (ADR-034 §D3): при непустом `images` `messages[0].content` становится списком
+        image-блоков (base64) + text-блок. Дефолт `images=None` ⇒ прежний текстовый путь
+        байт-в-байт. Image-блоки совместимы с extended thinking (иной механизм, чем
+        форсированный tool_choice ADR-020) — thinking/output_config не трогаются.
         """
         message = await self._stream_final_message(
             agent=agent,
             model=model,
             system_prompt=system_prompt,
             user_content=user_content,
+            images=images,
         )
         text = "".join(block.text for block in message.content if block.type == "text")
         return self._build_call(model, message, text)
+
+    @staticmethod
+    def _user_message_content(user_content: str, images: list[ImageInput] | None) -> Any:
+        """Содержимое user-сообщения: строка (текстовый путь) или список блоков (vision, §D3).
+
+        Непустой `images`: image content-блоки (base64) идут ПЕРЕД text-блоком — Anthropic
+        видит картинку как контекст к тексту. Пустой/None ⇒ прежняя голая строка (байт-в-байт).
+        """
+        if not images:
+            return user_content
+        blocks: list[dict[str, Any]] = [
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.media_type,
+                    "data": base64.b64encode(img.data).decode("ascii"),
+                },
+            }
+            for img in images
+        ]
+        blocks.append({"type": "text", "text": user_content})
+        return blocks
 
     async def _stream_final_message(
         self,
@@ -107,6 +138,7 @@ class ClaudeAgentClient:
         model: str,
         system_prompt: str,
         user_content: str,
+        images: list[ImageInput] | None = None,
     ) -> Any:
         """Транспорт: stream + get_final_message для текстового вызова агента.
 
@@ -137,7 +169,9 @@ class ClaudeAgentClient:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-            "messages": [{"role": "user", "content": user_content}],
+            "messages": [
+                {"role": "user", "content": self._user_message_content(user_content, images)}
+            ],
         }
         try:
             async with self._client.messages.stream(**kwargs) as stream:

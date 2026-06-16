@@ -81,6 +81,15 @@ def new_credit_grant_id() -> str:
     return _opaque("cg_")
 
 
+def new_attachment_id() -> str:
+    """Opaque ID строки attachments (`att_...`, ADR-034 user image attachments).
+
+    Часть детерминированного пути инжекта/ключа S3 (`uploads/{project_id}/{att_id}.{ext}`,
+    docs/03-data-model.md → attachments).
+    """
+    return _opaque("att_")
+
+
 def new_subdomain() -> str:
     """Opaque-идентификатор деплоя [a-z0-9]{16} (НЕ project_id)."""
     return "".join(secrets.choice(_SUBDOMAIN_ALPHABET) for _ in range(16))

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall, build_agent_client
+from app.pipeline.agents.base import AgentCall, ImageInput, build_agent_client
 from app.pipeline.agents.structured import (
     FAIL_CLASS_SCHEMA,
     DiagnosticsHook,
@@ -32,13 +32,50 @@ _CONTENT_LANGUAGE_MARKER = "**Content language:**"
 
 
 @dataclass(frozen=True)
+class AssetManifestEntry:
+    """Запись серверного манифеста ассетов (ADR-034 §D5): относительный путь + «что на фото».
+
+    `rel_path` — ЕДИНСТВЕННАЯ нормативная относительная форма `uploads/{att_id}.{ext}` (БЕЗ
+    префикса public/, БЕЗ ведущего /). `description` — краткое «что на фото» (оригинальное имя
+    файла из multipart как аудит-подсказка; формируется сервером, НЕ свободный текст LLM).
+    """
+
+    rel_path: str
+    description: str | None
+
+
+@dataclass(frozen=True)
 class Agent2Result:
     spec_markdown: str
     call: AgentCall
 
 
+def _build_asset_manifest(assets: list[AssetManifestEntry]) -> str:
+    """Детерминированная серверная секция манифеста ассетов в спеке (ADR-034 §D5).
+
+    Сервер формирует её из строк attachments (НЕ свободный текст LLM); Agent 2 переносит
+    дословно в spec_markdown. Путь — ОДНА нормативная относительная форма uploads/{att_id}.{ext}
+    (БЕЗ public/, БЕЗ абсолютного /uploads/ — иначе сломался бы path-routing --base=/s/{site_id}/).
+    """
+    lines = [
+        "Uploaded assets:",
+        "Use the EXACT relative paths below to reference the user's uploaded images in the "
+        'site (e.g. <img src="uploads/...">). Do NOT invent other paths, do NOT prefix with '
+        "public/ or a leading /. The build copies them into the site automatically.",
+    ]
+    for entry in assets:
+        if entry.description:
+            lines.append(f"- {entry.rel_path} — {entry.description}")
+        else:
+            lines.append(f"- {entry.rel_path}")
+    return "\n".join(lines)
+
+
 def _build_user_content(
-    prompt: str, qa_pairs: list[tuple[str, str]], language: DetectedLanguage
+    prompt: str,
+    qa_pairs: list[tuple[str, str]],
+    language: DetectedLanguage,
+    assets: list[AssetManifestEntry] | None = None,
 ) -> str:
     # Серверная language-директива (ADR-028 §3): язык — детерминированный детект из исходного
     # промпта (content_language), НЕ само-детект модели. Маркер `**Content language:**` в начале
@@ -56,6 +93,10 @@ def _build_user_content(
     for idx, (question, answer) in enumerate(qa_pairs, start=1):
         lines.append(f"{idx}. Q: {question}")
         lines.append(f"   A: {answer}")
+    # Серверный манифест ассетов (ADR-034 §D5) — детерминированно из строк attachments.
+    if assets:
+        lines.append("")
+        lines.append(_build_asset_manifest(assets))
     lines.append("\nWrite the specification now.")
     return "\n".join(lines)
 
@@ -95,12 +136,17 @@ async def run_agent2(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    images: list[ImageInput] | None = None,
+    assets: list[AssetManifestEntry] | None = None,
 ) -> Agent2Result:
     """Один шаг Agent 2 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
 
     `language` — серверный детерминированный детект языка из исходного промпта (ADR-028);
     инжектируется явной директивой; значение маркера `**Content language:**` приходит отсюда,
     НЕ из само-детекта модели.
+    `images` — vision-вход (приложенные изображения, ADR-034 §D3); дефолт None ⇒ текстовый путь.
+    `assets` — серверный манифест ассетов (ADR-034 §D5), вставляется детерминированно в ввод;
+    Agent 2 переносит относительные пути uploads/... в спеку (downstream-канал для Agent 3/4).
     Хуки инъектируются task-слоем (budget/wall-clock-гард, llm_usage, диагностика §I.4).
     На исчерпании ретраев бросает StructuredOutputError → task → FAILED(invalid_agent_output).
     """
@@ -111,10 +157,11 @@ async def run_agent2(
         agent="agent2",
         model=settings.agent2_model,
         system_prompt=_SYSTEM_PROMPT,
-        user_content=_build_user_content(prompt, qa_pairs, language),
+        user_content=_build_user_content(prompt, qa_pairs, language, assets),
         validate=_validate_spec,
         before_call=before_call,
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
+        images=images,
     )
     return Agent2Result(spec_markdown=result.value, call=result.call)

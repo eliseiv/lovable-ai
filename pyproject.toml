@@ -6,6 +6,11 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.115.*",
     "uvicorn[standard]==0.32.*",
+    # ADR-034 §D12: FastAPI Form/File-парсер multipart/form-data для D11-эндпоинтов
+    # POST /v1/projects и POST /v1/projects/{pid}/edits. Прямая зависимость — не транзитив
+    # через starlette (не тянет жёстко); без пакета импорт роутера с Form/UploadFile падает
+    # RuntimeError на старте. Пин — docs/02-tech-stack.md §Backend framework (>=0.0.12).
+    "python-multipart>=0.0.12",
     "pydantic==2.*",
     "pydantic-settings==2.*",
     "sqlalchemy[asyncio]==2.0.*",

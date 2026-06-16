@@ -77,7 +77,7 @@ def _hdr(key: str, idem: str = "qg-key") -> dict[str, str]:
 
 
 async def _post(client, key, idem="qg-key"):  # noqa: ANN001
-    return await client.post("/v1/projects", json={"prompt": "site"}, headers=_hdr(key, idem))
+    return await client.post("/v1/projects", data={"prompt": "site"}, headers=_hdr(key, idem))
 
 
 # --- free-дефолт без подписки проходит ---

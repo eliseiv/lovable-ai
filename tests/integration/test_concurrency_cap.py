@@ -114,11 +114,11 @@ async def test_second_post_projects_returns_402_not_429(
     api_key = r.json()["api_key"]
     headers = {"Authorization": f"Bearer {api_key}", "Idempotency-Key": "cap-key-1"}
 
-    first = await client.post("/v1/projects", json={"prompt": "site one"}, headers=headers)
+    first = await client.post("/v1/projects", data={"prompt": "site one"}, headers=headers)
     assert first.status_code == 202
 
     headers2 = {"Authorization": f"Bearer {api_key}", "Idempotency-Key": "cap-key-2"}
-    second = await client.post("/v1/projects", json={"prompt": "site two"}, headers=headers2)
+    second = await client.post("/v1/projects", data={"prompt": "site two"}, headers=headers2)
     assert second.status_code == 402, "S3.5: payment-gate, НЕ 429"
     assert second.headers["content-type"].startswith("application/problem+json")
     # Для free доминирует project_limit (проверяется раньше concurrency_limit, §4).
@@ -135,9 +135,9 @@ async def test_idempotent_repeat_not_counted_against_cap(
     api_key = r.json()["api_key"]
     headers = {"Authorization": f"Bearer {api_key}", "Idempotency-Key": "idem-same"}
 
-    first = await client.post("/v1/projects", json={"prompt": "p"}, headers=headers)
+    first = await client.post("/v1/projects", data={"prompt": "p"}, headers=headers)
     assert first.status_code == 202
     # Тот же ключ → идемпотентный повтор, тот же job_id, НЕ 402.
-    again = await client.post("/v1/projects", json={"prompt": "p"}, headers=headers)
+    again = await client.post("/v1/projects", data={"prompt": "p"}, headers=headers)
     assert again.status_code == 202
     assert again.json()["job_id"] == first.json()["job_id"]

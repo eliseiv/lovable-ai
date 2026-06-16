@@ -196,7 +196,7 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
     # детект из исходного промпта). Фейк ассертит, что _interview/_spec передают DetectedLanguage
     # со значением `en` (английский промпт "Landing page for a coffee shop").
     async def _fake_agent1(
-        settings, prompt, language, *, before_call, after_call, on_attempt_failure
+        settings, prompt, language, *, before_call, after_call, on_attempt_failure, images=None
     ):  # noqa: ANN001, ANN202, E501
         assert language.bcp47 == "en", f"ожидался серверный детект en, получено {language.bcp47}"
         await before_call()
@@ -211,7 +211,16 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
         )
 
     async def _fake_agent2(
-        settings, prompt, qa_pairs, language, *, before_call, after_call, on_attempt_failure
+        settings,
+        prompt,
+        qa_pairs,
+        language,
+        *,
+        before_call,
+        after_call,
+        on_attempt_failure,
+        images=None,
+        assets=None,
     ):  # noqa: ANN001, ANN202, E501
         # Crash-resume (ADR-028): язык на фазе spec читается из job.content_language (en),
         # НЕ передетектится. Маркер несёт значение директивы.

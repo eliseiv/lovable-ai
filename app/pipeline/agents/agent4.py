@@ -24,7 +24,7 @@ from dataclasses import dataclass
 
 from app.core.config import Settings
 from app.core.logging import get_logger
-from app.pipeline.agents.base import AgentCall, build_agent_client
+from app.pipeline.agents.base import AgentCall, ImageInput, build_agent_client
 from app.pipeline.agents.structured import (
     DiagnosticsHook,
     GuardHook,
@@ -245,10 +245,13 @@ async def run_agent4_editor(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    images: list[ImageInput] | None = None,
 ) -> Agent4Result:
     """Один шаг Agent 4 как editor (Sprint 5, ADR-014): спека + current good-дерево +
     instruction → новое дерево (та же выходная схема/валидация/structured-механизм, что fixer).
 
+    `images` — vision-вход editor'а (НОВЫЕ фото правки, ADR-034 §D3); дефолт None ⇒ текстовый
+    путь. Fixer-режим (run_agent4) vision НЕ получает.
     На исчерпании ретраев невалидный output → AgentOutputError (как fix-неудача — учёт в гардах
     edit-цикла). unrecoverable → Agent4Result.unrecoverable (дерево None).
     """
@@ -265,6 +268,7 @@ async def run_agent4_editor(
         before_call=before_call,
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
+        images=images,
     )
 
 
@@ -276,9 +280,10 @@ async def _run_agent4(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    images: list[ImageInput] | None = None,
 ) -> Agent4Result:
     """Общий structured-вызов Agent 4 (fixer/editor): текстовый режим + extract_json + retry +
-    доменная валидация."""
+    доменная валидация. `images` (vision) — только editor; fixer вызывает без images (None)."""
     client = build_agent_client(settings)
     result = await run_structured_agent(
         settings,
@@ -291,6 +296,7 @@ async def _run_agent4(
         before_call=before_call,
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
+        images=images,
     )
     return Agent4Result(
         call=result.call,

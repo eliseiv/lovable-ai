@@ -22,13 +22,14 @@ Usage/cost (ADR-032 §4): `input_tokens`/`output_tokens` (reasoning-токены
 
 from __future__ import annotations
 
+import base64
 from decimal import Decimal
 from typing import Any
 
 from openai import AsyncOpenAI
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall
+from app.pipeline.agents.base import AgentCall, ImageInput
 
 # Себестоимость per-1M токенов (USD) OpenAI-моделей — НОРМАТИВНАЯ таблица
 # docs/modules/observability/03-architecture.md §2.2A (верифицирована по каталогу OpenAI
@@ -137,6 +138,7 @@ class OpenAIAgentClient:
         model: str,
         system_prompt: str,
         user_content: str,
+        images: list[ImageInput] | None = None,
     ) -> AgentCall:
         """Один текстовый вызов агента через Responses API (ADR-032 §2/§3).
 
@@ -150,15 +152,41 @@ class OpenAIAgentClient:
         per-agent (§2). Credential (§5): пустой ключ отсекается preflight'ом, невалидный →
         request-time AuthenticationError(401) — не-транзиентный LLM-сбой (классифицируется
         retry_policy), клиент его НЕ оборачивает.
+
+        Vision (ADR-034 §D3): при непустом `images` `input` становится списком content-частей
+        `input_image` (data-URL base64) + `input_text`. Дефолт `images=None` ⇒ прежний текстовый
+        путь байт-в-байт. reasoning/instructions не меняются (input_image совместим с reasoning).
         """
         response = await self._stream_final_response(
             agent=agent,
             model=model,
             system_prompt=system_prompt,
             user_content=user_content,
+            images=images,
         )
         text = response.output_text
         return self._build_call(model, response, text)
+
+    @staticmethod
+    def _input_payload(user_content: str, images: list[ImageInput] | None) -> Any:
+        """`input` Responses API: строка (текстовый путь) или список content-частей (vision, §D3).
+
+        Непустой `images`: `input_image` (data-URL) идут ПЕРЕД `input_text`. Пустой/None ⇒
+        прежняя голая строка (байт-в-байт текстовый путь).
+        """
+        if not images:
+            return user_content
+        content: list[dict[str, Any]] = [
+            {
+                "type": "input_image",
+                "image_url": (
+                    f"data:{img.media_type};base64,{base64.b64encode(img.data).decode('ascii')}"
+                ),
+            }
+            for img in images
+        ]
+        content.append({"type": "input_text", "text": user_content})
+        return [{"role": "user", "content": content}]
 
     async def _stream_final_response(
         self,
@@ -167,6 +195,7 @@ class OpenAIAgentClient:
         model: str,
         system_prompt: str,
         user_content: str,
+        images: list[ImageInput] | None = None,
     ) -> Any:
         """Транспорт: Responses API stream + финальный response (ADR-032 §2).
 
@@ -190,7 +219,7 @@ class OpenAIAgentClient:
             "max_output_tokens": self._settings.agent_max_tokens(agent),
             "reasoning": {"effort": self._reasoning_effort(agent)},
             "instructions": system_prompt,
-            "input": user_content,
+            "input": self._input_payload(user_content, images),
         }
         async with self._client.responses.stream(**kwargs) as stream:
             return await stream.get_final_response()

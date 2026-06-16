@@ -52,7 +52,7 @@ async def test_gate_passes_when_plan_exhausted_but_credits_available(
 
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "site"},
+        data={"prompt": "site"},
         headers={"Authorization": f"Bearer {key}", "Idempotency-Key": "bg-1"},
     )
     assert resp.status_code == 202
@@ -68,7 +68,7 @@ async def test_gate_402_when_plan_exhausted_and_no_credits(client, session, no_s
 
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "site"},
+        data={"prompt": "site"},
         headers={"Authorization": f"Bearer {key}", "Idempotency-Key": "bg-2"},
     )
     assert resp.status_code == 402

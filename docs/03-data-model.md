@@ -19,7 +19,9 @@ erDiagram
     users ||--o{ billing_events : receives
     projects ||--o{ generation_jobs : has
     projects ||--o{ revisions : has
+    projects ||--o{ attachments : has_images
     projects ||--o| revisions : current_revision
+    generation_jobs ||--o{ attachments : uploaded_on
     generation_jobs ||--o{ job_events : logs
     generation_jobs ||--o{ questions : asks
     questions ||--o{ answers : answered_by
@@ -75,6 +77,27 @@ erDiagram
 | `title` | text NULL | Опц. человекочитаемое имя. |
 | `created_at` | timestamptz | |
 | `deleted_at` | timestamptz NULL | **Sprint 4.** Soft-delete-маркер ([ADR-011](adr/ADR-011-project-delete-gc.md)). `NULL` = активен. `DELETE /projects/{pid}` ставит `now()` → проект исключается из всех `GET`-листингов/деталей (фильтр `deleted_at IS NULL`) и из подсчёта `max_projects` quota-gate (`projects_used` считает только `deleted_at IS NULL`); ставится Celery `project.gc` (полный GC ресурсов → hard-delete строки). Миграция `20260602_0003`. |
+
+## attachments (ADR-034)
+
+Приложенные пользователем изображения (vision-референс + реальный ассет сайта, [ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md)). **Источник истины «какие фото у проекта/джобы».** Один и тот же файл служит двумя путями: (1) image content-блок во вход агентов 1/2/4 (vision, [pipeline §Vision-вход](modules/pipeline/03-architecture.md#vision-вход-приложенные-изображения-adr-034)); (2) детерминированный инжект воркером в дерево `public/uploads/{att_id}.{ext}` в обход LLM. **Инжект на фазе build скоупится `project_id`** (берутся ВСЕ фото проекта `WHERE project_id`, чтобы не терять между ревизиями), `job_id` — лишь аудит «на какой джобе пришёл файл».
+
+| Поле | Тип | Заметки |
+|---|---|---|
+| `id` | text PK | `att_...`. Часть детерминированного пути инжекта/ключа S3 (`uploads/{project_id}/{att_id}.{ext}`). |
+| `project_id` | text FK→projects NOT NULL | Владелец-проект. **Индекс по `(project_id)`** — выборка всех фото проекта для инжекта на build ([ADR-034 §D4](adr/ADR-034-user-image-attachments-vision-site-assets.md)) и для GC. |
+| `job_id` | text FK→generation_jobs NULL | На какой джобе (`POST /projects` или `/edits`) файл пришёл — аудит. NULL допустим (файл может пережить джобу). |
+| `s3_ref` | text NOT NULL | S3-ключ `uploads/{project_id}/{att_id}.{ext}` (тот же бакет, [07-deployment → модель хранения](07-deployment.md#модель-хранения-один-бакет--key-префиксы)). |
+| `filename` | text NULL | Оригинальное имя из multipart (аудит). **НЕ** используется для путей файловой системы/инжекта (путь детерминирован сервером по `att_id`). |
+| `mime` | text NOT NULL | Image MIME, выведенный из sniff magic bytes (`image/png`/`image/jpeg`/`image/webp`/`image/gif`), **не** из заголовка multipart ([ADR-034 §D2](adr/ADR-034-user-image-attachments-vision-site-assets.md)). |
+| `size_bytes` | int NOT NULL | Размер декодированного файла (сверяется с `MAX_IMAGE_BYTES`/`MAX_IMAGES_TOTAL_BYTES`). |
+| `width` / `height` | int NULL | Размеры в пикселях (если вычислены; сверка `MAX_IMAGE_DIMENSION_PX`). NULL допустим. |
+| `sha256` | text NULL | Хэш содержимого — дедуп/идемпотентность приёма (replay `Idempotency-Key` не дублирует, [ADR-034 §D9](adr/ADR-034-user-image-attachments-vision-site-assets.md)). NULL допустим. |
+| `created_at` | timestamptz NOT NULL | Момент приёма. |
+
+> **Миграция ([ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md), [ADR-031](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md)):** обычный **транзакционный** `op.create_table('attachments', ...)` (НЕ `autocommit_block` — нет non-transactional DDL вроде `ALTER TYPE ADD VALUE`; create_table штатно транзакционен на sync-движке psycopg). `down_revision = "20260612_0001"`. Backfill не нужен (новая таблица).
+
+> **GC ([ADR-011](adr/ADR-011-project-delete-gc.md), [ADR-034 §D7](adr/ADR-034-user-image-attachments-vision-site-assets.md)):** `project.gc` удаляет S3-префикс `uploads/{project_id}/` (`delete_prefix`, **project-scoped** — добавляется отдельно от per-job `job_artifact_prefixes`) + строки `attachments` проекта. В FK-порядке hard-delete: `attachments` удаляется **до** `generation_jobs` (FK `attachments.job_id`) и `projects` (FK `attachments.project_id`).
 
 ## generation_jobs
 

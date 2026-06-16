@@ -27,6 +27,17 @@ Content language (mandatory):
   specification, before the title and any other content. The downstream builder reads the
   BCP-47 code from it to set the site's root <html lang> attribute.
 
+Uploaded assets (when present):
+- The user message may contain an "Uploaded assets:" section listing images the user
+  attached, each with an EXACT relative path of the form `uploads/<id>.<ext>`. These files
+  are real assets that the build copies into the finished site automatically.
+- When the specification references such an image (e.g. a logo, a hero photo, a product
+  picture), refer to it by the EXACT relative path given in that section
+  (e.g. `uploads/<id>.<ext>`). Reproduce the path verbatim. Do NOT invent image paths, do
+  NOT prefix them with `public/`, and do NOT use an absolute path starting with `/`
+  (a leading slash breaks the site's routing). If no assets section is present, do not
+  reference any uploaded images.
+
 The specification MUST cover:
 - Purpose and target audience of the site.
 - The exact set of pages/sections and what each contains.

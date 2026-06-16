@@ -172,6 +172,7 @@ class _FakeClient:
         model,
         system_prompt,
         user_content,  # noqa: ANN001
+        images=None,  # noqa: ANN001 — ADR-034 §D3: vision-вход (дефолт None = текстовый путь)
     ):
         self.captured_user_content = user_content
         return _call(self._text)

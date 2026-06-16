@@ -89,7 +89,7 @@ class _FullTreeClient:
     def __init__(self, settings) -> None:  # noqa: ANN001
         self.captured_agent: str | None = None
 
-    async def run_agent(self, *, agent, model, system_prompt, user_content):  # noqa: ANN001, ANN201
+    async def run_agent(self, *, agent, model, system_prompt, user_content, images=None):  # noqa: ANN001, ANN201
         self.captured_agent = agent
         return AgentCall(
             text=_heavy_tree_json(),
@@ -153,7 +153,7 @@ async def test_agent3_heavy_spec_invoked_as_agent3_token_budget(monkeypatch):
     captor = {}
 
     class _Capturing(_FullTreeClient):
-        async def run_agent(self, *, agent, model, system_prompt, user_content):  # noqa: ANN001, ANN201
+        async def run_agent(self, *, agent, model, system_prompt, user_content, images=None):  # noqa: ANN001, ANN201
             captor["agent"] = agent
             return await super().run_agent(
                 agent=agent, model=model, system_prompt=system_prompt, user_content=user_content

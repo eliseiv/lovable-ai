@@ -139,6 +139,25 @@ def spec_key(job_id: str) -> str:
     return f"specs/{job_id}/spec.md"
 
 
+def uploads_prefix(project_id: str) -> str:
+    """Project-scoped префикс приложенных изображений (ADR-034 §D7, GC delete_prefix).
+
+    uploads/{project_id}/ — project-scoped (не job-scoped), удаляется в project.gc отдельно
+    от per-job job_artifact_prefixes. Слэш в конце — точный префикс (без захвата соседних
+    project_id с общим строковым началом).
+    """
+    return f"uploads/{project_id}/"
+
+
+def upload_key(project_id: str, att_id: str, ext: str) -> str:
+    """Детерминированный S3-ключ приложенного изображения (ADR-034 §D7).
+
+    uploads/{project_id}/{att_id}.{ext} — тот же бакет, что sources/dist/logs/specs.
+    `ext` — реальное расширение из sniff magic bytes (png/jpeg/webp/gif), не из multipart.
+    """
+    return f"uploads/{project_id}/{att_id}.{ext}"
+
+
 def job_artifact_prefixes(job_id: str) -> list[str]:
     """Все key-префиксы артефактов одного job_id (ADR-011 §B.4 / docs/07 модель хранения).
 

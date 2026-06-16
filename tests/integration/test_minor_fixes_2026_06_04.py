@@ -87,7 +87,7 @@ async def test_projects_missing_idempotency_key_is_problem_json(client, seeded_u
     """
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "build me a landing page"},
+        data={"prompt": "build me a landing page"},
         headers=auth_headers,
     )
     assert resp.status_code == 422

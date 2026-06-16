@@ -22,9 +22,10 @@ pytestmark = pytest.mark.asyncio
 async def test_create_project_returns_202_with_ids(
     client, auth_headers, seeded_user, no_side_effects
 ):
+    # ADR-034 §D11: POST /projects — multipart (prompt/title как Form). Текстовый путь без images.
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "A landing page for my cafe", "title": "Cafe"},
+        data={"prompt": "A landing page for my cafe", "title": "Cafe"},
         headers={**auth_headers, "Idempotency-Key": "key-1"},
     )
     assert resp.status_code == 202
@@ -39,8 +40,8 @@ async def test_idempotent_repeat_same_key_returns_same_job(
     client, auth_headers, seeded_user, no_side_effects
 ):
     headers = {**auth_headers, "Idempotency-Key": "key-dup"}
-    r1 = await client.post("/v1/projects", json={"prompt": "p"}, headers=headers)
-    r2 = await client.post("/v1/projects", json={"prompt": "p"}, headers=headers)
+    r1 = await client.post("/v1/projects", data={"prompt": "p"}, headers=headers)
+    r2 = await client.post("/v1/projects", data={"prompt": "p"}, headers=headers)
     assert r1.status_code == 202
     assert r2.status_code == 202
     assert r1.json()["job_id"] == r2.json()["job_id"]
@@ -77,7 +78,7 @@ async def test_http_replay_under_exhausted_cap_returns_202_same_job_not_402(
 
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "replay"},
+        data={"prompt": "replay"},
         headers={**auth_headers, "Idempotency-Key": "http-replay-key"},
     )
     assert resp.status_code == 202, f"replay под исчерпанным cap → 202, не 402: {resp.text}"
@@ -115,7 +116,7 @@ async def test_http_real_new_request_under_exhausted_cap_returns_402(
 
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "fresh"},
+        data={"prompt": "fresh"},
         headers={**auth_headers, "Idempotency-Key": "fresh-http-key"},
     )
     assert resp.status_code == 402, f"новый ключ под исчерпанной квотой → 402: {resp.text}"
@@ -124,7 +125,9 @@ async def test_http_real_new_request_under_exhausted_cap_returns_402(
 
 
 async def test_missing_idempotency_key_returns_422(client, auth_headers, seeded_user):
-    resp = await client.post("/v1/projects", json={"prompt": "p"}, headers=auth_headers)
+    # ADR-034 §D11: multipart, prompt присутствует, Idempotency-Key отсутствует → 422 (наш
+    # явный unprocessable, не FastAPI-валидация формы).
+    resp = await client.post("/v1/projects", data={"prompt": "p"}, headers=auth_headers)
     assert resp.status_code == 422
     assert resp.headers["content-type"].startswith("application/problem+json")
 

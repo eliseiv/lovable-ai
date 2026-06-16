@@ -31,7 +31,7 @@ from typing import Any
 from app.core.config import Settings
 from app.observability.sentry import scrub_text
 from app.observability.timing import timed_agent_call
-from app.pipeline.agents.base import AgentCall, LLMAgentClient
+from app.pipeline.agents.base import AgentCall, ImageInput, LLMAgentClient
 
 # Классы фейла structured-output (§I.4): parse — структура не извлеклась; schema — извлеклась,
 # но не прошла доменную валидацию.
@@ -271,6 +271,7 @@ async def run_structured_agent[T](
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    images: list[ImageInput] | None = None,
     retry_nudge: str = (
         "\n\nReturn the result STRICTLY as raw JSON — no markdown fences, no prose."
     ),
@@ -294,6 +295,9 @@ async def run_structured_agent[T](
     Доменная валидация может бросить ЛЮБОЕ доменное исключение (например AgentOutputError для
     Agent 3/4) — оно трактуется как schema-фейл (re-семплируемый), ретраится, а на исчерпании
     ретраев пробрасывается вызывающему для встраивания в семантику agent_output_invalid.
+
+    `images` (ADR-034 §D3): vision-вход агента, пробрасывается в `run_agent` В КАЖДОМ
+    retry-вызове (re-sample получает тот же vision-вход). Дефолт None ⇒ текстовый путь.
     """
     max_retries = settings.agent_output_max_retries
     strict_system_prompt = append_strict_json(system_prompt)
@@ -308,6 +312,7 @@ async def run_structured_agent[T](
                 model=model,
                 system_prompt=strict_system_prompt,
                 user_content=content,
+                images=images,
             )
         # Вызов оплачен — учитываем usage ВСЕГДА (включая последующий parse/schema-фейл, §I.3).
         await after_call(call)

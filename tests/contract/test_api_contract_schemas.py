@@ -44,7 +44,7 @@ async def _job_with_questions(session, user_id, state=JobState.AWAITING_CLARIFIC
 async def test_create_project_response_schema(client, auth_headers, seeded_user, no_side_effects):
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": "build me a site"},
+        data={"prompt": "build me a site"},
         headers={**auth_headers, "Idempotency-Key": "ck"},
     )
     assert resp.status_code == 202
@@ -55,7 +55,7 @@ async def test_create_project_response_schema(client, auth_headers, seeded_user,
 async def test_project_validation_empty_prompt_422(client, auth_headers, seeded_user):
     resp = await client.post(
         "/v1/projects",
-        json={"prompt": ""},
+        data={"prompt": ""},
         headers={**auth_headers, "Idempotency-Key": "ck2"},
     )
     # Pydantic min_length=1 → FastAPI 422.

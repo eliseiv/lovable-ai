@@ -509,6 +509,41 @@ class CreditGrant(Base):
     )
 
 
+class Attachment(Base):
+    """Приложенное пользователем изображение (ADR-034, docs §attachments).
+
+    vision-референс агентам 1/2/4 + реальный ассет сайта (детерминированный инжект воркером
+    в public/uploads/{att_id}.{ext} в обход LLM). Источник истины «какие фото у проекта/джобы».
+    Инжект на фазе build скоупится project_id (берутся ВСЕ фото проекта WHERE project_id, чтобы
+    не терять между ревизиями); job_id — лишь аудит «на какой джобе пришёл файл».
+    """
+
+    __tablename__ = "attachments"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # att_...
+    # Владелец-проект. Индекс по (project_id) — выборка всех фото проекта для инжекта на build
+    # и для GC (ADR-034 §D4).
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), nullable=False, index=True)
+    # На какой джобе (POST /projects или /edits) файл пришёл — аудит. NULL допустим.
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("generation_jobs.id"), nullable=True)
+    # S3-ключ uploads/{project_id}/{att_id}.{ext} (тот же бакет).
+    s3_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    # Оригинальное имя из multipart (аудит). НЕ используется для путей (путь детерминирован
+    # сервером по att_id).
+    filename: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Image MIME из sniff magic bytes (image/png|jpeg|webp|gif), НЕ из заголовка multipart.
+    mime: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Размеры в пикселях (если вычислены; сверка MAX_IMAGE_DIMENSION_PX). NULL допустим.
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Хэш содержимого — дедуп/идемпотентность приёма (replay Idempotency-Key, §D9). NULL допустим.
+    sha256: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class LlmUsage(Base):
     """Cost-ledger. Запись на каждый вызол Claude (docs/03-data-model.md → llm_usage)."""
 

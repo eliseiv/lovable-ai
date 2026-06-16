@@ -38,12 +38,28 @@ class AgentCall:
     cost_usd: Decimal
 
 
+@dataclass(frozen=True)
+class ImageInput:
+    """Vision-вход агента (ADR-034 §D3): нейтральный для обоих провайдеров image content-блок.
+
+    `media_type` — image MIME, выведенный из sniff magic bytes (`image/png`/`image/jpeg`/
+    `image/webp`/`image/gif`, attachments_service). Anthropic-клиент маппит в base64 image-блок
+    `messages[0].content`, OpenAI — в `input_image` data-URL `input`. Единый нейтральный источник
+    рядом с `AgentCall`, импортируется обоими клиентами и structured.py.
+    """
+
+    data: bytes
+    media_type: str
+
+
 class LLMAgentClient(Protocol):
     """Провайдер-агностичный контракт клиента агента (ADR-032 §1).
 
     Вход одинаков для обоих провайдеров: `agent` ∈ {agent1..agent4} (ключ per-agent
     бюджета/effort), `model` (значение env `AGENTn_MODEL` — провайдер-специфичный ID),
-    `system_prompt`, `user_content`. Выход — нейтральный `AgentCall`.
+    `system_prompt`, `user_content`, опц. `images` (vision-вход, ADR-034 §D3). Выход —
+    нейтральный `AgentCall`. `images=None` (дефолт) ⇒ текстовый путь обоих провайдеров
+    байт-в-байт прежний (инвариант обратной совместимости).
     """
 
     async def run_agent(
@@ -53,6 +69,7 @@ class LLMAgentClient(Protocol):
         model: str,
         system_prompt: str,
         user_content: str,
+        images: list[ImageInput] | None = None,
     ) -> AgentCall: ...
 
 

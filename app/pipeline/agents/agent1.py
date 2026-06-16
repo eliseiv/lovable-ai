@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall, build_agent_client
+from app.pipeline.agents.base import AgentCall, ImageInput, build_agent_client
 from app.pipeline.agents.structured import (
     FAIL_CLASS_SCHEMA,
     DiagnosticsHook,
@@ -97,11 +97,13 @@ async def run_agent1(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    images: list[ImageInput] | None = None,
 ) -> Agent1Result:
     """Один шаг Agent 1 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
 
     `language` — серверный детерминированный детект языка из исходного промпта (ADR-028);
     инжектируется в ввод явной директивой (Agent 1 язык НЕ детектит сам).
+    `images` — vision-вход (приложенные изображения, ADR-034 §D3); дефолт None ⇒ текстовый путь.
     before_call/after_call/on_attempt_failure инъектируются task-слоем (budget/wall-clock-гард
     перед каждым вызовом; запись llm_usage после каждого; диагностика parse/schema-фейла §I.4).
     На исчерпании ретраев бросает StructuredOutputError → task → FAILED(invalid_agent_output).
@@ -118,5 +120,6 @@ async def run_agent1(
         before_call=before_call,
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
+        images=images,
     )
     return Agent1Result(questions=result.value, call=result.call)

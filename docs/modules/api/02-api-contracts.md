@@ -11,11 +11,11 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 | POST | `/auth/apple` | Sign in with Apple → наш Bearer-ключ (S3) | Apple token | `200` |
 | GET | `/auth/tokens` | список токенов/устройств (S3) | Bearer | `200` |
 | DELETE | `/auth/tokens/{id}` | отозвать токен / logout (S3) | Bearer | `204` |
-| POST | `/projects` | создать проект + старт генерации | Bearer | `202` |
+| POST | `/projects` | создать проект + старт генерации (**multipart**: `prompt`+опц.`images`, [ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) | Bearer | `202` |
 | GET | `/projects` | список проектов пользователя | Bearer | `200` |
 | GET | `/projects/{pid}` | детали проекта + live URL | Bearer | `200` |
 | DELETE | `/projects/{pid}` | удалить проект + полный GC ресурсов (S4) | Bearer | `202` |
-| POST | `/projects/{pid}/edits` | post-delivery правка → Agent 4 (S5) | Bearer | `202` |
+| POST | `/projects/{pid}/edits` | post-delivery правка → Agent 4 (S5; **multipart**: `instruction`+опц.`images`, [ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) | Bearer | `202` |
 | GET | `/projects/{pid}/revisions` | история ревизий | Bearer | `200` |
 | POST | `/projects/{pid}/revisions/{revision_no}/rollback` | откат на good-ревизию (S5) | Bearer | `202` |
 | POST | `/devices` | регистрация APNs device token (S5) | Bearer | `201` |
@@ -30,7 +30,11 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 ## POST /projects
 Создаёт проект и стартует генерацию (Agent 1).
 - Headers: `Idempotency-Key` (обяз.).
-- Body: `{ "prompt": "string", "title": "string?" }`.
+- **Content-Type: `multipart/form-data`** ([ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) — было `application/json`, **breaking change для iOS**. Form-поля: `prompt` (обяз.), `title` (опц.); файлы: `images` — `list[UploadFile]` (опц., 0..`MAX_IMAGES_PER_JOB`).
+- **Приложенные изображения** служат двумя путями ([ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)): vision-референс агентам 1/2 (+4 на правке) и реальный ассет сайта (детерминированный инжект `public/uploads/...`). Только PNG/JPEG/WebP/GIF; тип определяется **по содержимому (magic bytes)**, не по `Content-Type`/имени; лимиты `MAX_IMAGES_PER_JOB`/`MAX_IMAGE_BYTES`/`MAX_IMAGES_TOTAL_BYTES`/`MAX_IMAGE_DIMENSION_PX` ([07-deployment → канонический список](../../07-deployment.md#канонический-список-ключей)). Нарушение → `422` (`reason` ∈ `unsupported_image_type`/`image_too_large`/`too_many_images`/`images_total_too_large`/`image_dimensions_too_large`).
+- **Идемпотентность приёма:** replay того же `Idempotency-Key` не создаёт повторные строки `attachments`/S3-объекты ([ADR-034 §D9](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)).
+- **Порядок вызовов iOS:** один `multipart/form-data` POST (`prompt`+опц.`images` в одном теле, заголовок `Idempotency-Key`) → `202 {project_id, job_id}` → далее статус через `GET /jobs/{jid}` или SSE (как прежде; добавочных шагов нет — upload синхронный в этом же запросе).
+- **Прокси-лимит тела:** edge (`client_max_body_size` nginx / max request body Traefik) обязан быть ≥ `MAX_IMAGES_TOTAL_BYTES`, иначе multipart с фото отвергается до приложения ([07-deployment](../../07-deployment.md#канонический-список-ключей)).
 - **Язык контента сайта НЕ принимается параметром** — детерминированный серверный детект из **исходного** `prompt` (язык сайта = язык исходного промпта пользователя), [ADR-028](../../adr/ADR-028-deterministic-source-prompt-language-detection.md) ревизует [ADR-025](../../adr/ADR-025-content-language-autodetect-spec-marker.md), [pipeline §Язык/локализация](../pipeline/03-architecture.md#языклокализация-контента-сайта--детерминированный-детект-adr-028-ревизует-adr-025). Схема body не меняется; явный `locale`-override — вне MVP ([Q-LOCALE-1](../../99-open-questions.md#q-locale-1)).
 - Гейтинг: quota-gate (активный entitlement + остаток квоты — генерации/`max_projects`/`max_concurrent`). Нарушение → `402`. Контракт гейта — [modules/billing/02-api-contracts.md §3](../billing/02-api-contracts.md#3-quota-gate-на-post-v1projects-и-post-v1projectspidedits).
 - `202` → `{ "project_id": "p_...", "job_id": "j_..." }`.
@@ -119,7 +123,8 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 ## POST /projects/{pid}/edits (Sprint 5)
 Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING → LIVE`, новый Revision). Контракт цикла — [modules/pipeline/03-architecture.md → post-delivery edit](../pipeline/03-architecture.md#post-delivery-edit-live--fixing--live--контракт-зафиксирован-реализация-в-sprint-5).
 - Headers: `Idempotency-Key` (обяз.) — дедуп `(user_id, idempotency_key)` (`generation_jobs`).
-- Body: `{ "instruction": "string" }`. Текст `instruction` сохраняется в append-only `job_events` (`event_type='edit_requested'`, `payload.instruction`) — **отдельной колонки `generation_jobs.instruction` нет** ([03-data-model.md → generation_jobs](../../03-data-model.md#generation_jobs)).
+- **Content-Type: `multipart/form-data`** ([ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) — было `application/json`, **breaking change для iOS**. Form-поле: `instruction` (обяз.); файлы: `images` — `list[UploadFile]` (опц., 0..`MAX_IMAGES_PER_JOB`). Те же image-правила/лимиты/коды, что `POST /projects` (sniff magic bytes, PNG/JPEG/WebP/GIF, `MAX_IMAGE*`, `422` с `reason`). Приложенные на правке фото — vision-вход Agent 4 (editor) + добавляются к ассетам проекта (инжект скоупится `project_id`, [ADR-034 §D4](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)). Идемпотентность приёма — как `POST /projects` ([ADR-034 §D9](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)). **Порядок вызовов iOS:** один multipart POST (`instruction`+опц.`images`, `Idempotency-Key`) → `202 {job_id}`.
+- Body (Form-поле): `instruction`. Текст `instruction` сохраняется в append-only `job_events` (`event_type='edit_requested'`, `payload.instruction`) — **отдельной колонки `generation_jobs.instruction` нет** ([03-data-model.md → generation_jobs](../../03-data-model.md#generation_jobs)).
 - **Гейтинг (отдельный лимит правок, [ADR-014](../../adr/ADR-014-edit-limit-revision-rollback.md)):** та же dependency `quota_gate`, но при `kind=edit` сверяет `edit_usage_counters.edits_used < plan_quotas.monthly_edits` (**не** `monthly_generations`), плюс `access_level` активен и `max_concurrent_jobs` (edit-джоба считается активной). `max_projects` не проверяется. Контракт — [modules/billing/03-architecture.md §7](../billing/03-architecture.md#7-граница-s5-edits).
 - `202` → `{ "job_id": "j_..." }`. Ошибки: `402` (RFC-7807, `reason ∈ {no_entitlement, edit_quota_exhausted, concurrency_limit}` + `required_entitlement`), `409` (проект не `LIVE` — правка возможна только над `LIVE`-сайтом), `404` (чужой/несуществующий `pid`).
 

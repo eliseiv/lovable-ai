@@ -30,6 +30,8 @@ from app.db.models import GenerationJob, Project, Revision
 from app.pipeline.dispatcher import dispatch_for_state
 from app.pipeline.events import record_event
 from app.services import project_service
+from app.services.attachments_service import ValidatedImage, persist_images
+from app.storage.s3 import get_storage
 
 logger = get_logger(__name__)
 
@@ -83,6 +85,7 @@ async def create_edit_job(
     project_id: str,
     instruction: str,
     idempotency_key: str,
+    images: list[ValidatedImage] | None = None,
 ) -> CreatedEdit:
     """Создаёт edit-джобу (kind=edit, CREATED) + ставит task_edit. ADR-014 §A.
 
@@ -92,6 +95,10 @@ async def create_edit_job(
       3. quota_gate kind='edit' (402 reason=edit_quota_exhausted/concurrency_limit/...);
       4. создать edit-джобу, скопировать спеку текущей good-ревизии, записать instruction
          в job_events, поставить task_edit.
+
+    `images` (ADR-034 §D9): НОВЫЕ фото правки пишутся в S3 + строки attachments ТОЛЬКО на новой
+    edit-джобе (created=True), в той же транзакции — replay того же Idempotency-Key (created=
+    False) сюда не доходит. Инжект скоупится project_id (vision Agent 4 editor — новые фото).
     """
     settings = get_settings()
 
@@ -129,6 +136,19 @@ async def create_edit_job(
         spec_ref=spec_ref,
     )
     session.add(job)
+    # ADR-034 §D4/§D9: новые фото правки (S3 + строки attachments) на новой edit-джобе, в той
+    # же транзакции — replay (created=False) сюда не доходит → не дублируется.
+    if images:
+        # FK-порядок parent-before-child: Attachment имеет column-level FK на projects/
+        # generation_jobs БЕЗ ORM relationship() (в отличие от JobEvent/Question/Answer),
+        # поэтому UoW-сортировка INSERT не гарантирует материализацию job до attachments.
+        # Явный flush детерминированно вставляет parent-строку (project уже существует, job —
+        # новая) ДО persist_images, иначе POST /edits с изображениями падает
+        # ForeignKeyViolation (fk_attachments_job).
+        await session.flush()
+        await persist_images(
+            session, get_storage(), project_id=project.id, job_id=job.id, images=images
+        )
     await record_event(session, job.id, "job_created", to_state=JobState.CREATED.value)
     # Инструкция правки + базовая ревизия — для task_edit (источник истины append-only).
     await record_event(
