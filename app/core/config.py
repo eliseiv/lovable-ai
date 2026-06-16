@@ -100,6 +100,17 @@ class Settings(BaseSettings):
     # effort из output_config — adaptive thinking у агентов 1/2; на Agent 3 и Agent 4 (thinking
     # disabled) не действует (ADR-023 §Decision (2), R2 §Decision (4)).
     agent_effort: str = Field(default="high")
+    # --- LLM read/connect-таймаут (ADR-035, docs/07-deployment.md env-контракт) ---
+    # read/idle-таймаут «между двумя SSE-чанками прошло > N секунд» → APITimeoutError обоих SDK
+    # → уже-существующая транзиентная классификация retry_policy → Celery-ретрай задолго до
+    # STUCK_THRESHOLD_S=900. НЕ total/request-таймаут: каждый чанк сбрасывает таймер, легитимный
+    # длинный thinking-стрим не рвётся (мотив стриминга ADR-023 сохранён). Применяется как
+    # httpx.Timeout(read=…) на обоих клиентах. app-env worker. env LLM_READ_TIMEOUT_S.
+    llm_read_timeout_s: float = Field(default=180.0)
+    # connect-таймаут TCP-установления к LLM endpoint (компонент httpx.Timeout(connect=…)).
+    # Короткий — недоступный endpoint падает быстро, не ждёт read-таймаут.
+    # env LLM_CONNECT_TIMEOUT_S.
+    llm_connect_timeout_s: float = Field(default=10.0)
     # --- Structured-output всех 4 агентов (ADR-020, docs pipeline §I; env-контракт 07) ---
     # Bounded retry ВНУТРИ шага агента на parse/schema-фейл (re-семплирование форсированного
     # tool-use) ДО терминала. default 2 доп. попытки = до 3 LLM-вызовов суммарно (§I.3).

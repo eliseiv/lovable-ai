@@ -12,6 +12,7 @@ import base64
 from decimal import Decimal
 from typing import Any, cast
 
+import httpx
 from anthropic import AsyncAnthropic
 from anthropic.types import OutputConfigParam
 
@@ -68,7 +69,19 @@ class ClaudeAgentClient:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client = AsyncAnthropic(api_key=settings.anthropic_api_key.get_secret_value())
+        # read/idle-таймаут (ADR-035 §(1)): httpx.Timeout с раздельным read-компонентом —
+        # рвёт МОЛЧАЩИЙ stream за llm_read_timeout_s (каждый SSE-чанк сбрасывает read-таймер,
+        # легитимный длинный thinking-стрим не рвётся), connect — отдельный короткий таймаут;
+        # write/pool наследуют read (короткий запрос, отдельная настройка избыточна).
+        self._client = AsyncAnthropic(
+            api_key=settings.anthropic_api_key.get_secret_value(),
+            timeout=httpx.Timeout(
+                read=settings.llm_read_timeout_s,
+                connect=settings.llm_connect_timeout_s,
+                write=settings.llm_read_timeout_s,
+                pool=settings.llm_read_timeout_s,
+            ),
+        )
 
     async def run_agent(
         self,

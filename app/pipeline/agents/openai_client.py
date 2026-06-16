@@ -26,6 +26,7 @@ import base64
 from decimal import Decimal
 from typing import Any
 
+import httpx
 from openai import AsyncOpenAI
 
 from app.core.config import Settings
@@ -123,7 +124,19 @@ class OpenAIAgentClient:
         # классифицируется как не-транзиентный LLM-сбой → FAILED(agent_unavailable) без ретраев.
         # Поэтому отдельная обёртка credential-кейса в LLMCredentialError здесь НЕ нужна
         # (в отличие от Anthropic, где невалидный ключ даёт client-side stdlib-TypeError ДО HTTP).
-        self._client = AsyncOpenAI(api_key=settings.openai_api_key.get_secret_value())
+        # read/idle-таймаут (ADR-035 §(1)): httpx.Timeout с раздельным read-компонентом —
+        # рвёт МОЛЧАЩИЙ stream за llm_read_timeout_s (каждый SSE-чанк сбрасывает read-таймер,
+        # легитимный длинный thinking-стрим не рвётся), connect — отдельный короткий таймаут;
+        # write/pool наследуют read. Симметрично Anthropic-клиенту (ADR-032).
+        self._client = AsyncOpenAI(
+            api_key=settings.openai_api_key.get_secret_value(),
+            timeout=httpx.Timeout(
+                read=settings.llm_read_timeout_s,
+                connect=settings.llm_connect_timeout_s,
+                write=settings.llm_read_timeout_s,
+                pool=settings.llm_read_timeout_s,
+            ),
+        )
 
     def _reasoning_effort(self, agent: str) -> str:
         """reasoning.effort по агенту (ADR-032 §2): agent3/4 → none; agent1/2 → конфиг-effort."""

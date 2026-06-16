@@ -118,6 +118,16 @@ x-app-env: &app-env
   # ADR-032: reasoning.effort агентов 1/2 при openai (из {medium,high,xhigh}).
   # Агенты 3/4 -> none (не из этого ключа). На anthropic-путь не влияет. Дефолт high.
   OPENAI_AGENT_EFFORT: ${OPENAI_AGENT_EFFORT:-high}
+  # ADR-035: read/idle- и connect-таймауты LLM-клиента (Anthropic+OpenAI). Поля
+  # Settings (llm_read_timeout_s/llm_connect_timeout_s, float, стиль соседних
+  # health_check_*_s), потребитель — worker (LLM-клиенты в Celery-llm-воркере;
+  # httpx.Timeout(read=…, connect=…)). read = idle между SSE-чанками -> APITimeoutError
+  # обоих SDK -> уже-существующая транзиентная классификация retry_policy -> Celery-
+  # ретрай задолго до STUCK_THRESHOLD_S; НЕ total-таймаут (длинный thinking-стрим не
+  # рвётся). app-env worker → ОБЯЗАНЫ быть в x-app-env, иначе extra=ignore молча
+  # отдаст дефолт config.py. Дефолты символ-в-символ docs/07 env-контракт (стр. 62-63).
+  LLM_READ_TIMEOUT_S: ${LLM_READ_TIMEOUT_S:-180.0}
+  LLM_CONNECT_TIMEOUT_S: ${LLM_CONNECT_TIMEOUT_S:-10.0}
   # --- Auth ---
   SEED_API_KEY: ${SEED_API_KEY}
   # ADR-021: секрет админ-плоскости (X-Admin-Key для /v1/admin/*: login-as,
