@@ -243,7 +243,7 @@ jobs:
             # Нормативный список инстансов {dir, project} (docs/07 таблица).
             # Порядок: corelysite первым (приоритет доставки в основной прод,
             # docs/07 §334). Расширение: N-й инстанс = +1 строка "dir:project".
-            INSTANCES="corelysite:corelysite nexoraweb:nexoraweb qyvrenzo:qyvrenzo lumorix:lumorix"
+            INSTANCES="corelysite:corelysite nexoraweb:nexoraweb qyvrenzo:qyvrenzo lumorix:lumorix orvianix:orvianix"
             for entry in $INSTANCES; do
               dir="${entry%%:*}"
               project="${entry##*:}"
