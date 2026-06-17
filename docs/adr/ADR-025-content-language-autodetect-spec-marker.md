@@ -16,7 +16,7 @@
 
 Минимальная output-схема Agent 2 в [pipeline §I.1a](../modules/pipeline/03-architecture.md#i1a-канонические-output-схемы-агентов--single-source-of-truth-нормативно) сама использует русский пример (`{"spec_markdown":"# Спецификация\n…"}`) — это часть проблемы (пример в нормативном документе тоже смещает язык).
 
-**Требование пользователя (утверждено, не пересматривается):** язык контента сайта = «язык, на котором отвечает пользователь». Авто-детект из текста пользователя (промпт + ответы на вопросы), **без** изменения публичного API (`POST /projects` body не получает поле `language`), **без** миграции БД, **без** нового параметра в сигнатурах `agentN.py`. Override явным `locale` от клиента — вне MVP.
+**Требование пользователя (утверждено, не пересматривается):** язык контента сайта = «язык, на котором отвечает пользователь». Авто-детект из текста пользователя (промпт + ответы на вопросы), **без** изменения публичного API (`POST /projects` body не получает поле `language`), **без** миграции БД, **без** нового параметра в сигнатурах `agentN.py`. ~~Override явным `locale` от клиента — вне MVP.~~ *(на момент ADR-025 — вне MVP; **введён ревизией [ADR-036](ADR-036-explicit-client-locale-override.md), [Q-LOCALE-1](../99-open-questions.md#q-locale-1) resolved 2026-06-17** — см. Consequences. Блок «Требование пользователя» фиксирует контекст на дату принятия ADR-025, 2026-06-08.)
 
 ## Decision
 
@@ -54,7 +54,7 @@
 **Минусы / риски.**
 - ~~Детект — на стороне LLM (Agent 2), не детерминированный.~~ **Отозвано ревизией [ADR-028](ADR-028-deterministic-source-prompt-language-detection.md):** именно недетерминизм LLM-детекта оказался прод-багом. Детект теперь **детерминированный серверный** (script-эвристика из исходного промпта, [ADR-028 §1](ADR-028-deterministic-source-prompt-language-detection.md)).
 - Смешанный язык ввода разрешается правилом приоритета (**промпт**, [ADR-028](ADR-028-deterministic-source-prompt-language-detection.md) §4) + fallback-правилом script-детекта ([ADR-028](ADR-028-deterministic-source-prompt-language-detection.md) §5). *(До ревизии ADR-028 здесь действовал отозванный приоритет «ответы > промпт».)*
-- Явный locale-override от iOS-клиента (когда пользователь хочет сайт на языке, отличном от языка ввода) — **не покрыт**, вынесен в [Q-LOCALE-1](../99-open-questions.md#q-locale-1) (вне MVP, `blocks_sprint: none`).
+- ~~Явный locale-override от iOS-клиента (когда пользователь хочет сайт на языке, отличном от языка ввода) — **не покрыт**, вынесен в [Q-LOCALE-1](../99-open-questions.md#q-locale-1) (вне MVP).~~ **Введён ревизией [ADR-036](ADR-036-explicit-client-locale-override.md) (2026-06-17):** опц. Form-поле `locale` в `POST /v1/projects` → `projects.requested_locale` → приоритет над script-детектом; [Q-LOCALE-1](../99-open-questions.md#q-locale-1) resolved.
 
 **Требование к зависимостям.** Новых внешних библиотек/SDK не вводится (детект — собственная script-эвристика, чистый Python, [ADR-028 §1](ADR-028-deterministic-source-prompt-language-detection.md)). Правка `docs/02-tech-stack.md` не требуется.
 
