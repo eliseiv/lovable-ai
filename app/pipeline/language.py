@@ -114,6 +114,32 @@ def _resolve(bcp47: str) -> DetectedLanguage:
     return DetectedLanguage(bcp47=bcp47, name=_LANGUAGE_NAMES[bcp47])
 
 
+def normalize_locale(raw: str | None) -> str | None:
+    """Нормализует raw client-locale → `ru` | `en` | `None` (ADR-036 §4).
+
+    Точка нормализации явного клиентского locale (Form-поле `locale` в `POST /v1/projects`).
+    Правило BCP-47 (единственный нормативный источник — ADR-036 §4):
+
+    1. Регистронезависимо; берётся **первый сабтег** до разделителя `-` или `_`
+       (`ru-RU`/`ru_RU` → `ru`; `en-US` → `en`).
+    2. Первый сабтег ∈ поддерживаемых языков (`_LANGUAGE_NAMES` = {`ru`, `en`}) →
+       нормализованный код.
+    3. Иначе (неподдерживаемый / пустой / `None`) → `None` (= «locale не передан» →
+       авто-детект из промпта, обратносовместимо, НЕ ошибка `422`).
+
+    `None` — единственный канал «нет валидного locale»: и пустая строка, и `fr`/`de`
+    дают `None`. Чистый Python, без IO/зависимостей.
+    """
+    if raw is None:
+        return None
+    # Первый сабтег до '-'/'_', регистронезависимо. `split` по обоим разделителям:
+    # сначала по '-', затем первый кусок по '_' — покрывает `ru-RU` и `ru_RU`.
+    subtag = raw.strip().split("-", 1)[0].split("_", 1)[0].lower()
+    if subtag in _LANGUAGE_NAMES:
+        return subtag
+    return None
+
+
 def language_from_bcp47(bcp47: str) -> DetectedLanguage:
     """Восстанавливает `DetectedLanguage` из сохранённого `content_language` (crash-resume).
 

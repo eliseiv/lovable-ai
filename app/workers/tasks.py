@@ -180,13 +180,19 @@ async def _interview(job_id: str) -> None:
         # project гарантированно жив и не None — проверено _abort_if_project_deleted выше.
         project = await session.get(Project, job.project_id)
         assert project is not None
-        # ADR-028: детерминированный серверный детект языка из ИСХОДНОГО project.prompt
-        # (script-эвристика) ОДИН РАЗ, ДО Agent 1. Результат — crash-устойчивый якорь в
+        # ADR-036 §6 / pipeline §Язык п.2: приоритет явного клиентского locale > script-детект.
+        # Если project.requested_locale задан (нормализованный `ru`/`en`) — язык берётся из него
+        # (language_from_bcp47), БЕЗ detect_language. Иначе (NULL) — прежний детерминированный
+        # серверный детект из ИСХОДНОГО project.prompt (script-эвристика, ADR-028) байт-в-байт.
+        # Выбор языка — ОДИН РАЗ, ДО Agent 1. Результат — crash-устойчивый якорь в
         # generation_jobs.content_language, фиксируется в той же транзакции, что и transition
         # в INTERVIEWING (первый commit). _interview стартует только из state==CREATED, поэтому
-        # детект выполняется ровно один раз за джобу (передетекта при crash-resume нет — на
+        # выбор выполняется ровно один раз за джобу (передетекта при crash-resume нет — на
         # фазе spec язык читается из БД, см. _spec).
-        language = detect_language(project.prompt)
+        if project.requested_locale is not None:
+            language = language_from_bcp47(project.requested_locale)
+        else:
+            language = detect_language(project.prompt)
         job.content_language = language.bcp47
         await transition(
             session,

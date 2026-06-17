@@ -13,6 +13,7 @@ from fastapi import APIRouter, File, Form, Header, UploadFile, status
 from app.api.dependencies import CurrentUser, SessionDep
 from app.api.errors import not_found, problem_responses, unprocessable
 from app.core.config import get_settings
+from app.pipeline.language import normalize_locale
 from app.schemas.api import (
     CreateEditResponse,
     CreateProjectResponse,
@@ -71,6 +72,16 @@ async def create_project(
     session: SessionDep,
     prompt: Annotated[str, Form(min_length=1, description="Текстовое описание желаемого сайта.")],
     title: Annotated[str | None, Form(description="Необязательное название проекта.")] = None,
+    locale: Annotated[
+        str | None,
+        Form(
+            description=(
+                "Необязательный язык генерации (BCP-47-подобный: `ru`, `ru-RU`, `en`, "
+                "`en-US`, …). Переопределяет авто-детект языка из `prompt`. "
+                "Неподдерживаемое/пустое значение → авто-детект (не ошибка)."
+            )
+        ),
+    ] = None,
     images: Annotated[
         list[UploadFile],
         File(description="Приложенные изображения (PNG/JPEG/WebP/GIF, опц.)."),
@@ -82,12 +93,15 @@ async def create_project(
         raise unprocessable("Idempotency-Key header is required.")
     # ADR-034 §D2: валидация (sniff magic bytes + лимиты) ДО создания джобы. Нарушение → 422.
     validated = attachments_service.validate_images(get_settings(), await _read_uploads(images))
+    # ADR-036 §4: нормализация явного locale в ОДНОМ месте (роутер) → в сервис попадает уже
+    # `ru`/`en`/None. Неподдерживаемое/пустое → None = авто-детект (fallback, не 422).
     result = await project_service.create_project_with_job(
         session,
         user_id=user.id,
         prompt=prompt,
         title=title,
         idempotency_key=idempotency_key,
+        requested_locale=normalize_locale(locale),
         images=validated,
     )
     return CreateProjectResponse(project_id=result.project_id, job_id=result.job_id)

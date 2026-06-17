@@ -42,6 +42,7 @@ async def create_project_with_job(
     prompt: str,
     title: str | None,
     idempotency_key: str,
+    requested_locale: str | None = None,
     images: list[ValidatedImage] | None = None,
 ) -> CreatedProject:
     """Создаёт project + generation_job (CREATED) и ставит task_interview.
@@ -60,6 +61,11 @@ async def create_project_with_job(
     `images` (ADR-034 §D9): валидированные приложенные изображения пишутся в S3 + строки
     attachments ТОЛЬКО на реально новой джобе (created=True), в той же транзакции — replay
     того же Idempotency-Key (created=False) сюда не доходит, повторных строк/объектов нет.
+
+    `requested_locale` (ADR-036): уже нормализованный (`ru`/`en`/None) явный locale-override
+    языка генерации (нормализация — в роутере через `normalize_locale`). Пишется в
+    `project.requested_locale` ТОЛЬКО на новой джобе (created=True); идемпотентный replay
+    возвращается ДО создания проекта и НЕ перезаписывает (ADR-036 §7). NULL ⇒ авто-детект.
     """
     settings = get_settings()
 
@@ -84,6 +90,10 @@ async def create_project_with_job(
         user_id=user_id,
         prompt=prompt,
         title=title,
+        # ADR-036: уже нормализованный (`ru`/`en`/None) явный locale-override. Записывается
+        # ТОЛЬКО на реально новой джобе (created=True); идемпотентный replay вернулся выше
+        # (existing_job) и сюда не доходит → не перезаписывает (ADR-036 §7).
+        requested_locale=requested_locale,
     )
     job = GenerationJob(
         id=new_job_id(),

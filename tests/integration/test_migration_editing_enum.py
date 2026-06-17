@@ -228,8 +228,8 @@ async def test_full_chain_upgrade_head_via_sync_psycopg(autonomous_db):
     try:
         r = _alembic(env, "upgrade", "head")
         assert r.returncode == 0, f"full-chain upgrade head (sync psycopg) failed:\n{r.stderr}"
-        # head = текущая последняя ревизия (ADR-034 attachments сместил head 0012→0016).
-        assert await _alembic_version(base_url, tmp_db) == "20260616_0001"
+        # head = текущая последняя ревизия (ADR-036 requested_locale сместил head 0016→0017).
+        assert await _alembic_version(base_url, tmp_db) == "20260617_0001"
         # Несколько контрольных объектов из ранних ревизий существуют (цепочка реально
         # применилась, а не только последняя ревизия).
         conn = await asyncpg.connect(asyncpg_dsn(base_url, db=tmp_db))

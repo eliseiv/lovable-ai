@@ -125,6 +125,11 @@ class Project(Base):
         nullable=True,
     )
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ADR-036: явный locale-override языка генерации от клиента. Нормализованный BCP-47
+    # (`ru`/`en`) из Form-поля `locale` POST /v1/projects; NULL = locale не передан/
+    # неподдерживаемый → авто-детект из prompt (ADR-028, байт-в-байт как прежде). Без
+    # server_default (ADR-036 §5) — существующие проекты остаются NULL.
+    requested_locale: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
