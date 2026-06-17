@@ -78,6 +78,12 @@ TODO|FIXME|XXX|HACK|WIP|stub
 - События из `05-events.md` (если есть) publish/consume корректны?
 - Permissions из `06-rbac.md` применены в endpoints?
 
+#### Шаг 3a: ADR/«revision»-цитаты в коде ОБЯЗАНЫ существовать и не противоречить docs (docs↔code drift gate)
+Любая ссылка в коде/комментарии на ADR или «ревизию» (`ADR-NNN`, «ADR-NNN revision», «по ревизии», «fix-заметка» и т.п.), оправдывающая поведение, ОБЯЗАНА быть проверена тобой по фактическому источнику:
+- Открой указанный `docs/adr/ADR-NNN-*.md` И `docs/adr/INDEX.md`. Если цитируемой «revision»/ADR/fix-заметки **нет** ни в тексте ADR, ни в INDEX, ни как отдельный зарегистрированный ADR — ссылка фиктивна → `severity: "critical"`, `category: "docs_code_mismatch"`, `verdict: "rework"`.
+- Сверь фактическое поведение кода с НОРМАТИВНЫМ утверждением в docs/ADR. Если код **противоречит** нормативу docs (напр. docs/ADR фиксируют `include_in_schema=False` / одну security-модель, а код делает endpoint видимым в публичной схеме / меняет security-модель на per-operation), и это изменение **не зарегистрировано** новым ADR + обновлением затронутых docs — это незарегистрированный docs↔code drift по публичной surface/security → `severity: "critical"`, `category: "docs_code_mismatch"`, `verdict: "rework"`. В `fix_hint`: backend обязан либо привести код к docs, либо эскалировать architect для нового ADR + синхронизации docs ДО сдачи; ссылка на несуществующую «revision» как обоснование запрещена.
+- Это касается ВСЕХ файлов в `files_modified`/`files_created`, даже соседних с твоим scope — изменение публичной видимости endpoint и security-модели нельзя пропускать как «вне scope».
+
 ### Шаг 4: Безопасность
 - Auth middleware на каждом protected endpoint?
 - Секреты из config / env / secret manager (не hardcoded)?
@@ -168,6 +174,7 @@ TODO|FIXME|XXX|HACK|WIP|stub
 - [ ] Pre-review gate соблюдён (не ревьюишь не-production-ready код)
 - [ ] Tech-debt sweep пройден
 - [ ] Каждый endpoint/model/event из ТЗ проверен
+- [ ] Каждая ADR/«revision»-ссылка в коде сверена с `docs/adr/ADR-NNN-*.md` + `INDEX.md`: цитируемая ревизия/ADR реально существует, и код не противоречит нормативу docs (особенно `include_in_schema` / security-модель публичной surface). Фиктивная ссылка или незарегистрированный drift публичной схемы/security = `critical` (`docs_code_mismatch`)
 - [ ] Безопасность проверена (auth, секреты, TLS)
 - [ ] Отказоустойчивость проверена (idempotency, retry, N+1)
 - [ ] Если в diff миграция БД: сверен фактический движок по `migrations/env.py`; механизм реально применяет DDL на нём (non-transactional DDL не через `autocommit_block()` при async/asyncpg — иначе `critical`); backend потребовал у qa проверку реального применения DDL (для enum — `pg_enum`)

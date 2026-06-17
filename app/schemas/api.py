@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Problem(BaseModel):
@@ -345,6 +345,36 @@ class AdminGrantCreditsResponse(BaseModel):
     user_id: str = Field(description="Идентификатор пользователя.")
     amount_applied: int = Field(description="Применённая дельта баланса.")
     bonus_generations_balance: int = Field(description="Итоговый баланс бонус-генераций.")
+
+
+class AdminGrantSubscriptionRequest(BaseModel):
+    """Форма срока pro-подписки. Поля взаимоисключающие, оба опциональны.
+
+    Оба `null` (или тело `{}`) — бессрочно (`expires_at` подписки = NULL). Оба заданы
+    одновременно → `422` (неоднозначный срок). `duration_days <= 0` → `422`. `expires_at`
+    в прошлом/настоящем (не в будущем относительно текущего момента) → `422`.
+    """
+
+    duration_days: int | None = Field(
+        default=None, description="Срок в днях от текущего момента (UTC), должен быть `> 0`."
+    )
+    expires_at: datetime | None = Field(
+        default=None, description="Явная дата окончания (ISO-8601), должна быть в будущем."
+    )
+
+    @model_validator(mode="after")
+    def _validate_period(self) -> AdminGrantSubscriptionRequest:
+        if self.duration_days is not None and self.expires_at is not None:
+            raise ValueError("duration_days and expires_at are mutually exclusive.")
+        if self.duration_days is not None and self.duration_days <= 0:
+            raise ValueError("duration_days must be greater than zero.")
+        if self.expires_at is not None:
+            expires_at = self.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= datetime.now(UTC):
+                raise ValueError("expires_at must be in the future.")
+        return self
 
 
 class AdminUserQuota(BaseModel):

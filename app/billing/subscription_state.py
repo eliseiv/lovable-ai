@@ -184,6 +184,48 @@ async def apply_webhook_event(
     return sub
 
 
+async def apply_admin_grant(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    expires_at: datetime | None,
+) -> Subscription:
+    """Ставит pro-доступ выбранному юзеру напрямую (admin-grant, docs §12.1, ADR-037 §B).
+
+    Переиспускает _ensure_row (одна строка на user_id, idempotent upsert; повтор = обновление
+    срока) — НЕ прямой upsert, чтобы не дублировать state-machine §2.3. Коммит — на стороне
+    вызывающего (admin_service, одна транзакция). Токены НЕ начисляются
+    (bonus_generations_balance/credit_grants/billing_events не трогаются — отличие от §11).
+    adapty_transaction_id не трогается.
+
+    Поля: access_level=pro, status=active (проходит гейт §4), grace_until=NULL,
+    will_renew=false (admin-grant не автопродляется), expires_at из параметра (или NULL —
+    бессрочно, §12.2), started_at=now() если не задан (существующий сохраняется),
+    synced_at=now(), store='admin' (маркер происхождения), product_id=NULL,
+    raw={source:'admin_grant', granted_at, expires_at}.
+    """
+    existing = await get_subscription(session, user_id)
+    sub = _ensure_row(session, user_id, existing)
+
+    now = datetime.now(UTC)
+    sub.access_level = "pro"
+    sub.status = STATUS_ACTIVE
+    sub.grace_until = None
+    sub.will_renew = False
+    sub.expires_at = expires_at
+    if sub.started_at is None:
+        sub.started_at = now
+    sub.synced_at = now
+    sub.store = "admin"
+    sub.product_id = None
+    sub.raw = {
+        "source": "admin_grant",
+        "granted_at": now.isoformat(),
+        "expires_at": expires_at.isoformat() if expires_at is not None else None,
+    }
+    return sub
+
+
 def resolve_tier_tokens(vendor_product_id: str | None, settings: Settings) -> int:
     """Число токенов (кредитов) для начисления по тиру vendor_product_id (docs §11.1).
 

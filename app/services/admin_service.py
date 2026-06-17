@@ -12,6 +12,7 @@ require_admin (X-Admin-Key), не Bearer.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -21,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.errors import conflict, not_found, unprocessable
 from app.auth.token_service import issue_token
+from app.billing.subscription_state import apply_admin_grant
 from app.core.config import get_settings
 from app.core.ids import new_credit_grant_id, new_user_id
 from app.core.logging import get_logger
@@ -198,6 +200,51 @@ async def grant_credits(
     )
 
 
+async def grant_subscription(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    duration_days: int | None,
+    expires_at: datetime | None,
+) -> User:
+    """Выдаёт юзеру pro-подписку напрямую (admin-grant, ADR-037 §B, docs admin §3.5).
+
+    Резолв юзера (нет → 404; юзер НЕ создаётся, в отличие от login-as). Вычисляет expires_at:
+    duration_days задан → now() + timedelta(days=duration_days); иначе берётся переданный
+    expires_at (или NULL — бессрочно). Ставит subscriptions через apply_admin_grant (поля —
+    docs §12.1) и коммитит (одна транзакция). Токены НЕ начисляются. Возвращает обновлённого
+    юзера для снимка AdminUserResponse (тот же, что GET /admin/users/{user_id}).
+
+    Предполагается, что взаимоисключение duration_days/expires_at и валидность срока уже
+    проверены на уровне схемы запроса (AdminGrantSubscriptionRequest → 422).
+    """
+    user = await _get_user(session, user_id)
+    if user is None:
+        raise not_found("User not found.")
+
+    effective_expires_at: datetime | None
+    if duration_days is not None:
+        effective_expires_at = datetime.now(UTC) + timedelta(days=duration_days)
+    else:
+        effective_expires_at = expires_at
+
+    await apply_admin_grant(session, user_id=user_id, expires_at=effective_expires_at)
+    await session.commit()
+
+    logger.info(
+        "admin_grant_subscription",
+        extra={
+            "user_id": user_id,
+            "access_level": "pro",
+            "expires_at": (
+                effective_expires_at.isoformat() if effective_expires_at is not None else None
+            ),
+            "duration_days": duration_days,
+        },
+    )
+    return user
+
+
 async def _apply_balance_delta(session: AsyncSession, user_id: str, amount: int) -> int | None:
     """Атомарно применяет дельту к users.bonus_generations_balance, держа инвариант >= 0.
 
@@ -232,4 +279,11 @@ async def _find_grant_by_idempotency(
     return result.scalar_one_or_none()
 
 
-__all__ = ["GrantResult", "LoginAsResult", "get_user", "grant_credits", "login_as"]
+__all__ = [
+    "GrantResult",
+    "LoginAsResult",
+    "get_user",
+    "grant_credits",
+    "grant_subscription",
+    "login_as",
+]

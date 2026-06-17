@@ -1,8 +1,8 @@
 # admin — операторская админ-плоскость ([ADR-021](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
 
-**Статус:** контракт зафиксирован (ADR-021), реализация — backend.
+**Статус:** контракт зафиксирован (ADR-021 реализован; admin-grant pro-подписки [ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md) — контракт зафиксирован, реализация — backend).
 
-Операторская плоскость поверх user-facing API: аутентификация одним секретом `ADMIN_API_KEY` (не RBAC-роли), login-as по `user_id`, начисление/просмотр бонус-генераций (кредитов). Работает в **dev И prod** (безопасность — через секрет, не через среду). Все эндпоинты **скрыты** из публичной OpenAPI (`include_in_schema=False`).
+Операторская плоскость поверх user-facing API: аутентификация одним секретом `ADMIN_API_KEY` (не RBAC-роли), login-as по `user_id`, начисление/просмотр бонус-генераций (кредитов). Работает в **dev И prod** (безопасность — через секрет, не через среду). Все эндпоинты **видимы** в публичной OpenAPI под тегом «Администрирование» с security `AdminKey` (`X-Admin-Key`, ADR-021 revision — [admin §4](03-architecture.md#4-публичная-openapi-adr-021-revision)).
 
 ## Документы
 | Документ | Назначение |
@@ -14,6 +14,7 @@
 - **`require_admin`** — FastAPI-dependency: `X-Admin-Key` constant-time против `ADMIN_API_KEY`; пусто/невалидно → `401`.
 - **`POST /v1/admin/login-as`** — выпуск пользовательского Bearer за `user_id` (создаёт юзера без `apple_sub`, если нет).
 - **`POST /v1/admin/users/{user_id}/credits`** — начислить/скорректировать бонус-генерации.
+- **`POST /v1/admin/users/{user_id}/subscription`** ([ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md)) — выдать pro-подписку (`access_level=pro`) на срок/бессрочно; токены не начисляет. Переиспользует `subscription_state.apply_admin_grant`.
 - **`GET /v1/admin/users/{user_id}`** — баланс кредитов + квота юзера.
 
 ## Зависимости

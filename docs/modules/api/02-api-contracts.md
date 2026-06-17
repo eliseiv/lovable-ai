@@ -201,8 +201,11 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
 | **Правки и ревизии** | Post-delivery правки сайта, история ревизий, откат | `POST /projects/{pid}/edits`, `GET /projects/{pid}/revisions`, `POST /projects/{pid}/revisions/{revision_no}/rollback` |
 | **Устройства** | Регистрация/отписка устройств для push-уведомлений | `POST /devices`, `DELETE /devices/{apns_token}` |
 | **Биллинг** | Тариф, остаток квоты, приём событий магазина подписок | `GET /billing/me`, `POST /billing/webhook/adapty` |
+| **Администрирование** | Операторская плоскость: вход за пользователя, бонус-генерации, выдача pro-подписки (защита — `X-Admin-Key`, **не** Bearer) | `POST /admin/login-as`, `POST /admin/users/{user_id}/credits`, `POST /admin/users/{user_id}/subscription`, `GET /admin/users/{user_id}` |
 
-> Имена tag'ов и состав — единственный нормативный источник; backend проставляет `tags=[...]` ровно по этой таблице. (Внутренняя модульная принадлежность — `api`/`auth`/`billing` — наружу **не** выносится; группировка чисто доменная.)
+> Имена tag'ов и состав — единственный нормативный источник; backend проставляет `tags=[...]` ровно по этой таблице. (Внутренняя модульная принадлежность — `api`/`auth`/`billing`/`admin` — наружу **не** выносится; группировка чисто доменная.)
+
+> **Тег «Администрирование» — публичная операторская поверхность (ADR-021 revision).** Эндпоинты `/v1/admin/*` **видимы** в публичной схеме (`include_in_schema=True`) и несут **per-operation security `AdminKey`** (apiKey-заголовок `X-Admin-Key`, **не** глобальный `BearerAuth`) — схема `AdminKey` объявляется в `components.securitySchemes` кастомным `app.openapi()` ([admin §4](../admin/03-architecture.md#4-публичная-openapi-adr-021-revision), [ADR-021 §C revision](../../adr/ADR-021-admin-plane-and-bonus-credits.md)). Защита `require_admin`/`X-Admin-Key` действует при любой видимости. Нормативный REST-контракт админ-эндпоинтов — [modules/admin/02-api-contracts.md](../admin/02-api-contracts.md). Денилист B.7 (нет `Sprint`/`ADR-`/`TD-`/имён агентов в `/openapi.json`) распространяется и на эти эндпоинты.
 
 ## B.5 Скрытие служебных / internal эндпоинтов из публичной схемы
 - **`include_in_schema=False`** (скрыть из `/openapi.json` и `/docs`) для **внутренних** эндпоинтов, не предназначенных iOS-клиенту:
@@ -210,6 +213,7 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
   - **`GET /healthz` / `GET /readyz`** (liveness/readiness, инфра — [07-deployment.md → Health/readiness](../../07-deployment.md#health--readiness)).
 - **`POST /billing/webhook/adapty`** — **оставить** в схеме, но с явной пометкой в `description`: **server-to-server (S2S)**, вызывается провайдером подписок, **не** требует Bearer (верификация по секрету провайдера). Тег — «Биллинг». Пометка нужна, чтобы iOS-разработчик понимал, что этот endpoint **не** для клиента.
 - **`POST /auth/register` · `POST /auth/login`** ([ADR-024](../../adr/ADR-024-user-id-secret-authentication.md)) — **публичные** (вход/регистрация, **не** требуют Bearer — как `/auth/apple`), `include_in_schema=True`, тег «Аутентификация». Глобальный `BearerAuth` ([B.6 securityScheme](#b6-глобальные-метаданные-fastapi-рус-без-внутренних-маркеров)) на них **не** обязателен — описать в `description`, что авторизация не требуется (как у `/auth/apple`); лишний `Authorization`-заголовок безвреден. `POST /auth/secret` — наоборот, **требует** Bearer (глобальный `BearerAuth` применяется).
+- **Админ-эндпоинты `/v1/admin/*` — `include_in_schema=True` (ВИДИМЫ, ADR-021 revision).** Подаются под тегом «Администрирование» (§B.4) с per-operation security `AdminKey` (`X-Admin-Key`, **не** глобальный `BearerAuth`), схема `AdminKey` — в `components.securitySchemes`. **Не** скрываются (в отличие от `/metrics`/`/healthz`/`/readyz`): это явная публичная операторская поверхность; чистота схемы обеспечивается денилистом B.7, а не скрытием. Нормативный контракт — [modules/admin/02-api-contracts.md](../admin/02-api-contracts.md).
 - Прочие эндпоинты из сводной таблицы выше — публичные (`include_in_schema=True`, дефолт).
 
 ## B.6 Глобальные метаданные FastAPI (рус., без внутренних маркеров)

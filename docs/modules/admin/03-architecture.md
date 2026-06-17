@@ -20,7 +20,7 @@ flowchart TB
 
 - Заголовок — **`X-Admin-Key`** (отдельный от `Authorization` — не конфликтует с Bearer-парсингом `current_user`).
 - Сравнение — **constant-time** `hmac.compare_digest(provided, settings.admin_api_key.get_secret_value())` (stdlib `hmac`, без новой зависимости).
-- **Пустой `ADMIN_API_KEY`** (`None`/`""`) → всегда `401` (один код-путь; `compare_digest` против пустого никогда не проходит). Совместно с `include_in_schema=False` (см. §4) — эндпоинты скрыты и недоступны.
+- **Пустой `ADMIN_API_KEY`** (`None`/`""`) → всегда `401` (один код-путь; `compare_digest` против пустого никогда не проходит). Эндпоинты **видны** в публичной схеме (§4), но без валидного `X-Admin-Key` недоступны (`401`) — видимость защиту не ослабляет.
 - Провал → `401` RFC-7807 без раскрытия причины (как auth-провалы `current_user`).
 - **Среда не гейтит** — `settings.environment` в `require_admin` не используется (dev И prod).
 
@@ -48,9 +48,23 @@ flowchart TB
 
 > Списание кредитов (на старте генерации) — **не** здесь: атомарный декремент `users.bonus_generations_balance` на квота-гейте/usage ([billing §10.3](../billing/03-architecture.md#10-бонус-генерации-кредиты-adr-021)), без строки `credit_grants`. `credit_grants` — только входящие начисления/коррекции.
 
-## 4. Публичная OpenAPI ([ADR-021 §C](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
-- Все `/v1/admin/*` — **`include_in_schema=False`** (как `/metrics`/`/healthz`, [api §B.5](../api/02-api-contracts.md#b5-скрытие-служебных--internal-эндпоинтов-из-публичной-схемы)). В `/openapi.json` их нет → grep-чек-лист [api §B.7](../api/02-api-contracts.md#b7-чек-лист-для-reviewerqa-grep-критерии-чистоты-openapijson) не затрагивается.
-- Внутренние docstring/`summary` — русский, без `Sprint`/`ADR`/`TD` (страховка на случай отзыва скрытия).
+## 3.5. Выдача pro-подписки ([ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md))
+
+`POST /v1/admin/users/{user_id}/subscription` (`require_admin`) — ставит `subscriptions.access_level=pro`/`status=active` выбранному юзеру на срок или бессрочно, без симуляции Adapty-вебхука. **Токены НЕ начисляет** (это ось `/credits`, §3) — нормативное разделение осей.
+
+- **Резолв юзера:** `admin_service.get_user(user_id)` → `404` если нет (юзер **не** создаётся, в отличие от login-as §2 — [ADR-037 §A](../../adr/ADR-037-admin-grant-pro-subscription.md)).
+- **Срок (тело):** `duration_days` ∨ `expires_at` (взаимоисключающи; оба `null` → бессрочно `expires_at=NULL`). Оба заданы / `duration_days<=0` / `expires_at` не в будущем → `422`.
+- **Установка подписки — новый helper `subscription_state.apply_admin_grant`** (единый нормативный источник механики — [billing §12](../billing/03-architecture.md#12-admin-grant-pro-подписки-adr-037)): переиспользует `_ensure_row` (одна строка на `user_id`, idempotent upsert), ставит `access_level=pro`, `status=active`, `grace_until=NULL`, `will_renew=false`, `expires_at` из параметра, `started_at=now()` если не задан, `synced_at=now()`, `store='admin'`, `product_id=NULL`, `raw={source:'admin_grant',...}`. **Не** прямой upsert из `admin_service` (не дублирует state-machine [billing §2.3](../billing/03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица)).
+- **Ответ `200`** — `AdminUserResponse` (тот же снимок `build_billing_snapshot`, что `GET /admin/users/{user_id}`).
+- **Аудит:** `logger.info("admin_grant_subscription", extra={user_id, access_level:'pro', expires_at, duration_days})`.
+
+> **Без миграции/env/новых зависимостей** — переиспользуется таблица `subscriptions` (все поля уже есть). **Сосуществование с реальной Adapty-подпиской/ресинком** (ресинк/вебхук могут перезаписать grant) и **энфорс срока** (`expires_at` сейчас не триггерит истечение) — осознанные следствия, [ADR-037 §Consequences](../../adr/ADR-037-admin-grant-pro-subscription.md) + [Q-ADMIN-1](../../99-open-questions.md#q-admin-1).
+
+## 4. Публичная OpenAPI ([ADR-021 §C revision](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
+- Все `/v1/admin/*` — **`include_in_schema=True`** (ВИДИМЫ в `/openapi.json` и `/docs`) под тегом **«Администрирование»** ([api §B.4/§B.5](../api/02-api-contracts.md#b4-группировка-по-доменам--tags-нормативный-перечень-русские-названия)). Роутер объявлен `APIRouter(prefix="/admin", tags=["Администрирование"])`.
+- **Security — per-operation `AdminKey`, НЕ глобальный `BearerAuth`.** Кастомный `app.openapi()` (`main.py`) объявляет схему `AdminKey` (`type: apiKey`, `in: header`, `name: X-Admin-Key`) в `components.securitySchemes` и навешивает `security=[{AdminKey: []}]` на каждую операцию `/v1/admin/*`, чтобы Swagger `Authorize` принимал админ-ключ. Обычные (не-admin) эндпоинты наследуют глобальный `BearerAuth`.
+- **Денилист утечки маркеров действует:** docstring/`summary` админ-роутов — русский, без `Sprint`/`ADR`/`TD`/имён агентов; grep-чек-лист [api §B.7](../api/02-api-contracts.md#b7-чек-лист-для-reviewerqa-grep-критерии-чистоты-openapijson) применяется к видимым админ-эндпоинтам (`admin`/`login-as`/`X-Admin-Key` легитимны, процессные маркеры — нет).
+- Контракт видимости закреплён тестом `tests/contract/test_admin_openapi_visible.py`.
 
 ## Конвенции
 - `ADMIN_API_KEY` в логах **никогда** не печатается (как Bearer-секрет). В Sentry — scrubbing (добавить в denylist, [05-security → Observability](../../05-security.md#observability-как-security-сигнал)).

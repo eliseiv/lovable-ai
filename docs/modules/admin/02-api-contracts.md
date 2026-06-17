@@ -2,7 +2,7 @@
 
 Base: `https://api.domain/v1` · Auth: **`X-Admin-Key: <ADMIN_API_KEY>`** (НЕ Bearer) · Ошибки: RFC-7807 (`application/problem+json`).
 
-> **Публичная схема:** все эндпоинты ниже — **`include_in_schema=False`** (скрыты из `/openapi.json` и `/docs`, как `/metrics`/`/healthz` — [api §B.5](../api/02-api-contracts.md#b5-скрытие-служебных--internal-эндпоинтов-из-публичной-схемы)). Не предназначены iOS-клиенту. Денилист [api §B.2](../api/02-api-contracts.md#b2-запрещённые-подстроки-в-публичной-схеме-нормативный-denylist) формально не применяется (эндпоинты не в схеме), но docstring/`summary` пишутся **на русском, без `Sprint`/`ADR`/`TD`** — страховка на случай отзыва `include_in_schema=False` ([ADR-021 §C](../../adr/ADR-021-admin-plane-and-bonus-credits.md)).
+> **Публичная схема (ADR-021 revision):** все эндпоинты ниже — **`include_in_schema=True`** (ВИДИМЫ в `/openapi.json` и `/docs`) под тегом **«Администрирование»**, с per-operation security **`AdminKey`** (apiKey-заголовок `X-Admin-Key`, **не** глобальный `BearerAuth`; схема объявлена в `components.securitySchemes` кастомным `app.openapi()` — [admin §4](03-architecture.md#4-публичная-openapi-adr-021-revision)). Денилист [api §B.7](../api/02-api-contracts.md#b7-чек-лист-для-reviewerqa-grep-критерии-чистоты-openapijson) применяется: docstring/`summary` — **на русском, без `Sprint`/`ADR`/`TD`/имён агентов** (`admin`/`login-as`/`X-Admin-Key` легитимны, процессные маркеры — нет). Подача наружу — [api §B.4/§B.5](../api/02-api-contracts.md#b4-группировка-по-доменам--tags-нормативный-перечень-русские-названия), [ADR-021 §C revision](../../adr/ADR-021-admin-plane-and-bonus-credits.md).
 
 ## Сводка endpoints
 
@@ -10,6 +10,7 @@ Base: `https://api.domain/v1` · Auth: **`X-Admin-Key: <ADMIN_API_KEY>`** (НЕ 
 |---|---|---|---|---|
 | POST | `/admin/login-as` | выпустить пользовательский Bearer за `user_id` (создать юзера без Apple, если нет) | `X-Admin-Key` | `200` |
 | POST | `/admin/users/{user_id}/credits` | начислить/скорректировать бонус-генерации | `X-Admin-Key` | `200` |
+| POST | `/admin/users/{user_id}/subscription` | выдать pro-подписку (`access_level=pro`) на срок/бессрочно ([ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md)) | `X-Admin-Key` | `200` |
 | GET | `/admin/users/{user_id}` | баланс кредитов + квота юзера | `X-Admin-Key` | `200` |
 
 ## Аутентификация админ-эндпоинтов ([ADR-021 §A](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
@@ -57,6 +58,22 @@ Base: `https://api.domain/v1` · Auth: **`X-Admin-Key: <ADMIN_API_KEY>`** (НЕ 
   "bonus_generations_balance": 25 }
 ```
 - **Ошибки:** `401`, `404` (нет такого `user_id`), `409` (коррекция увела бы баланс < 0), `422` (`amount==0`/невалидное тело).
+
+## POST /admin/users/{user_id}/subscription
+Выдать выбранному юзеру **pro-подписку** (`subscriptions.access_level=pro`, `status=active`) на заданный срок или бессрочно — без симуляции Adapty-вебхука ([ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md)). **Токены НЕ начисляются** (`bonus_generations_balance` не трогается) — для токенов отдельный `POST /admin/users/{user_id}/credits`.
+- **Auth:** `X-Admin-Key`.
+- **Body** — форма срока (поля **взаимоисключающие**, оба опциональны):
+```json
+{ "duration_days": 30, "expires_at": null }
+```
+  - `duration_days: int | null` — срок в днях от `now()` (UTC), `> 0`.
+  - `expires_at: datetime | null` — явная дата окончания (ISO-8601, в будущем).
+  - **Оба `null` (или тело `{}`) → бессрочно** (`subscriptions.expires_at=NULL`; не истекает ложно — гейт/sweep не консультируют `expires_at`, [ADR-037 §C](../../adr/ADR-037-admin-grant-pro-subscription.md)).
+- **Семантика** ([ADR-037 §B](../../adr/ADR-037-admin-grant-pro-subscription.md), переиспользует `subscription_state.apply_admin_grant` — **не** прямой upsert): `access_level=pro`, `status=active`, `grace_until=NULL`, `will_renew=false`, `expires_at` из параметра (или `NULL`), `started_at=now()` если не задан, `synced_at=now()`, `store='admin'`, `product_id=NULL`, `raw={source:'admin_grant',...}`. Идемпотентно — одна строка `subscriptions` на `user_id` (повтор = обновление срока).
+- **`200`** → `AdminUserResponse` (тот же снимок, что `GET /admin/users/{user_id}`: `access_level='pro'`, `status`, `period`, `bonus_generations_balance`, `quota{...}`).
+- **Ошибки:** `401`, `404` (нет такого `user_id` — выдаём **только** существующему юзеру; в отличие от login-as, юзер не создаётся), `422` (оба поля срока заданы / `duration_days<=0` / `expires_at` не в будущем / невалидное тело).
+
+> **Сосуществование с реальной Adapty-подпиской/ресинком** — admin-grant пишет в кэш Adapty; периодический `getProfile`-ресинк или вебхук могут перезаписать grant ([Q-ADMIN-1](../../99-open-questions.md#q-admin-1)). Предназначен для юзеров без активной реальной подписки. Срок (`expires_at`) сейчас **не энфорсится автоматически** (информативен) — снятие pro по сроку = follow-up Q-ADMIN-1.
 
 ## GET /admin/users/{user_id}
 Текущий баланс кредитов + квота юзера (для операторского просмотра).

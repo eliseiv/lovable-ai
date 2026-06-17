@@ -6,9 +6,10 @@
     AdminKey навешивается per-operation в app.openapi() (main.py), защита — X-Admin-Key;
   - возвращают RFC-7807 при ошибках.
 
-POST /admin/login-as                — выпустить пользовательский Bearer за user_id (без Apple).
-POST /admin/users/{user_id}/credits — начислить/скорректировать бонус-генерации (идемпотентно).
-GET  /admin/users/{user_id}         — баланс бонус-генераций + квота пользователя.
+POST /admin/login-as                     — выпустить пользовательский Bearer за user_id (без Apple).
+POST /admin/users/{user_id}/credits      — начислить/скорректировать бонус-генерации (идемпотентно).
+POST /admin/users/{user_id}/subscription — выдать pro-подписку на срок/бессрочно (ADR-037).
+GET  /admin/users/{user_id}              — баланс бонус-генераций + квота пользователя.
 """
 
 from __future__ import annotations
@@ -19,9 +20,11 @@ from fastapi import APIRouter, Header, status
 
 from app.api.dependencies import RequireAdmin, SessionDep
 from app.api.errors import not_found, problem_responses
+from app.db.models import User
 from app.schemas.api import (
     AdminGrantCreditsRequest,
     AdminGrantCreditsResponse,
+    AdminGrantSubscriptionRequest,
     AdminLoginAsRequest,
     AdminLoginAsResponse,
     AdminUserQuota,
@@ -34,6 +37,31 @@ from app.services import admin_service, billing_service
 # навешивает per-operation security AdminKey на /v1/admin/* (вместо глобального BearerAuth),
 # чтобы Authorize в Swagger принимал админ-ключ. Защита — X-Admin-Key при любой видимости.
 router = APIRouter(prefix="/admin", tags=["Администрирование"])
+
+
+async def _build_user_response(session: SessionDep, user: User) -> AdminUserResponse:
+    """Снимок баланса + квоты юзера (AdminUserResponse) — общий для GET и выдачи подписки."""
+    snapshot = await billing_service.build_billing_snapshot(session, user)
+    q = snapshot.quota
+    return AdminUserResponse(
+        user_id=user.id,
+        access_level=snapshot.access_level,
+        status=snapshot.status,
+        period=snapshot.period,
+        bonus_generations_balance=user.bonus_generations_balance,
+        quota=AdminUserQuota(
+            monthly_generations=q.monthly_generations,
+            generations_used=q.generations_used,
+            generations_remaining=q.generations_remaining,
+            monthly_edits=q.monthly_edits,
+            edits_used=q.edits_used,
+            edits_remaining=q.edits_remaining,
+            max_concurrent_jobs=q.max_concurrent_jobs,
+            active_jobs=q.active_jobs,
+            max_projects=q.max_projects,
+            projects_used=q.projects_used,
+        ),
+    )
 
 
 @router.post(
@@ -110,25 +138,34 @@ async def get_user(
     user = await admin_service.get_user(session, user_id)
     if user is None:
         raise not_found("User not found.")
+    return await _build_user_response(session, user)
 
-    snapshot = await billing_service.build_billing_snapshot(session, user)
-    q = snapshot.quota
-    return AdminUserResponse(
-        user_id=user.id,
-        access_level=snapshot.access_level,
-        status=snapshot.status,
-        period=snapshot.period,
-        bonus_generations_balance=user.bonus_generations_balance,
-        quota=AdminUserQuota(
-            monthly_generations=q.monthly_generations,
-            generations_used=q.generations_used,
-            generations_remaining=q.generations_remaining,
-            monthly_edits=q.monthly_edits,
-            edits_used=q.edits_used,
-            edits_remaining=q.edits_remaining,
-            max_concurrent_jobs=q.max_concurrent_jobs,
-            active_jobs=q.active_jobs,
-            max_projects=q.max_projects,
-            projects_used=q.projects_used,
-        ),
+
+@router.post(
+    "/users/{user_id}/subscription",
+    response_model=AdminUserResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Выдать пользователю pro-подписку на срок или бессрочно",
+    responses=problem_responses(401, 404, 422),
+)
+async def grant_subscription(
+    user_id: str,
+    body: AdminGrantSubscriptionRequest,
+    session: SessionDep,
+    _admin: RequireAdmin,
+) -> AdminUserResponse:
+    """Ставит pro-доступ выбранному пользователю на заданный срок или бессрочно.
+
+    Срок задаётся одним из взаимоисключающих полей: число дней либо явная дата окончания
+    (оба опциональны; оба не заданы → бессрочно). Оба заданы одновременно, неположительное
+    число дней или дата окончания не в будущем → 422. Нет пользователя → 404. Бонус-генерации
+    НЕ начисляются. Повтор обновляет ту же подписку (продление срока). В ответе — текущий
+    снимок баланса и квоты пользователя.
+    """
+    user = await admin_service.grant_subscription(
+        session,
+        user_id=user_id,
+        duration_days=body.duration_days,
+        expires_at=body.expires_at,
     )
+    return await _build_user_response(session, user)
