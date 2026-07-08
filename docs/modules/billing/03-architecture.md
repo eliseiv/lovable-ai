@@ -254,3 +254,49 @@ Alembic data-migration сидит Free + Pro. Нормативные значе�
 `subscriptions` — кэш Adapty (source-of-truth — Adapty, ADR-004/009). Admin-grant пишет в тот же кэш ⇒ при наличии реального Adapty-профиля периодический `getProfile`-ресинк (§3.1, `apply_profile_resync`: неактивный профиль → `status=expired`) или вебхук (§2.3) **перезапишут grant**. `synced_at=now()` откладывает периодический ресинк на один `BILLING_RESYNC_INTERVAL_S`, но не защищает от вебхука/протухания. Admin-grant предназначен для юзеров **без активной реальной подписки**. **Срок (`expires_at`) сейчас не энфорсится автоматически** (ни гейт, ни sweep его не консультируют для admin-grant — §12.2). Формализация admin-pinned-семантики / авто-снятия pro по сроку — [Q-ADMIN-1](../../99-open-questions.md#q-admin-1).
 
 > **Без миграции:** все поля `subscriptions` уже есть ([03-data-model § subscriptions](../../03-data-model.md#subscriptions-локальный-кэш-adapty)). Без env-ключей и новых зависимостей.
+
+---
+
+## 13. Прямой StoreKit-путь ([ADR-039](../../adr/ADR-039-direct-storekit-jws-purchase-path.md))
+
+**Второй канал покупок параллельно Adapty-вебхуку.** iOS отправляет подписанную **StoreKit 2 JWS-транзакцию** напрямую backend'у; backend верифицирует её криптографически (офлайн, без Apple/Adapty) и начисляет. Покрывает **Xcode StoreKit Testing** (где Adapty-вебхук структурно не приходит — транзакция не покидает устройство) + Sandbox/Production. Adapty-вебхук (§2, §11) **остаётся** первичным каналом Sandbox/Prod-потока; сосуществование — §13.4.
+
+### 13.1 JWS-верификатор (`app/billing/storekit.py`)
+
+Новый модуль, чистый от БД. Зависимости — `cryptography` (x5c cert-chain) + `PyJWT[crypto]` (ES256 JWS), обе в стеке ([02-tech-stack → Безопасность](../../02-tech-stack.md#безопасность-библиотеки)). Шаги (fail-closed):
+
+1. Разбор JWS-заголовка → `alg` (обязан `ES256`) + цепочка `x5c` (base64 DER). Нет `x5c`/не-объект → отказ.
+2. Загрузка доверенных roots из `APPSTORE_ROOT_CERT_DIR` (`x509.load_der_x509_certificate` по всем `.cer/.der/.pem/.crt` каталога). **Пусто/каталог нет/без сертификатов → нет roots → отказ (fail-closed).**
+3. Верификация цепочки: каждый cert `x5c[i]` подписан `x5c[i+1]` (public-key verify `ec.ECDSA`/`padding.PKCS1v15` по `signature_hash_algorithm`); цепочка **терминируется в доверенном root** (сравнение DER-отпечатков `public_bytes(Encoding.DER)` + verify-signed-by trusted).
+4. Верификация подписи JWS публичным ключом **leaf** (`x5c[0]`), `jwt.decode(..., key=leaf.public_key(), algorithms=["ES256"], options={"verify_aud": False})`.
+5. Валидация payload: `bundleId == APPSTORE_BUNDLE_ID` (**skip, если `APPSTORE_BUNDLE_ID` пусто** — тест/dev); `environment`; `revocationDate` → `revoked=True`; нет `transactionId` → отказ.
+6. `VerifiedTransaction` (frozen dataclass): `transaction_id`, `original_transaction_id` (fallback на `transaction_id`), `product_id`, `expires_at` (опц., подписки), `revoked: bool`, `environment`. Любой отказ → `StoreKitVerificationError` (роутер → `422`, §13.3).
+
+**Payload/JWS НЕ логируются** — только `transaction_id`/`environment` максимум ([05-security → StoreKit](../../05-security.md#прямой-storekit-jws-путь-adr-039)).
+
+### 13.2 Начисление и идемпотентность
+
+**Глобальная идемпотентность — новая таблица `store_transactions(transaction_id PK)`** ([03-data-model](../../03-data-model.md#store_transactions-прямой-storekit-путь-adr-039)): одна Apple-транзакция редимится **ровно один раз во всей системе, ровно одному `user_id`** (per-user `credit_grants` UNIQUE кросс-аккаунтную переигровку не ловит).
+
+- **Токен-пак (`POST /v1/tokens/purchase`):** `resolve_consumable_tokens(product_id)` ([§11.3](#113-consumable-token-паки-non_subscription_purchase-adr-038), тот же `TOKEN_PACK_PRODUCTS`) → если `None` (неизвестный SKU) → `200 ignored:unknown_token_product` (не угадываем); иначе в **одной** транзакции: insert `store_transactions(kind='tokens_purchase', amount)` + общий примитив `grant_tokens` ([§11.2](#112-начисление-и-идемпотентность-adr-027-e), `created_by='storekit'`, `reason='storekit:tokens_purchase'`, `idempotency_key='storekit:'+transaction_id`). Конфликт PK `transaction_id` → `200 duplicate`, начисление не повторяется (глобально, в т.ч. попытка другого `user_id`). **Write-path не дублируется** — `grant_tokens` обобщается параметрами `created_by`/`reason`/`idempotency_key`; Adapty-вызовы — байт-в-байт прежние.
+- **Подписка (`POST /v1/subscription/sync`):** insert `store_transactions(kind='subscription_sync')` `ON CONFLICT DO NOTHING` + новый helper `subscription_state.apply_storekit_subscription(session, *, user_id, expires_at, environment, transaction_id, original_transaction_id)` (по образцу `apply_admin_grant` §12.1): `_ensure_row` → `access_level='pro'`, `status=STATUS_ACTIVE`, `grace_until=NULL`, `expires_at` из транзакции, `will_renew=false`, `store='storekit'`, `product_id` из транзакции, `synced_at=now()`, `raw={source:'storekit',...}`. **Токены не начисляет** (подписка = только pro). Natural-idempotent (state-set); renewal = новая `transaction_id` → обновление `expires_at`.
+
+**Начисление — на аутентифицированного `user_id` (Bearer), не на account из payload** ([05-security](../../05-security.md#прямой-storekit-jws-путь-adr-039)).
+
+### 13.3 Коды ответов
+
+Нормативная таблица — [02-api-contracts §4](02-api-contracts.md#4-прямой-storekit-путь-adr-039). Кратко: `401` (нет/невалидный Bearer); **`422` fail-closed** (невалидный JWS / цепочка не терминируется в доверенном root / невалидная ES256-подпись / bundle mismatch / roots не сконфигурированы) — RFC-7807, крипто-детали не раскрываются; `200 {status}` для бизнес-исходов (`applied`/`duplicate`/`ignored:unknown_token_product`/`ignored:revoked`/`ignored:expired`); `5xx` только на реальный сбой БД.
+
+### 13.4 Сосуществование с Adapty — без двойного начисления
+
+Оба канала пишут в те же `bonus_generations_balance`/`credit_grants`/`subscriptions`, но дедупятся **разными** ключами (Adapty — `billing_events.adapty_event_id`; StoreKit — `store_transactions.transaction_id`). В пределах канала двойного начисления нет; между каналами (одна покупка в оба) — потенциально есть.
+
+**Нормативный контракт разграничения (primary):**
+- **`environment="Xcode"` → ТОЛЬКО прямой путь** (Adapty структурно не доставит — пересечения нет).
+- **`environment ∈ {Sandbox, Production}` → Adapty-вебхук авторитетен** для штатного потока; клиент **не** дублирует ту же покупку в прямой эндпоинт (прямые эндпоинты остаются для QA/фолбэка).
+
+**Структурный кросс-дедуп (отложено, [Q-BILLING-7](../../99-open-questions.md#q-billing-7)):** унификация обоих каналов на общий ключ `transaction_id` — после верификации равенства «Adapty `transaction_id` == StoreKit `transactionId`»; пока не подтверждено, Adapty-канал не трогаем (нулевая регрессия). Не блокирует.
+
+**Подписочный sync и ресинк** — то же осознанное следствие, что admin-grant (§12.3): `subscriptions` — кэш Adapty; для юзеров с реальным Adapty-профилем ресинк/вебхук может перезаписать StoreKit-grant. StoreKit-sync предназначен для юзеров без активной реальной подписки (Xcode-тест). Общий gap энфорса срока — [Q-ADMIN-1](../../99-open-questions.md#q-admin-1)/[Q-BILLING-7](../../99-open-questions.md#q-billing-7).
+
+> **Миграция:** новая таблица `store_transactions` — **транзакционный** `create_table` (revises `20260617_0001`, [ADR-031](../../adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md); нет enum/`ADD VALUE`). Новая прямая зависимость — `cryptography` ([02-tech-stack](../../02-tech-stack.md#безопасность-библиотеки)); новые env — `APPSTORE_ROOT_CERT_DIR`/`APPSTORE_BUNDLE_ID` ([07-deployment](../../07-deployment.md#прямой-storekit-путь-adr-039)).

@@ -309,6 +309,25 @@ APNs device tokens для push-нотификаций ([ADR-013](adr/ADR-013-apn
 | `processed_at` | timestamptz NULL | NULL = принят, не обработан. |
 | `received_at` | timestamptz | |
 
+### store_transactions (прямой StoreKit-путь, ADR-039)
+
+Глобальный реестр обработанных Apple StoreKit-транзакций **прямого** канала ([ADR-039](adr/ADR-039-direct-storekit-jws-purchase-path.md), [modules/billing/03-architecture.md §13](modules/billing/03-architecture.md#13-прямой-storekit-путь-adr-039)). **Единственная точка идемпотентности прямого пути — глобальная по `transaction_id`** (в отличие от per-user `credit_grants(user_id, idempotency_key)`): одна Apple-транзакция редимится **ровно один раз во всей системе, ровно одному `user_id`** — блокирует кросс-аккаунтную переигровку чужого (leaked/shared) валидного JWS. Отдельная таблица (не `billing_events`, чья `adapty_event_id` семантически Adapty-специфична).
+
+| Поле | Тип | Заметки |
+|---|---|---|
+| `transaction_id` | text **PK** | Apple `transactionId` — глобально уникален. PK ⇒ глобальный дедуп; конфликт → `200 duplicate`, начисление не повторяется (любым `user_id`). |
+| `original_transaction_id` | text NULL | Родительская транзакция подписки/renewal-цепочки (fallback на `transaction_id`). |
+| `user_id` | text FK→users NOT NULL | Аккаунт, которому начислено (Bearer-вызывающий, **не** account из payload). Индекс по `(user_id)`. |
+| `product_id` | text | App Store SKU из транзакции. |
+| `kind` | text | `tokens_purchase` (consumable-пак) / `subscription_sync` (подписка). |
+| `environment` | text | `Xcode` / `Sandbox` / `Production` (из верифицированной транзакции). |
+| `amount` | int NULL | Начисленные токены (`tokens_purchase`); `NULL` для подписки. |
+| `created_at` | timestamptz NOT NULL | Момент обработки. |
+
+- **`tokens_purchase`:** insert строки + `grant_tokens` (credit_grants + balance-delta) — в **одной** транзакции. Конфликт PK → `200 duplicate` (глобально). [billing §13.2](modules/billing/03-architecture.md#132-начисление-и-идемпотентность).
+- **`subscription_sync`:** insert `ON CONFLICT (transaction_id) DO NOTHING` + `apply_storekit_subscription` (state-set, natural-idempotent). Renewal = новая `transaction_id` (тот же `original_transaction_id`) → новая строка → обновление `subscriptions.expires_at`.
+- **Миграция — транзакционный `op.create_table`** ([ADR-031](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md): нет enum/`ADD VALUE` → обычная транзакционная миграция, БЕЗ `autocommit_block`; движок sync psycopg по `DATABASE_URL_SYNC`), **revises `20260617_0001`**, без backfill.
+
 ## Migration-guidance — non-transactional DDL (ADR-031)
 
 > Нормативный паттерн для **ВСЕХ** будущих миграций с DDL, который PostgreSQL запрещает выполнять в транзакции (`ALTER TYPE ... ADD VALUE`, `CREATE INDEX CONCURRENTLY`, `DROP INDEX CONCURRENTLY` и т.п.). Фиксирует [ADR-031](adr/ADR-031-alembic-sync-engine-non-transactional-ddl.md) (прод-фикс инцидента `20260612_0001`).

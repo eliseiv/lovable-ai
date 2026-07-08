@@ -341,6 +341,35 @@ class Settings(BaseSettings):
     # env TOKEN_PACK_PRODUCTS.
     token_pack_products: str = Field(default="")
 
+    # --- Прямой StoreKit-путь (ADR-039, docs/07-deployment.md env-контракт) ---
+    # Потребитель — api (эндпоинты POST /v1/tokens/purchase · /subscription/sync + верификатор
+    # app/billing/storekit.py исполняются в FastAPI-процессе). Механизм потребления — поля
+    # Settings (docs/07-deployment «Механизм потребления»): при энфорсе через Settings ОБЯЗАНЫ
+    # быть в x-app-env compose api, иначе extra=ignore молча отдаст дефолт. Без новых секретов
+    # (сертификаты публичны; JWS-транзакция приходит от клиента в теле запроса).
+    # Каталог доверенных root-сертификатов App Store (DER .cer) для верификации x5c-цепочки.
+    # Верификатор грузит все сертификаты каталога; цепочка обязана терминироваться в одном из
+    # них. Пусто/каталог не существует/без сертификатов → нет доверенных roots → 422 fail-closed
+    # (не начисляем на неверифицируемой транзакции). Дефолт — фиксированное местоположение в
+    # образе certs/appstore. Provisioning-артефакт (devops, per-instance): prod = только Apple
+    # production root; Xcode-тест-сертификат — только тест/dev-каталоги. env APPSTORE_ROOT_CERT_DIR.
+    appstore_root_cert_dir: str = Field(
+        default="certs/appstore",
+        description="Каталог доверенных root-сертификатов App Store (DER) для верификации "
+        "x5c-цепочки StoreKit JWS. Пусто/без сертификатов → 422 fail-closed. "
+        "env APPSTORE_ROOT_CERT_DIR (ADR-039).",
+    )
+    # Ожидаемый bundleId в payload StoreKit-транзакции. Непусто → сверяется (mismatch → 422);
+    # пусто → проверка bundle пропускается (Xcode StoreKit Testing / тест/dev ТОЛЬКО). Prod —
+    # реальный bundle id. Стиль поля символ-в-символ как apns_bundle_id (str, default "").
+    # env APPSTORE_BUNDLE_ID.
+    appstore_bundle_id: str = Field(
+        default="",
+        description="Ожидаемый bundleId в StoreKit-транзакции. Непусто → сверяется (mismatch → "
+        "422); пусто → bundle-check пропускается (тест/dev ТОЛЬКО). env APPSTORE_BUNDLE_ID "
+        "(ADR-039).",
+    )
+
     # --- Sprint 4: build-sandbox runtime + egress (ADR-010, docs/07 env-контракт) ---
     # Имена/типы/дефолты — символ-в-символ с docs/07-deployment.md «Канонический список».
     # Эти поля — конфиг build-песочницы (потребитель worker, ADR-010); добавлены в Settings,

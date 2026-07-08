@@ -19,7 +19,16 @@ from app.api.errors import (
     problem_exception_handler,
     validation_exception_handler,
 )
-from app.api.routers import admin, auth, billing, devices, health, jobs, projects
+from app.api.routers import (
+    admin,
+    auth,
+    billing,
+    devices,
+    health,
+    jobs,
+    projects,
+    storekit,
+)
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.observability import sentry
@@ -163,6 +172,9 @@ app.include_router(auth.router, prefix="/v1")
 app.include_router(projects.router, prefix="/v1")
 app.include_router(jobs.router, prefix="/v1")
 app.include_router(billing.router, prefix="/v1")
+# ADR-039: прямой StoreKit-путь покупок (POST /v1/tokens/purchase · /subscription/sync),
+# тег «Биллинг». Пути вне /billing-префикса → отдельный роутер.
+app.include_router(storekit.router, prefix="/v1")
 # Sprint 5: регистрация APNs устройств (ADR-013).
 app.include_router(devices.router, prefix="/v1")
 # ADR-021 (revision): операторская админ-плоскость под тегом «Администрирование» — видима в

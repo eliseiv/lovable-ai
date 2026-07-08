@@ -314,6 +314,47 @@ class AdaptyWebhookResponse(BaseModel):
     )
 
 
+# --- Прямой StoreKit-путь (ADR-039, docs/modules/billing/02-api-contracts §4) ---
+
+
+class StoreKitTransactionRequest(BaseModel):
+    """Тело `POST /v1/tokens/purchase` и `POST /v1/subscription/sync`: подписанная транзакция."""
+
+    jws: str = Field(description="Подписанная StoreKit 2 транзакция (компактный JWS).")
+
+
+class TokensPurchaseResponse(BaseModel):
+    """Ответ покупки токен-пака: `{status, reason?, tokens_granted?}` (docs §4.1).
+
+    Пустые поля исключаются из ответа — он несёт ровно те ключи, что применимы к исходу.
+    """
+
+    status: str = Field(description="`applied` / `duplicate` / `ignored`.")
+    reason: str | None = Field(
+        default=None, description="Причина `ignored` (`unknown_token_product` / `revoked`)."
+    )
+    tokens_granted: int | None = Field(default=None, description="Начислено токенов при `applied`.")
+
+
+class SubscriptionSyncResponse(BaseModel):
+    """Ответ синхронизации подписки: `{status, reason?, access_level?, expires_at?}` (docs §4.2).
+
+    Пустые поля исключаются из ответа — он несёт ровно те ключи, что применимы к исходу.
+    """
+
+    status: str = Field(description="`applied` / `duplicate` / `ignored`.")
+    reason: str | None = Field(
+        default=None, description="Причина `ignored` (`revoked` / `expired`)."
+    )
+    access_level: str | None = Field(
+        default=None, description="Тариф после применения (`pro`) при `applied`."
+    )
+    expires_at: datetime | None = Field(
+        default=None,
+        description="Срок действия подписки (ISO-8601) при `applied`; может быть пуст.",
+    )
+
+
 # --- Админ-плоскость (ADR-021, не в публичной схеме: include_in_schema=False) ---
 
 

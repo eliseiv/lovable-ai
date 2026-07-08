@@ -221,6 +221,23 @@ x-app-env: &app-env
   # настройка в .env инстанса (каноническое значение = 5 паков, см. .env.prod.example
   # / docs/07 env-контракт). Fail-fast на невалидной записи маппинга.
   TOKEN_PACK_PRODUCTS: ${TOKEN_PACK_PRODUCTS:-}
+  # --- ADR-039: прямой StoreKit JWS-путь (POST /v1/tokens/purchase,
+  # /v1/subscription/sync; верификатор app/billing/storekit.py). Оба ключа — поля
+  # Settings (appstore_root_cert_dir / appstore_bundle_id), потребитель api →
+  # ОБЯЗАНЫ быть здесь, иначе extra=ignore молча отдаст дефолт (certs/appstore / "")
+  # и фичу нельзя сконфигурировать per-instance. Дефолты/механизм — docs/07-deployment.md
+  # env-контракт (стр. APPSTORE_*) + §«Прямой StoreKit-путь» / §«Правило конфиг-артефакта:
+  # App Store roots». БЕЗ новых секретов (сертификаты публичны; JWS — в теле запроса).
+  # APPSTORE_ROOT_CERT_DIR — фиксированное местоположение в образе certs/appstore
+  # (относительно WORKDIR /app → /app/certs/appstore); каталог провижится bind-mount'ом
+  # в сервис api (volume ниже). Пустой/несконфигурированный каталог → 422 fail-closed.
+  APPSTORE_ROOT_CERT_DIR: ${APPSTORE_ROOT_CERT_DIR:-certs/appstore}
+  # PER-INSTANCE БЕЗОПАСНОСТЬ (КРИТИЧНО — docs/05-security §Прямой StoreKit-путь):
+  # PROD — РЕАЛЬНЫЙ bundle id (как APNS_BUNDLE_ID/APPLE_AUDIENCE = mba.gipsy.lovable).
+  # Пустой bundle-check + Xcode тест-сертификат в roots = дыра на prod (кто угодно
+  # self-sign'ит Xcode-JWS → бесплатные токены/pro). Дефолт кода "" (skip bundle-check)
+  # — ТОЛЬКО тест/dev; в prod-стеке secure-by-default = реальный bundle id.
+  APPSTORE_BUNDLE_ID: ${APPSTORE_BUNDLE_ID:-mba.gipsy.lovable}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   BUILD_SANDBOX_RUNTIME: ${BUILD_SANDBOX_RUNTIME:-rootless}
   # PROD: build-контейнеры по-прежнему в изолированной egress-сети build-воркера
@@ -431,6 +448,20 @@ services:
       # серт вместо ожидаемого Let's Encrypt. Нормативный набор лейблов — без них.
       # Бэкенд-порт uvicorn (Dockerfile.api EXPOSE 8000).
       - "traefik.http.services.${COMPOSE_PROJECT_NAME:-corelysite}-api.loadbalancer.server.port=8000"
+    volumes:
+      # ADR-039: bind-mount каталога доверенных App Store root-сертификатов в api
+      # (JWS-верификатор app/billing/storekit.py грузит их из APPSTORE_ROOT_CERT_DIR).
+      # read-only. Цель внутри контейнера = /app/certs/appstore (WORKDIR /app +
+      # APPSTORE_ROOT_CERT_DIR=certs/appstore, относительный путь резолвится к
+      # /app/certs/appstore). Host-источник по умолчанию — ../certs/appstore
+      # ОТНОСИТЕЛЬНО каталога compose-файла (infra/), т.е. РЕПОЗИТОРНЫЙ certs/appstore,
+      # где закоммичен ТОЛЬКО Apple production root AppleRootCA-G3.cer (docs/07 §Правило
+      # конфиг-артефакта: App Store roots). PER-INSTANCE БЕЗОПАСНОСТЬ (docs/05): на prod
+      # в каталог попадает ТОЛЬКО Apple root — Xcode тест-сертификат сюда НЕ коммитится
+      # и НЕ монтируется. Host-путь параметризован (как APNS_AUTH_KEY_HOST_PATH); для
+      # тест/dev-инстанса переопределяется на каталог с Xcode-сертификатом (+ пустой
+      # APPSTORE_BUNDLE_ID). Пустой/отсутствующий каталог → 422 fail-closed (не начисляем).
+      - ${APPSTORE_ROOT_CERT_DIR_HOST:-../certs/appstore}:/app/certs/appstore:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
       interval: 15s

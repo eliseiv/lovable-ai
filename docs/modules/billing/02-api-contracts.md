@@ -125,3 +125,52 @@ Auth: Bearer.
 - `required_entitlement` — минимальный access_level, снимающий ограничение (обычно `pro`). iOS по этому коду показывает Adapty-пейвол.
 
 > `concurrency_limit` исторически в S3 отдавался как `429`/`402` из `auth` ([auth §6](../auth/03-architecture.md)). В S3.5 канонизируется как `402` с `reason=concurrency_limit` (единый payment-gate), `429` остаётся за rate-limit (60/min). См. [03-arch §4](03-architecture.md#4-entitlements--quota-gate).
+
+---
+
+## 4. Прямой StoreKit-путь ([ADR-039](../../adr/ADR-039-direct-storekit-jws-purchase-path.md))
+
+Клиентские эндпоинты **прямого** канала покупок параллельно Adapty-вебхуку. Оба — **пользовательский Bearer** (`token_service`, как весь клиентский API); тело — подписанная StoreKit 2 JWS-транзакция. Верификация — собственный верификатор `app/billing/storekit.py` ([03-arch §13.1](03-architecture.md#131-jws-верификатор-appbillingstorekitpy)). **Начисление — на аутентифицированного `user_id` (Bearer), НЕ на account из payload.**
+
+### Общее
+
+- **Auth:** `Authorization: Bearer <api-key>`; нет/невалидный → `401` (RFC-7807).
+- **Body:** `{ "jws": "<signed StoreKit 2 transaction>" }`.
+- **Верификация (fail-closed):** x5c cert-chain → доверенный Apple root (`APPSTORE_ROOT_CERT_DIR`) → ES256-подпись leaf → payload (`bundleId==APPSTORE_BUNDLE_ID` если задан; `environment`; `revocationDate`). Любой отказ / **roots не сконфигурированы** → **`422`** (RFC-7807, `type=…/errors/invalid-storekit-transaction`, крипто-детали не раскрываются).
+- **Идемпотентность — глобальная** по `store_transactions.transaction_id` (PK): повтор той же транзакции (любым `user_id`) → `200 {"status":"duplicate"}`, без повторного начисления.
+- **`5xx`** — только реальный сбой БД.
+- Response-схема бизнес-исходов: `{ "status": "applied"|"duplicate"|"ignored", "reason"?: string, ... }`.
+
+### 4.1 POST /v1/tokens/purchase
+
+Consumable токен-пак → начисление токенов в `bonus_generations_balance`. Маппинг `product_id → tokens` — **тот же** `TOKEN_PACK_PRODUCTS`/`resolve_consumable_tokens`, что consumable-путь Adapty ([03-arch §11.3](03-architecture.md#113-consumable-token-паки-non_subscription_purchase-adr-038)); отдельного env нет.
+
+| Условие | Код | Тело |
+|---|---|---|
+| нет/невалидный Bearer | `401` | RFC-7807 |
+| невалидный JWS / roots не сконфигурированы (fail-closed) | `422` | RFC-7807 (`invalid-storekit-transaction`) |
+| `product_id ∉ TOKEN_PACK_PRODUCTS` | `200` | `{"status":"ignored","reason":"unknown_token_product"}` |
+| транзакция `revoked` | `200` | `{"status":"ignored","reason":"revoked"}` |
+| повтор `transaction_id` | `200` | `{"status":"duplicate"}` |
+| применено | `200` | `{"status":"applied","tokens_granted":<int>}` |
+| сбой БД | `5xx` | клиент повторит |
+
+Начисление: insert `store_transactions(kind='tokens_purchase')` + `grant_tokens(created_by='storekit', reason='storekit:tokens_purchase', idempotency_key='storekit:'+transaction_id)` — одна транзакция ([03-arch §13.2](03-architecture.md#132-начисление-и-идемпотентность)).
+
+### 4.2 POST /v1/subscription/sync
+
+Подписка → `access_level=pro`/`status=active`/`expires_at` из транзакции (helper `apply_storekit_subscription`, [03-arch §13.2](03-architecture.md#132-начисление-и-идемпотентность)). Токены **не** начисляет. Natural-idempotent (state-set); renewal = новая `transaction_id`.
+
+| Условие | Код | Тело |
+|---|---|---|
+| нет/невалидный Bearer | `401` | RFC-7807 |
+| невалидный JWS / roots не сконфигурированы | `422` | RFC-7807 (`invalid-storekit-transaction`) |
+| транзакция `revoked` | `200` | `{"status":"ignored","reason":"revoked"}` |
+| `expires_at` в прошлом | `200` | `{"status":"ignored","reason":"expired"}` |
+| повтор `transaction_id` | `200` | `{"status":"duplicate"}` |
+| применено | `200` | `{"status":"applied","access_level":"pro","expires_at":<iso\|null>}` |
+| сбой БД | `5xx` | клиент повторит |
+
+> **Публичная OpenAPI:** оба эндпоинта — клиентские (тег «Биллинг»), русскоязычные `summary`/`description` без внутренних маркеров (`Sprint`/`ADR`/`TD`/имена агентов), denylist B.7 ([api §Публичная API-документация](../api/02-api-contracts.md#публичная-api-документация-swaggeropenapi--нормативный-стандарт)). Верификатор/`store_transactions`/имена env в публичной схеме не фигурируют.
+
+> **Сосуществование с Adapty** (без двойного начисления), per-instance безопасность (Xcode-сертификат не на prod), fail-closed — [03-arch §13.4](03-architecture.md#134-сосуществование-с-adapty--без-двойного-начисления) / [05-security → StoreKit](../../05-security.md#прямой-storekit-jws-путь-adr-039) / [07-deployment → StoreKit](../../07-deployment.md#прямой-storekit-путь-adr-039).

@@ -31,6 +31,11 @@ dependencies = [
     "aioboto3==13.*",
     "argon2-cffi==23.*",
     "PyJWT[crypto]>=2.9",
+    # ADR-039: x509 cert-chain верификация StoreKit JWS (app/billing/storekit.py) использует
+    # cryptography НАПРЯМУЮ (x509.load_der_x509_certificate + ec/rsa public-key verify), не только
+    # транзитивно через PyJWT[crypto]. Правило прямых зависимостей (docs/02-tech-stack.md
+    # §Безопасность) → явная прямая зависимость. Версия >=43 (совместима с PyJWT[crypto]).
+    "cryptography>=43",
     # Sprint 5: extra http2 обязателен для APNs (HTTP/2 POST /3/device), тянет h2
     # (docs/02-tech-stack.md §httpx, ADR-013). Прямая зависимость — extra объявлен явно.
     "httpx[http2]==0.27.*",

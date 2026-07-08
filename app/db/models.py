@@ -514,6 +514,38 @@ class CreditGrant(Base):
     )
 
 
+class StoreTransaction(Base):
+    """Глобальный реестр обработанных Apple StoreKit-транзакций прямого канала (ADR-039 §D).
+
+    docs/03-data-model.md → store_transactions. Единственная точка идемпотентности прямого пути —
+    ГЛОБАЛЬНАЯ по transaction_id (PK), в отличие от per-user credit_grants(user_id,
+    idempotency_key): одна Apple-транзакция редимится ровно один раз во всей системе, ровно
+    одному user_id — блокирует кросс-аккаунтную переигровку чужого валидного JWS. Отдельная
+    таблица (не billing_events, чья adapty_event_id семантически Adapty-специфична).
+    """
+
+    __tablename__ = "store_transactions"
+
+    # Apple transactionId — глобально уникален. PK ⇒ глобальный дедуп; конфликт → 200 duplicate,
+    # начисление не повторяется (любым user_id).
+    transaction_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    # Родительская транзакция подписки/renewal-цепочки (fallback на transaction_id).
+    original_transaction_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Аккаунт, которому начислено (Bearer-вызывающий, НЕ account из payload). Индекс по user_id.
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    # App Store SKU из транзакции.
+    product_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # tokens_purchase (consumable-пак) / subscription_sync (подписка).
+    kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Xcode / Sandbox / Production (из верифицированной транзакции).
+    environment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Начисленные токены (tokens_purchase); NULL для подписки.
+    amount: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class Attachment(Base):
     """Приложенное пользователем изображение (ADR-034, docs §attachments).
 

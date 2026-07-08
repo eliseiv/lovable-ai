@@ -234,6 +234,58 @@ async def apply_admin_grant(
     return sub
 
 
+async def apply_storekit_subscription(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    expires_at: datetime | None,
+    environment: str,
+    transaction_id: str,
+    original_transaction_id: str,
+    product_id: str,
+) -> Subscription:
+    """Ставит pro-доступ по прямой StoreKit-транзакции (ADR-039 §C, docs §13.2).
+
+    По образцу apply_admin_grant (§12.1): переиспускает _ensure_row (одна строка на user_id,
+    idempotent upsert), НЕ прямой upsert из роутера (единый источник установки subscriptions).
+    Коммит — на стороне вызывающего (одна транзакция с insert store_transactions). Natural-
+    idempotent (state-set): renewal = новая transaction_id → повторный вызов обновляет expires_at.
+
+    Поля (ADR-039 §C): access_level='pro', status=active (проходит гейт §4), grace_until=NULL,
+    expires_at из транзакции, will_renew=false (renewal приходит отдельной sync), store='storekit'
+    (маркер происхождения, отличает от app_store/admin), product_id из транзакции, started_at=now()
+    если не задан, synced_at=now() (приоритет над ресинком §3.1 на один TTL), raw={source:
+    'storekit', environment, transaction_id, ...}. adapty_transaction_id НЕ трогается. **Токены НЕ
+    начисляет** (подписка = только pro, как ADR-037/ADR-038 §D).
+
+    product_id передаётся из верифицированной транзакции (ADR-039 §C «product_id из транзакции»):
+    сигнатура §C расширена этим параметром — helper обязан установить поле, но не имеет доступа к
+    payload; значение резолвит роутер из VerifiedTransaction.
+    """
+    existing = await get_subscription(session, user_id)
+    sub = _ensure_row(session, user_id, existing)
+
+    now = datetime.now(UTC)
+    sub.access_level = "pro"
+    sub.status = STATUS_ACTIVE
+    sub.grace_until = None
+    sub.will_renew = False
+    sub.expires_at = expires_at
+    if sub.started_at is None:
+        sub.started_at = now
+    sub.synced_at = now
+    sub.store = "storekit"
+    sub.product_id = product_id or None
+    sub.raw = {
+        "source": "storekit",
+        "environment": environment,
+        "transaction_id": transaction_id,
+        "original_transaction_id": original_transaction_id,
+        "expires_at": expires_at.isoformat() if expires_at is not None else None,
+    }
+    return sub
+
+
 def resolve_tier_tokens(vendor_product_id: str | None, settings: Settings) -> int:
     """Число токенов (кредитов) для начисления по тиру vendor_product_id (docs §11.1).
 
@@ -270,26 +322,38 @@ async def grant_tokens(
     event_id: str,
     event_type: str,
     amount: int,
+    created_by: str = "adapty",
+    reason: str | None = None,
+    idempotency_key: str | None = None,
 ) -> int:
     """Общий примитив начисления токенов в bonus_generations_balance (ADR-038 §C, docs §11.2).
 
-    Единая ledger-реализация на ОБА класса начисления — подписочный (amount =
-    resolve_tier_tokens) и consumable (amount = resolve_consumable_tokens); write-path не
-    дублируется. Относительный атомарный UPDATE users.bonus_generations_balance += amount (та же
-    механика, что admin `_apply_balance_delta`) + insert credit_grants(reason='adapty:<event_
-    type>', idempotency_key=event_id, created_by='adapty') — БЕЗ commit (вызывающий коммитит в
-    ТОЙ ЖЕ транзакции, что insert billing_events).
+    Единая ledger-реализация на ОБА канала начисления — Adapty (подписочный §11.1 / consumable
+    §11.3) и прямой StoreKit-путь (ADR-039 §C, tokens_purchase); write-path не дублируется.
+    Относительный атомарный UPDATE users.bonus_generations_balance += amount (та же механика, что
+    admin `_apply_balance_delta`) + insert credit_grants(...) — БЕЗ commit (вызывающий коммитит
+    в ТОЙ ЖЕ транзакции, что insert billing_events / store_transactions).
+
+    Обобщение канала (ADR-039 §C): created_by/reason/idempotency_key параметризованы с
+    дефолтами, дающими БАЙТ-В-БАЙТ прежнее Adapty-поведение (created_by='adapty',
+    reason='adapty:<event_type>', idempotency_key=event_id). StoreKit-вызывающий передаёт
+    created_by='storekit', reason='storekit:tokens_purchase', idempotency_key='storekit:'+
+    transaction_id.
 
     Short-circuit `amount <= 0` (ADR-038 §C): грант НЕ пишется (нет строки credit_grants, нет
     balance-delta) — устраняет нулевые ledger-строки (подписки нормативно дают 0 токенов, §11.1).
 
-    Дедуп начисления — UNIQUE billing_events.adapty_event_id (повтор event_id → 200 duplicate,
-    сюда не доходит) + партиальный UNIQUE credit_grants(user_id, idempotency_key=event_id) как
-    вторая страховка. Возвращает число фактически начисленных токенов (0 при short-circuit).
+    Дедуп начисления — вторичная страховка партиальным UNIQUE credit_grants(user_id,
+    idempotency_key); первичный дедуп канала — UNIQUE billing_events.adapty_event_id (Adapty) /
+    PK store_transactions.transaction_id (StoreKit). Возвращает число фактически начисленных
+    токенов (0 при short-circuit).
     """
     if amount <= 0:
         # Подписка с 0-токенами (§11.1) или пак с amount=0 — мусорную нулевую строку не пишем.
         return 0
+
+    resolved_reason = reason if reason is not None else f"adapty:{event_type}"
+    resolved_idempotency_key = idempotency_key if idempotency_key is not None else event_id
 
     # Лениво: избегаем импорт-цикла billing↔services и переиспользуем существующую механику
     # относительного атомарного UPDATE (НЕ дублируем логику начисления, docs §11.2).
@@ -300,9 +364,9 @@ async def grant_tokens(
             id=new_credit_grant_id(),
             user_id=user_id,
             amount=amount,
-            reason=f"adapty:{event_type}",
-            idempotency_key=event_id,
-            created_by="adapty",
+            reason=resolved_reason,
+            idempotency_key=resolved_idempotency_key,
+            created_by=created_by,
         )
     )
     # amount > 0 (short-circuit выше), инвариант balance >= 0 не нарушается → None не ожидается.

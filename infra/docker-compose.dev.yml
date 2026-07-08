@@ -162,6 +162,20 @@ x-app-env: &app-env
   # + alert billing_unknown_token_product). Реальные SKU — операторская настройка
   # .env (каноническое значение = 5 паков, см. .env.example). Fail-fast на невалидной записи.
   TOKEN_PACK_PRODUCTS: ${TOKEN_PACK_PRODUCTS:-}
+  # --- ADR-039: прямой StoreKit JWS-путь (POST /v1/tokens/purchase,
+  # /v1/subscription/sync; верификатор app/billing/storekit.py). Оба ключа — поля
+  # Settings (appstore_root_cert_dir / appstore_bundle_id), потребитель api →
+  # ОБЯЗАНЫ быть в x-app-env, иначе extra=ignore молча отдаст дефолт. Дефолты =
+  # Dev-пример env-контракта docs/07-deployment.md (certs/appstore / пусто).
+  # APPSTORE_ROOT_CERT_DIR — фиксированное местоположение в образе certs/appstore
+  # (относительно WORKDIR /app → /app/certs/appstore); каталог провижится bind-mount'ом
+  # в api (volume ниже). Пустой каталог → 422 fail-closed. ---
+  APPSTORE_ROOT_CERT_DIR: ${APPSTORE_ROOT_CERT_DIR:-certs/appstore}
+  # DEV: APPSTORE_BUNDLE_ID пуст по умолчанию (skip bundle-check) — для Xcode StoreKit
+  # Testing (docs/07 Dev-пример = ""). Для прохождения Xcode-цепочки dev-инстанс также
+  # переопределяет APPSTORE_ROOT_CERT_DIR_HOST на каталог с Xcode тест-сертификатом
+  # (certs/appstore-xcode). Пустой bundle + Xcode-cert разрешены ТОЛЬКО тест/dev (docs/05).
+  APPSTORE_BUNDLE_ID: ${APPSTORE_BUNDLE_ID:-}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   # Канонические имена и дефолты — docs/07-deployment.md → env-контракт (стр. 80-88).
   # Имена совпадают символ-в-символ с полями Settings (config.py). Поля Settings
@@ -477,6 +491,16 @@ services:
       - "traefik.http.routers.api.entrypoints=web"
       - "traefik.http.routers.api.middlewares=secure-headers@file"
       - "traefik.http.services.api.loadbalancer.server.port=8000"
+    volumes:
+      # ADR-039: bind-mount каталога доверенных App Store root-сертификатов в api
+      # (JWS-верификатор app/billing/storekit.py). read-only. Цель = /app/certs/appstore
+      # (WORKDIR /app + APPSTORE_ROOT_CERT_DIR=certs/appstore). Host-источник по
+      # умолчанию — ../certs/appstore ОТНОСИТЕЛЬНО каталога compose-файла (infra/), т.е.
+      # репозиторный certs/appstore (закоммичен Apple production root AppleRootCA-G3.cer).
+      # Для локального Xcode StoreKit Testing переопредели APPSTORE_ROOT_CERT_DIR_HOST на
+      # каталог с Xcode тест-сертификатом (напр. ../certs/appstore-xcode) + пустой
+      # APPSTORE_BUNDLE_ID (docs/05 §Прямой StoreKit-путь: Xcode-cert ТОЛЬКО тест/dev).
+      - ${APPSTORE_ROOT_CERT_DIR_HOST:-../certs/appstore}:/app/certs/appstore:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
       interval: 15s
