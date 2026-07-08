@@ -84,9 +84,12 @@ async def test_subscription_started_fixture(session):
 
 
 async def test_subscription_started_grants_tokens(session):
-    """Валидный started → credit_grants(created_by='adapty', idempotency_key=event_id) + баланс."""
+    """ADR-038 §D: подписка = 0 бонус-токенов → short-circuit, credit_grants НЕ пишется."""
+    from sqlalchemy import func
+
     user = await _user(session, "u_ct_grant0000000001")
     settings = get_settings()
+    assert settings.subscription_tokens_weekly == 0  # нормативно 0 (ADR-038 §D)
     payload = _fixture(
         "evt_ct_grant",
         "subscription_started",
@@ -96,14 +99,13 @@ async def test_subscription_started_grants_tokens(session):
     await process_webhook(session, payload)
 
     balance = await session.scalar(select(User.bonus_generations_balance).where(User.id == user.id))
-    assert balance == settings.subscription_tokens_weekly
-    grant = (
-        await session.execute(
-            select(CreditGrant).where(CreditGrant.idempotency_key == "evt_ct_grant")
-        )
-    ).scalar_one()
-    assert grant.created_by == "adapty"
-    assert grant.amount == settings.subscription_tokens_weekly
+    assert balance == 0
+    grant_count = await session.scalar(
+        select(func.count())
+        .select_from(CreditGrant)
+        .where(CreditGrant.idempotency_key == "evt_ct_grant")
+    )
+    assert grant_count == 0
 
 
 async def test_subscription_renewed_fixture(session):

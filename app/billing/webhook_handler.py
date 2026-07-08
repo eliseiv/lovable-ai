@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing import subscription_state
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import BillingEvent, User
 
@@ -164,6 +165,19 @@ async def process_webhook(session: AsyncSession, payload: Any) -> WebhookResult:
         )
         return WebhookResult(outcome=WebhookOutcome.IGNORED, reason="missing_customer_user_id")
 
+    # Consumable-покупка токен-пака (non_subscription_purchase, ADR-038 §A): ОТДЕЛЬНАЯ ветка,
+    # МИНУЯ apply_webhook_event — subscriptions/access_level НЕ трогаются, эффект только
+    # начисление токенов по vendor_product_id (docs §11.3).
+    if event_type in subscription_state.CONSUMABLE_EVENT_TYPES:
+        return await _process_consumable(
+            session,
+            ledger=ledger,
+            event_id=event_id,
+            event_type=event_type,
+            user_id=user.id,
+            payload=payload,
+        )
+
     # Апдейт subscriptions + (started/renewed) token-grant в ТОЙ ЖЕ транзакции, processed_at=now.
     try:
         await subscription_state.apply_webhook_event(
@@ -199,5 +213,79 @@ async def process_webhook(session: AsyncSession, payload: Any) -> WebhookResult:
     logger.info(
         "billing_webhook_processed",
         extra={"event_id": event_id, "event_type": event_type, "user_id": user.id},
+    )
+    return WebhookResult(outcome=WebhookOutcome.APPLIED)
+
+
+async def _process_consumable(
+    session: AsyncSession,
+    *,
+    ledger: BillingEvent,
+    event_id: str,
+    event_type: str,
+    user_id: str,
+    payload: dict[str, Any],
+) -> WebhookResult:
+    """Обрабатывает non_subscription_purchase (consumable токен-пак, ADR-038, docs §11.3).
+
+    Отдельная ветка, МИНУЯ apply_webhook_event: subscriptions/access_level НЕ трогаются — эффект
+    только начисление токенов по vendor_product_id через общий write-path (§11.2). Известный
+    vendor_product_id → grant_tokens(amount), processed_at=now, 200 applied. Неизвестный/
+    отсутствует → токены НЕ начисляются, ledger processed_at=NULL (не теряем событие — ручная
+    реобработка после правки TOKEN_PACK_PRODUCTS), alert billing_unknown_token_product,
+    200 ignored:unknown_token_product (§11.3/E). Реальный сбой БД → 5xx (Adapty retry).
+    """
+    settings = get_settings()
+    vendor_product_id = _extract_vendor_product_id(payload)
+    amount = subscription_state.resolve_consumable_tokens(vendor_product_id, settings)
+
+    if amount is None:
+        # Неизвестный token-product: не угадываем. Событие фиксируем с processed_at=NULL для
+        # ручной реобработки после правки env; alert оператору.
+        try:
+            await session.commit()
+        except IntegrityError:
+            # Гонка дублей по UNIQUE adapty_event_id → идемпотентно DUPLICATE.
+            await session.rollback()
+            return WebhookResult(outcome=WebhookOutcome.DUPLICATE)
+        except Exception as exc:  # noqa: BLE001 - реальный сбой БД → 5xx (Adapty retry)
+            await session.rollback()
+            raise WebhookProcessingError(f"Failed to persist webhook {event_id}: {exc}") from exc
+        logger.warning(
+            "billing_unknown_token_product",
+            extra={
+                "event_id": event_id,
+                "user_id": user_id,
+                "vendor_product_id": vendor_product_id,
+            },
+        )
+        return WebhookResult(outcome=WebhookOutcome.IGNORED, reason="unknown_token_product")
+
+    # Известный пак: начисление через общий write-path (§11.2) в ТОЙ ЖЕ транзакции с ledger,
+    # processed_at=now. subscriptions НЕ трогаем (не подписка).
+    try:
+        await subscription_state.grant_tokens(
+            session,
+            user_id=user_id,
+            event_id=event_id,
+            event_type=event_type,
+            amount=amount,
+        )
+        ledger.processed_at = datetime.now(UTC)
+        await session.commit()
+    except IntegrityError:
+        # Гонка дублей по UNIQUE adapty_event_id / credit_grants(user_id,event_id) → DUPLICATE.
+        await session.rollback()
+        return WebhookResult(outcome=WebhookOutcome.DUPLICATE)
+    except Exception as exc:  # noqa: BLE001 - реальный сбой БД → 5xx (Adapty retry)
+        await session.rollback()
+        logger.error(
+            "billing_webhook_apply_failed", extra={"event_id": event_id, "error": str(exc)}
+        )
+        raise WebhookProcessingError(f"Failed to apply webhook {event_id}: {exc}") from exc
+
+    logger.info(
+        "billing_webhook_processed",
+        extra={"event_id": event_id, "event_type": event_type, "user_id": user_id},
     )
     return WebhookResult(outcome=WebhookOutcome.APPLIED)

@@ -51,9 +51,11 @@ flowchart TB
 ### 2.2 Идемпотентность
 `billing_events.adapty_event_id` UNIQUE — единственная точка дедупа. Повтор → `200` no-op. Insert ledger-строки и апдейт `subscriptions` — в **одной транзакции** с `processed_at=now()`; при ошибке апдейта транзакция откатывается, строка остаётся `processed_at=NULL` (добивается ресинком/повтором доставки).
 
+> **Consumable-покупка (`non_subscription_purchase`, [ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md)):** разовая покупка токен-пака — **отдельный класс события**, идущий по **своей ветке** `process_webhook` (после общего user-lookup), **минуя `apply_webhook_event`**: `subscriptions`/`access_level` НЕ трогаются, эффект — только начисление токенов по `vendor_product_id` (§11.3). Поэтому `non_subscription_purchase` **отсутствует** в таблице §2.3 (не подписочный переход). Он добавлен в `KNOWN_EVENT_TYPES` (иначе `200 ignored: event_type`), но НЕ в `TOKEN_GRANT_EVENT_TYPES` (то — подписочный путь); классификация — множество `CONSUMABLE_EVENT_TYPES = {non_subscription_purchase}`.
+
 ### 2.3 Маппинг `event_type` → `subscriptions` (нормативная таблица)
 
-`status` ∈ `active` / `expired` / `grace` / `billing_issue`. На гейте пропускаются **только** `active` и `grace` (§4). Единственный нормативный источник переходов по событиям:
+`status` ∈ `active` / `expired` / `grace` / `billing_issue`. На гейте пропускаются **только** `active` и `grace` (§4). Единственный нормативный источник переходов по событиям (**только подписочные** события; consumable — §11.3, вне `subscriptions`):
 
 | `event_type` Adapty | `status` после | `access_level` | `grace_until` | `will_renew`/`expires_at` |
 |---|---|---|---|---|
@@ -189,27 +191,49 @@ Alembic data-migration сидит Free + Pro. Нормативные значе�
 
 ---
 
-## 11. Token-grant по тиру подписки ([ADR-027](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md))
+## 11. Token-grant подписок и consumable-паков ([ADR-027](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md) / [ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md))
 
-`subscription_started`/`subscription_renewed` (включая renewed/started в grace/billing_issue) **дополнительно** к апдейту `access_level`/`status` (§2.3 — существующий quota-gate сохраняется) начисляют пакет генераций в `bonus_generations_balance` по тиру `vendor_product_id`. **Кредиты дополняют, не заменяют** access_level-модель: плановая квота тратится первой (§5/§10.3), кредиты — сверх неё.
+Два класса начисления токенов в `bonus_generations_balance`, **общий write-path** (§11.2): подписочный (§11.1) и consumable-паки (§11.3). **Кредиты дополняют, не заменяют** access_level-модель: плановая квота тратится первой (§5/§10.3), кредиты — сверх неё.
 
-### 11.1 Тир-маппинг (env)
-`vendor_product_id` (дефенсив-извлечение, [02-api-contracts §1](02-api-contracts.md#body-дефенсивный-парсинг--поля-разбросаны-по-версиям-sdk-adr-027-c)) → число токенов:
+### 11.1 Тир-маппинг подписок (env) — токены = 0 ([ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md))
+`subscription_started`/`subscription_renewed` (включая renewed/started в grace/billing_issue) **дополнительно** к апдейту `access_level`/`status` (§2.3) резолвят токены подписки по тиру `vendor_product_id` (дефенсив-извлечение, [02-api-contracts §1](02-api-contracts.md#body-дефенсивный-парсинг--поля-разбросаны-по-версиям-sdk-adr-027-c)):
 
 | `vendor_product_id` | Токенов начисляется |
 |---|---|
-| `== SUBSCRIPTION_PRODUCT_WEEKLY` | `SUBSCRIPTION_TOKENS_WEEKLY` |
-| `== SUBSCRIPTION_PRODUCT_YEARLY` | `SUBSCRIPTION_TOKENS_YEARLY` |
-| иной (неизвестный SKU) | fallback `SUBSCRIPTION_TOKENS_GRANT` |
+| `== SUBSCRIPTION_PRODUCT_WEEKLY` | `SUBSCRIPTION_TOKENS_WEEKLY` (=`0`) |
+| `== SUBSCRIPTION_PRODUCT_YEARLY` | `SUBSCRIPTION_TOKENS_YEARLY` (=`0`) |
+| иной (неизвестный SKU) | fallback `SUBSCRIPTION_TOKENS_GRANT` (=`0`) |
 
-Нормативный env-контракт ключей (имена символ-в-символ, типы, потребитель) — [07-deployment → SUBSCRIPTION_* token-grant](../../07-deployment.md#adapty-webhook--token-grant-по-тиру-adr-027). product_id↔тир — внешняя зависимость дашборда Adapty (как access_level↔product, §9); backend сверяет `vendor_product_id` со значениями env, баланс — по тиру.
+**Нормативно ([ADR-038 §D](../../adr/ADR-038-adapty-consumable-token-packs.md)): подписка даёт 0 бонус-токенов** — все три значения = `0` (ценность подписки = `access_level=pro` + плановая квота 100 ген/мес по `plan_quotas`, не пакет кредитов). С учётом short-circuit `amount<=0` (§11.2) подписочный грант фактически no-op (строка `credit_grants` не пишется). `resolve_tier_tokens`/механизм не меняются — меняются только значения env/дефолтов. Реальные SKU (`week_6.99_not_trial`/`yearly_49.99_not_trial`) — операторская env `SUBSCRIPTION_PRODUCT_*`.
+
+Нормативный env-контракт ключей (имена символ-в-символ, типы, потребитель, дефолты) — [07-deployment → token-grant](../../07-deployment.md#adapty-webhook--token-grant-по-тиру-adr-027--adr-038). product_id↔тир — внешняя зависимость дашборда Adapty (как access_level↔product, §9).
 
 ### 11.2 Начисление и идемпотентность ([ADR-027 §E](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md))
-- Атомарный относительный `UPDATE users SET bonus_generations_balance = bonus_generations_balance + :tier_tokens` (та же механика, что admin `_apply_balance_delta` — §10.2) **в ТОЙ ЖЕ транзакции**, что insert `billing_events` (UNIQUE `adapty_event_id`), плюс запись `credit_grants(amount=tier_tokens, reason='adapty:<event_type>', idempotency_key=event_id, created_by='adapty')`.
-- **Дедуп — UNIQUE `billing_events.adapty_event_id`** (§2.2): повтор `event_id` → `200 duplicate`, начисление **не** повторяется. Партиальный UNIQUE `credit_grants(user_id, idempotency_key=event_id)` — вторая страховка от двойного начисления.
-- **Миграция не требуется:** `credit_grants.created_by` (default `'admin'`, теперь принимает `'adapty'`) и `credit_grants.idempotency_key` (партиальный UNIQUE) уже существуют ([03-data-model → credit_grants](../../03-data-model.md#credit_grants-бонус-генерации-adr-021), миграция `20260604_0001`). `created_by='adapty'` — новое значение существующей колонки.
+Общий write-path обоих классов начисления ([ADR-038 §C](../../adr/ADR-038-adapty-consumable-token-packs.md)).
+- **Единый примитив на оба класса.** Ledger-запись начисления — **одна** реализация (напр. `grant_tokens(session, *, user_id, event_id, event_type, amount)`), которой пользуются подписочный (§11.1, `amount = resolve_tier_tokens(...)`) и consumable (§11.3, `amount = resolve_consumable_tokens(...)`) пути. Существующий `grant_subscription_tokens` рефакторится на этот примитив + тонкий резолвер тира — write-path **не** дублируется ([ADR-038 §C](../../adr/ADR-038-adapty-consumable-token-packs.md)).
+- Атомарный относительный `UPDATE users SET bonus_generations_balance = bonus_generations_balance + :amount` (та же механика, что admin `_apply_balance_delta` — §10.2) **в ТОЙ ЖЕ транзакции**, что insert `billing_events` (UNIQUE `adapty_event_id`), плюс запись `credit_grants(amount, reason='adapty:<event_type>', idempotency_key=event_id, created_by='adapty')`.
+- **Short-circuit `amount <= 0` ([ADR-038 §C](../../adr/ADR-038-adapty-consumable-token-packs.md)):** резолвер вернул `0` (подписка с 0-токенами §11.1) — грант **не** пишется (нет строки `credit_grants`, нет balance-delta); `billing_events`/`subscriptions` фиксируются как обычно. Устраняет нулевые ledger-строки на каждый renew.
+- **Дедуп — UNIQUE `billing_events.adapty_event_id`** (§2.2): повтор `event_id` → `200 duplicate`, начисление **не** повторяется. Партиальный UNIQUE `credit_grants(user_id, idempotency_key=event_id)` — вторая страховка от двойного начисления. Для обоих классов.
+- **Миграция не требуется:** `credit_grants.created_by` (default `'admin'`, принимает `'adapty'`) и `credit_grants.idempotency_key` (партиальный UNIQUE) уже существуют ([03-data-model → credit_grants](../../03-data-model.md#credit_grants-бонус-генерации-adr-021), миграция `20260604_0001`).
 - Поскольку `bonus_generations_balance` не обнуляется помесячно (§10.1), token-grant **накопителен** между периодами; списание — на старте generation-джобы после исчерпания плановой квоты (§10.3), без изменений.
-- `subscription_cancelled`/`subscription_expired`/`subscription_refunded`/`billing_issue_detected` — **токены не трогают** (только started/renewed начисляют).
+- `subscription_cancelled`/`subscription_expired`/`subscription_refunded`/`billing_issue_detected` — **токены не трогают** (только started/renewed резолвят подписочный тир, §11.1).
+
+### 11.3 Consumable token-паки (`non_subscription_purchase`, [ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md))
+
+Разовая покупка токен-пака (consumable App Store через Adapty). Точное имя события — **`non_subscription_purchase`** (verified first-party: [Adapty webhook event types](https://adapty.io/docs/webhook-event-types-and-fields)), продукт в payload — `vendor_product_id`. **НЕ подписка:** обрабатывается отдельной веткой `process_webhook` (после общего user-lookup), **минуя `apply_webhook_event`** — `subscriptions`/`access_level` не трогаются (§2.3 note). Эффект — только начисление токенов через общий write-path §11.2.
+
+**Маппинг `vendor_product_id → tokens` (env `TOKEN_PACK_PRODUCTS`).** Механизм — один `str`-env: CSV пар `<vendor_product_id>:<amount>`, парс приложением в `dict[str,int]`. Правила парсинга (нормативно): split по `,`; каждая пара — по первому `:` → `(product_id, amount)`; trim; `amount → int`, `>= 0`; пустая строка → пустой маппинг; **fail-fast** на невалидной записи (нет `:`/нецелый/отрицательный `amount`) — приложение не стартует (typo не должен молча ронять начисление). Env-контракт (имя, тип, потребитель api+worker, x-app-env, дефолт, каноническое значение 5 паков) — [07-deployment → token-grant](../../07-deployment.md#adapty-webhook--token-grant-по-тиру-adr-027--adr-038). Выбор единой строки vs per-pack полей/JSON — [ADR-038 §B](../../adr/ADR-038-adapty-consumable-token-packs.md) (расширяемость каталога + стиль `NPM_REGISTRY_ALLOWLIST`).
+
+**Резолвер `resolve_consumable_tokens(vendor_product_id, settings) -> int | None`:** `vendor_product_id ∈ TOKEN_PACK_PRODUCTS` → amount; иначе `None`. **Без fallback-константы** (в отличие от `resolve_tier_tokens` §11.1) — ценность consumable = само число токенов, угадать нельзя.
+
+| Условие | Эффект |
+|---|---|
+| `vendor_product_id ∈ TOKEN_PACK_PRODUCTS`, amount>0 | грант `bonus_generations_balance += amount` (write-path §11.2, `reason='adapty:non_subscription_purchase'`), `billing_events processed_at=now`, `200 applied` |
+| `vendor_product_id` неизвестен / отсутствует | **токены не начисляются**; `billing_events processed_at=NULL` (не теряем, ручная реобработка после правки env), alert `billing_unknown_token_product`, `200 {"status":"ignored","reason":"unknown_token_product"}` |
+| повтор `event_id` | `200 duplicate`, без повторного начисления (UNIQUE `adapty_event_id`) |
+| `customer_user_id` не маппится | общая ветка §2.4 — `billing_events(user_id=NULL, processed_at=NULL)`, `200 ignored: missing_customer_user_id` |
+
+**Идемпотентность** — тот же механизм §11.2 (UNIQUE `adapty_event_id` + партиальный UNIQUE `credit_grants`), без нового. `non_subscription_purchase_refunded` — **вне scope** (не в `KNOWN_EVENT_TYPES` → `200 ignored: event_type`); clawback consumable-кредитов — [Q-BILLING-6](../../adr/ADR-038-adapty-consumable-token-packs.md#открытые-вопросы).
 
 ---
 

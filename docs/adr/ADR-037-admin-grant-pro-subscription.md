@@ -51,7 +51,7 @@
    - `started_at = now()` если ещё не задан (новая строка); существующий `started_at` (например от прежней реальной подписки) **сохраняется** — admin-grant не переписывает историю старта.
    - `synced_at = now()` — отметка свежести (приоритет над ресинком §3, как у вебхука) — **смягчает**, но не устраняет risk ресинка (§Consequences «Сосуществование»).
    - **Маркировка происхождения:** `store = "admin"`, `product_id = None`, `raw = {"source": "admin_grant", "granted_at": <iso>, "expires_at": <iso|null>}`. `store="admin"` отличает grant от реальной Adapty-строки (`app_store`) в аудите/диагностике. `adapty_transaction_id` не трогается.
-3. Коммит — на стороне `admin_service` (одна транзакция). Токены (`bonus_generations_balance`, `credit_grants`, `billing_events`) **не создаются** — это нормативное отличие от вебхука (§требование 2, [billing §11](../modules/billing/03-architecture.md#11-token-grant-по-тиру-подписки-adr-027)).
+3. Коммит — на стороне `admin_service` (одна транзакция). Токены (`bonus_generations_balance`, `credit_grants`, `billing_events`) **не создаются** — это нормативное отличие от вебхука (§требование 2, [billing §11](../modules/billing/03-architecture.md#11-token-grant-подписок-и-consumable-паков-adr-027--adr-038)).
 
 `admin_service.grant_subscription(session, *, user_id, duration_days, expires_at)`: резолв юзера (`get_user` → `404` если нет), вычисление `expires_at`, вызов `apply_admin_grant`, `commit`, структурный аудит-лог (§F), возврат снимка.
 

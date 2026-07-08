@@ -1,6 +1,6 @@
 # Модуль `billing`
 
-**Статус:** **реализован (Sprint 3.5)**; **ревизия приёма вебхука [ADR-027](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md) зафиксирована в docs — требует доработки кода** (Bearer вместо HMAC, always-200-on-bad-input, token-grant по тиру, `subscription_cancelled`). · **Владелец кода:** `app/billing`
+**Статус:** **реализован (Sprint 3.5)**; **ревизия приёма вебхука [ADR-027](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md) зафиксирована в docs — требует доработки кода** (Bearer вместо HMAC, always-200-on-bad-input, token-grant по тиру, `subscription_cancelled`); **consumable token-паки + подписки=0 [ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md) зафиксированы — требуют реализации кода** (`non_subscription_purchase`, `TOKEN_PACK_PRODUCTS`). · **Владелец кода:** `app/billing`
 
 Интеграция с Adapty: приём вебхуков, ресинк `getProfile`, маппинг тарифа → квоты, quota-gate, grace-teardown сайтов. Adapty — источник истины по правам ([ADR-004](../../adr/ADR-004-adapty-source-of-truth.md), [ADR-009](../../adr/ADR-009-billing-idempotency-resync-grace.md)).
 
@@ -13,6 +13,13 @@
 - [00-overview.md](00-overview.md) — scope, компоненты, граница S5
 - [03-architecture.md](03-architecture.md) — webhook handler + маппинг событий, ресинк (beat+lazy), entitlements/quota_gate, usage_counters, grace state-machine
 - [02-api-contracts.md](02-api-contracts.md) — `/billing/webhook/adapty`, `/billing/me`, quota-gate `402`
+
+## DoD (consumable token-паки — [ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md))
+- `non_subscription_purchase` в `KNOWN_EVENT_TYPES` + `CONSUMABLE_EVENT_TYPES`; отдельная ветка `process_webhook` (после user-lookup), **минуя `apply_webhook_event`** — `subscriptions`/`access_level` не трогаются.
+- `TOKEN_PACK_PRODUCTS` (env `str` CSV `product_id:amount`) парсится в `dict[str,int]`, fail-fast на невалиде; `resolve_consumable_tokens` → amount или `None` (без fallback).
+- Начисление через **общий** grant-примитив (§11.2): `credit_grants(created_by='adapty', reason='adapty:non_subscription_purchase', idempotency_key=event_id)` + relative UPDATE, short-circuit `amount<=0`; `grant_subscription_tokens` рефакторится на этот примитив (без дублирования).
+- Неизвестный `vendor_product_id` → `200 ignored:unknown_token_product`, `billing_events processed_at=NULL`, alert; повтор `event_id` → `200 duplicate` (без двойного начисления). Без миграции.
+- Подписки → 0 токенов: `SUBSCRIPTION_TOKENS_WEEKLY/YEARLY/GRANT` дефолт → `0`; `SUBSCRIPTION_PRODUCT_*` дефолт → реальные SKU. `non_subscription_purchase_refunded` не обрабатывается (Q-BILLING-6).
 
 ## DoD (ревизия приёма вебхука — [ADR-027](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md))
 - Bearer-авторизация вебхука (`ADAPTY_WEBHOOK_SECRET`, constant-time) до парсинга тела: `401` на невалид, `500` на пустой секрет; HMAC убран.
@@ -33,10 +40,13 @@
 
 ## Открытые пункты
 - [Q-BILLING-4](../../99-open-questions.md#q-billing-4) — open: при реальной интеграции Adapty верифицировать webhook signature-header/префикс и точную схему `getProfile` payload v2; обновить контракт-тест httpx-мока под живой sample. Не блокирует код S3.5; целевой — момент реальной интеграции / pre-prod.
+- [Q-BILLING-5](../../99-open-questions.md#q-billing-5) — сверка имени события отмены: официальный список Adapty содержит `subscription_renewal_cancelled`, код/ADR-027 используют `subscription_cancelled`. Верифицировать при интеграции (совместно с Q-BILLING-4); при расхождении — ревизия ADR-027, не ADR-038.
+- [Q-BILLING-6](../../99-open-questions.md#q-billing-6) — обработка `non_subscription_purchase_refunded` (clawback consumable-токенов): списание при возврате, разрешение отрицательного баланса на израсходованном паке. Вне scope ADR-038; не блокирует начисление паков.
 - [TD-009](../../100-known-tech-debt.md#td-009) — `billing.resync` без батча/LIMIT → Sprint 6 (scale): `.limit(BATCH)` + курсор по `synced_at ASC`.
 - **Связь с S4:** sandbox egress-policy не должна блокировать исходящий `getProfile` beat-воркера к Adapty — [05-security → «Граница egress-политики»](../../05-security.md#граница-egress-политики-build-sandbox-vs-application-процессы-требование-к-sprint-4), [Q-DEPLOY-1](../../99-open-questions.md#q-deploy-1).
 
 ## Changelog
+- 2026-07-08: **consumable token-паки + подписки=0 токенов** ([ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md)): новый класс события `non_subscription_purchase` (verified first-party Adapty; поле `vendor_product_id`) — отдельная ветка `webhook_handler`, НЕ трогает `subscriptions`/`access_level`, начисляет токены по маппингу `TOKEN_PACK_PRODUCTS` (env, CSV `product_id:amount`) через общий grant-примитив (§11.2, `credit_grants created_by='adapty'`, idempotency_key=event_id); неизвестный product_id → `200 ignored:unknown_token_product` (без угадывания, `processed_at=NULL`, alert). Подписки → **0 бонус-токенов** (`SUBSCRIPTION_TOKENS_*=0`, short-circuit `amount<=0`; только `access_level=pro`). `resolve_consumable_tokens` без fallback. Без миграции/новых полей БД; новый env `TOKEN_PACK_PRODUCTS` + дефолты `SUBSCRIPTION_*` → 0/реальные SKU. Обновлены 02/03 модуля, 06-testing, 07-deployment. **Код требует реализации** (backend: ветка consumable, `resolve_consumable_tokens`, парсер `TOKEN_PACK_PRODUCTS`, рефактор `grant_subscription_tokens`→общий примитив, дефолты config.py). Открыты Q-BILLING-5/6.
 - 2026-06-17: **admin-grant pro-подписки** ([ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md)): новый helper `subscription_state.apply_admin_grant` (переиспускает `_ensure_row`, ставит `access_level=pro`/`status=active`/`store='admin'`, токены НЕ начисляет) для `POST /v1/admin/users/{user_id}/subscription` ([admin §3.5](../admin/03-architecture.md#35-выдача-pro-подписки-adr-037)). Срок параметром (`duration_days`/`expires_at`/бессрочно `NULL`). Без миграции/env/зависимостей. Добавлен [§12](03-architecture.md#12-admin-grant-pro-подписки-adr-037); сосуществование с ресинком/энфорс срока — [Q-ADMIN-1](../../99-open-questions.md#q-admin-1). **Код требует реализации.**
 - 2026-06-09: **ревизия приёма вебхука** ([ADR-027](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md)): Bearer заменяет HMAC (constant-time, `401`/`500`), always-200-on-bad-input (5xx только на сбой БД), дефенсивный парсинг, новый `subscription_cancelled`, token-grant по тиру product_id (`SUBSCRIPTION_PRODUCT_*`/`SUBSCRIPTION_TOKENS_*`/fallback `SUBSCRIPTION_TOKENS_GRANT`) с идемпотентностью по `event_id` (одна транзакция с `billing_events`+`credit_grants created_by='adapty'`, без миграции). Обновлены 02/03 модуля, 05-security, 06-testing, 07-deployment. **Код требует доработки.**
 - 2026-06-02: создан bootstrap (architect).

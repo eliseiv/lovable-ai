@@ -9,8 +9,46 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+@lru_cache(maxsize=8)
+def parse_token_pack_products(raw: str) -> dict[str, int]:
+    """CSV `vendor_product_id:amount` → `dict[str,int]` (ADR-038 §B, billing §11.3).
+
+    Правила парсинга (нормативно docs/modules/billing/03-architecture.md §11.3): split по `,`;
+    каждая пара — по первому `:` → `(vendor_product_id, amount)`; trim пробелов; `amount → int`,
+    инвариант `amount >= 0`. Пустая строка (или только пробелы) → пустой маппинг (паки не
+    сконфигурированы). Пустые сегменты (напр. хвостовая запятая) пропускаются.
+
+    Fail-fast (ADR-038 §B): невалидная запись (нет `:`, пустой product_id, нецелый/
+    отрицательный amount) → `ValueError` → приложение не стартует. Молчаливый drop пака означал
+    бы «оплаченный пак не начислил токены», что хуже видимого сбоя деплоя. Кэшируется по сырой
+    строке (стабильна за время жизни процесса) — резолвер на горячем пути не переразбирает.
+    """
+    mapping: dict[str, int] = {}
+    if not raw or not raw.strip():
+        return mapping
+    for segment in raw.split(","):
+        entry = segment.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(f"Invalid TOKEN_PACK_PRODUCTS entry (missing ':'): {entry!r}")
+        product_id, _, amount_raw = entry.partition(":")
+        product_id = product_id.strip()
+        amount_raw = amount_raw.strip()
+        if not product_id:
+            raise ValueError(f"Invalid TOKEN_PACK_PRODUCTS entry (empty product_id): {entry!r}")
+        try:
+            amount = int(amount_raw)
+        except ValueError as exc:
+            raise ValueError(f"Invalid TOKEN_PACK_PRODUCTS amount (not an int): {entry!r}") from exc
+        if amount < 0:
+            raise ValueError(f"Invalid TOKEN_PACK_PRODUCTS amount (negative): {entry!r}")
+        mapping[product_id] = amount
+    return mapping
 
 
 class Settings(BaseSettings):
@@ -273,20 +311,35 @@ class Settings(BaseSettings):
     grace_period_days: int = Field(default=7)
     # Частота beat-sweeper'а grace-teardown сайтов (billing.subscription_sweep).
     subscription_sweep_interval_s: int = Field(default=3600)
-    # --- Token-grant по тиру подписки (ADR-027, docs/07-deployment.md) ---
+    # --- Token-grant по тиру подписки (ADR-027 · ADR-038 §D, docs/07-deployment.md) ---
     # SKU/vendor_product_id недельной подписки Adapty → токены SUBSCRIPTION_TOKENS_WEEKLY.
-    subscription_product_weekly: str = Field(default="lovable.pro.weekly")
-    # Число генераций (кредитов) при подписке тира SUBSCRIPTION_PRODUCT_WEEKLY.
+    # Реальный SKU (ADR-038 §D) — операторская env-настройка (внешняя зависимость дашборда
+    # Adapty), не хардкод логики.
+    subscription_product_weekly: str = Field(default="week_6.99_not_trial")
+    # Число бонус-токенов при подписке тира SUBSCRIPTION_PRODUCT_WEEKLY.
+    # Нормативно 0 (ADR-038 §D): подписка даёт только access_level=pro (плановая квота
+    # 100 ген/мес по plan_quotas), не пакет кредитов. С учётом short-circuit amount<=0
+    # (docs §11.2) подписочный грант фактически no-op (credit_grants не пишется).
     # ge=0 (ADR-027): защита от мисконфига оператора — отрицательное значение дало бы
     # rowcount=0 в _apply_balance_delta (инвариант balance>=0) → тихий рассинхрон
     # ledger↔balance (credit_grants записан, баланс не обновлён).
-    subscription_tokens_weekly: int = Field(default=30, ge=0)
+    subscription_tokens_weekly: int = Field(default=0, ge=0)
     # SKU/vendor_product_id годовой подписки Adapty → токены SUBSCRIPTION_TOKENS_YEARLY.
-    subscription_product_yearly: str = Field(default="lovable.pro.yearly")
-    # Число генераций (кредитов) при подписке тира SUBSCRIPTION_PRODUCT_YEARLY.
-    subscription_tokens_yearly: int = Field(default=2000, ge=0)
-    # Fallback-число генераций для неизвестного vendor_product_id (не WEEKLY/YEARLY).
-    subscription_tokens_grant: int = Field(default=30, ge=0)
+    subscription_product_yearly: str = Field(default="yearly_49.99_not_trial")
+    # Число бонус-токенов при подписке тира SUBSCRIPTION_PRODUCT_YEARLY. Нормативно 0 (см. WEEKLY).
+    subscription_tokens_yearly: int = Field(default=0, ge=0)
+    # Fallback-число бонус-токенов для неизвестного vendor_product_id (не WEEKLY/YEARLY).
+    # Нормативно 0 (ADR-038 §D): подписки токенов не дают.
+    subscription_tokens_grant: int = Field(default=0, ge=0)
+    # --- Consumable token-паки (ADR-038 §B, docs §11.3, 07-deployment env-контракт) ---
+    # Маппинг consumable-паков токенов: CSV пар <vendor_product_id>:<amount>, парсится
+    # приложением в dict[str,int] (parse_token_pack_products, стиль NPM_REGISTRY_ALLOWLIST).
+    # При non_subscription_purchase с vendor_product_id ∈ этого списка начисляется amount в
+    # bonus_generations_balance; неизвестный product_id → 200 ignored:unknown_token_product
+    # (не угадываем). Пусто (дефолт) → маппинг пуст (паки не сконфигурированы). Fail-fast на
+    # невалидной записи (см. _validate_token_pack_products). Потребитель api+worker.
+    # env TOKEN_PACK_PRODUCTS.
+    token_pack_products: str = Field(default="")
 
     # --- Sprint 4: build-sandbox runtime + egress (ADR-010, docs/07 env-контракт) ---
     # Имена/типы/дефолты — символ-в-символ с docs/07-deployment.md «Канонический список».
@@ -500,6 +553,26 @@ class Settings(BaseSettings):
         if self.llm_provider == "openai":
             return self.openai_api_key.get_secret_value()
         return self.anthropic_api_key.get_secret_value()
+
+    @model_validator(mode="after")
+    def _validate_token_pack_products(self) -> Settings:
+        """Fail-fast (ADR-038 §B): невалидный TOKEN_PACK_PRODUCTS → приложение не стартует.
+
+        Разбор выполняется при инстанцировании Settings — опечатка в паке (нет `:`, нецелый/
+        отрицательный amount) роняет старт видимо, а не молча ронять начисление оплаченного
+        пака в рантайме. Результат кэшируется (lru_cache по сырой строке) — token_pack_map()
+        на горячем пути не переразбирает.
+        """
+        parse_token_pack_products(self.token_pack_products)
+        return self
+
+    def token_pack_map(self) -> dict[str, int]:
+        """Распарсенный маппинг TOKEN_PACK_PRODUCTS (ADR-038 §B, docs §11.3).
+
+        `vendor_product_id → amount`. Fail-fast уже отработал на старте (_validate_token_pack_
+        products); здесь — кэшированное чтение. Возвращённый dict read-only (общий кэш).
+        """
+        return parse_token_pack_products(self.token_pack_products)
 
     @property
     def is_prod(self) -> bool:

@@ -30,6 +30,8 @@ EVENT_REFUNDED = "subscription_refunded"
 EVENT_BILLING_ISSUE = "billing_issue_detected"
 EVENT_ACCESS_LEVEL_UPDATED = "access_level_updated"
 EVENT_CANCELLED = "subscription_cancelled"
+# Consumable (разовая) покупка токен-пака (ADR-038 §A). Verified first-party Adapty event name.
+EVENT_NON_SUBSCRIPTION_PURCHASE = "non_subscription_purchase"
 
 # Известные event_type Adapty (docs §2.3). Неизвестный → 200 ignored (event_type).
 KNOWN_EVENT_TYPES: frozenset[str] = frozenset(
@@ -41,11 +43,17 @@ KNOWN_EVENT_TYPES: frozenset[str] = frozenset(
         EVENT_BILLING_ISSUE,
         EVENT_ACCESS_LEVEL_UPDATED,
         EVENT_CANCELLED,
+        EVENT_NON_SUBSCRIPTION_PURCHASE,
     }
 )
 
-# event_type → token-grant начисляется (docs §11.2: только started/renewed).
+# event_type → token-grant начисляется (docs §11.2: только started/renewed) — ПОДПИСОЧНЫЙ путь.
 TOKEN_GRANT_EVENT_TYPES: frozenset[str] = frozenset({EVENT_STARTED, EVENT_RENEWED})
+
+# Consumable-события (ADR-038 §A): отдельная ветка process_webhook, МИНУЯ apply_webhook_event
+# (subscriptions/access_level не трогаются) — только начисление токенов по vendor_product_id
+# (docs §11.3). НЕ входит в TOKEN_GRANT_EVENT_TYPES (то — подписочный путь).
+CONSUMABLE_EVENT_TYPES: frozenset[str] = frozenset({EVENT_NON_SUBSCRIPTION_PURCHASE})
 
 # Статусы subscriptions.status.
 STATUS_ACTIVE = "active"
@@ -231,13 +239,84 @@ def resolve_tier_tokens(vendor_product_id: str | None, settings: Settings) -> in
 
     `== SUBSCRIPTION_PRODUCT_WEEKLY` → `SUBSCRIPTION_TOKENS_WEEKLY`;
     `== SUBSCRIPTION_PRODUCT_YEARLY` → `SUBSCRIPTION_TOKENS_YEARLY`;
-    иной/неизвестный SKU → fallback `SUBSCRIPTION_TOKENS_GRANT` (начисление не теряется).
+    иной/неизвестный SKU → fallback `SUBSCRIPTION_TOKENS_GRANT`. Все три нормативно `0`
+    (ADR-038 §D) — подписка бонус-токенов не даёт; short-circuit `amount<=0` в grant_tokens
+    делает грант no-op.
     """
     if vendor_product_id and vendor_product_id == settings.subscription_product_weekly:
         return settings.subscription_tokens_weekly
     if vendor_product_id and vendor_product_id == settings.subscription_product_yearly:
         return settings.subscription_tokens_yearly
     return settings.subscription_tokens_grant
+
+
+def resolve_consumable_tokens(vendor_product_id: str | None, settings: Settings) -> int | None:
+    """Число токенов consumable-пака по vendor_product_id (docs §11.3, ADR-038 §C).
+
+    `vendor_product_id ∈ TOKEN_PACK_PRODUCTS` → его amount; иначе (неизвестный/отсутствует) →
+    `None`. **БЕЗ fallback-константы** (в отличие от resolve_tier_tokens §11.1): ценность
+    consumable = само число токенов, угадать нельзя — начислить произвольное число хуже, чем не
+    начислить (§11.3/E, неизвестный → ignored:unknown_token_product).
+    """
+    if not vendor_product_id:
+        return None
+    return settings.token_pack_map().get(vendor_product_id)
+
+
+async def grant_tokens(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    event_id: str,
+    event_type: str,
+    amount: int,
+) -> int:
+    """Общий примитив начисления токенов в bonus_generations_balance (ADR-038 §C, docs §11.2).
+
+    Единая ledger-реализация на ОБА класса начисления — подписочный (amount =
+    resolve_tier_tokens) и consumable (amount = resolve_consumable_tokens); write-path не
+    дублируется. Относительный атомарный UPDATE users.bonus_generations_balance += amount (та же
+    механика, что admin `_apply_balance_delta`) + insert credit_grants(reason='adapty:<event_
+    type>', idempotency_key=event_id, created_by='adapty') — БЕЗ commit (вызывающий коммитит в
+    ТОЙ ЖЕ транзакции, что insert billing_events).
+
+    Short-circuit `amount <= 0` (ADR-038 §C): грант НЕ пишется (нет строки credit_grants, нет
+    balance-delta) — устраняет нулевые ledger-строки (подписки нормативно дают 0 токенов, §11.1).
+
+    Дедуп начисления — UNIQUE billing_events.adapty_event_id (повтор event_id → 200 duplicate,
+    сюда не доходит) + партиальный UNIQUE credit_grants(user_id, idempotency_key=event_id) как
+    вторая страховка. Возвращает число фактически начисленных токенов (0 при short-circuit).
+    """
+    if amount <= 0:
+        # Подписка с 0-токенами (§11.1) или пак с amount=0 — мусорную нулевую строку не пишем.
+        return 0
+
+    # Лениво: избегаем импорт-цикла billing↔services и переиспользуем существующую механику
+    # относительного атомарного UPDATE (НЕ дублируем логику начисления, docs §11.2).
+    from app.services.admin_service import _apply_balance_delta
+
+    session.add(
+        CreditGrant(
+            id=new_credit_grant_id(),
+            user_id=user_id,
+            amount=amount,
+            reason=f"adapty:{event_type}",
+            idempotency_key=event_id,
+            created_by="adapty",
+        )
+    )
+    # amount > 0 (short-circuit выше), инвариант balance >= 0 не нарушается → None не ожидается.
+    await _apply_balance_delta(session, user_id, amount)
+    logger.info(
+        "billing_token_grant",
+        extra={
+            "user_id": user_id,
+            "event_id": event_id,
+            "event_type": event_type,
+            "amount": amount,
+        },
+    )
+    return amount
 
 
 async def grant_subscription_tokens(
@@ -248,44 +327,21 @@ async def grant_subscription_tokens(
     event_type: str,
     vendor_product_id: str | None,
 ) -> int:
-    """Начисляет пакет генераций по тиру подписки (ADR-027 §E, docs §11.2).
+    """Начисляет токены по тиру подписки (docs §11.1) через общий примитив grant_tokens (§11.2).
 
-    Относительный атомарный UPDATE users.bonus_generations_balance += tier_tokens (та же
-    механика, что admin `_apply_balance_delta`) + insert credit_grants(created_by='adapty',
-    idempotency_key=event_id) — БЕЗ commit (вызывающий коммитит в ТОЙ ЖЕ транзакции, что
-    insert billing_events). Дедуп начисления — UNIQUE billing_events.adapty_event_id (повтор
-    event_id → 200 duplicate, сюда не доходит) + партиальный UNIQUE credit_grants(user_id,
-    idempotency_key=event_id) как вторая страховка. Возвращает число начисленных токенов.
+    Тонкий резолвер тира (resolve_tier_tokens) поверх общего write-path — write-path НЕ
+    дублируется (ADR-038 §C). Нормативно тир-токены = 0 → grant_tokens short-circuit'ит (no-op).
+    Возвращает число начисленных токенов.
     """
-    # Лениво: избегаем импорт-цикла billing↔services и переиспользуем существующую механику
-    # относительного атомарного UPDATE (НЕ дублируем логику начисления, docs §11.2).
-    from app.services.admin_service import _apply_balance_delta
-
     settings = get_settings()
-    tier_tokens = resolve_tier_tokens(vendor_product_id, settings)
-
-    session.add(
-        CreditGrant(
-            id=new_credit_grant_id(),
-            user_id=user_id,
-            amount=tier_tokens,
-            reason=f"adapty:{event_type}",
-            idempotency_key=event_id,
-            created_by="adapty",
-        )
+    amount = resolve_tier_tokens(vendor_product_id, settings)
+    return await grant_tokens(
+        session,
+        user_id=user_id,
+        event_id=event_id,
+        event_type=event_type,
+        amount=amount,
     )
-    # tier_tokens >= 0 (env-конфиг), инвариант balance >= 0 не нарушается → None не ожидается.
-    await _apply_balance_delta(session, user_id, tier_tokens)
-    logger.info(
-        "billing_token_grant",
-        extra={
-            "user_id": user_id,
-            "event_id": event_id,
-            "vendor_product_id": vendor_product_id,
-            "tier_tokens": tier_tokens,
-        },
-    )
-    return tier_tokens
 
 
 def apply_profile_resync(sub: Subscription, profile: AdaptyProfile) -> None:

@@ -195,17 +195,32 @@ x-app-env: &app-env
   BILLING_RESYNC_INTERVAL_S: ${BILLING_RESYNC_INTERVAL_S:-3600}
   GRACE_PERIOD_DAYS: ${GRACE_PERIOD_DAYS:-7}
   SUBSCRIPTION_SWEEP_INTERVAL_S: ${SUBSCRIPTION_SWEEP_INTERVAL_S:-3600}
-  # ADR-027: token-grant по тиру подписки. Все пять — app-env (читаются Settings,
-  # потребитель both=api+worker) → ОБЯЗАНЫ быть здесь, иначе extra=ignore молча
-  # отдаст дефолт config.py (фичу нельзя сконфигурировать в проде). Дефолты
-  # символ-в-символ с docs/07 env-контрактом (стр. 92-96). PRODUCT_* — SKU-строки
-  # (vendor_product_id Adapty, внешняя зависимость дашборда); TOKENS_* — int-кредиты
-  # в bonus_generations_balance. GRANT — fallback для неизвестного SKU.
-  SUBSCRIPTION_PRODUCT_WEEKLY: ${SUBSCRIPTION_PRODUCT_WEEKLY:-lovable.pro.weekly}
-  SUBSCRIPTION_TOKENS_WEEKLY: ${SUBSCRIPTION_TOKENS_WEEKLY:-30}
-  SUBSCRIPTION_PRODUCT_YEARLY: ${SUBSCRIPTION_PRODUCT_YEARLY:-lovable.pro.yearly}
-  SUBSCRIPTION_TOKENS_YEARLY: ${SUBSCRIPTION_TOKENS_YEARLY:-2000}
-  SUBSCRIPTION_TOKENS_GRANT: ${SUBSCRIPTION_TOKENS_GRANT:-30}
+  # ADR-027 (token-grant по тиру подписки) · ADR-038 §D (подписки = 0 бонус-токенов).
+  # Все пять + TOKEN_PACK_PRODUCTS — app-env (читаются Settings, потребитель
+  # both=api+worker) → ОБЯЗАНЫ быть здесь, иначе extra=ignore молча отдаст дефолт
+  # config.py (.env-override инстанса игнорируется — фичу нельзя сконфигурировать).
+  # Дефолты символ-в-символ с docs/07 env-контрактом (стр. 104-109). PRODUCT_* —
+  # SKU-строки (vendor_product_id Adapty, внешняя зависимость дашборда) с реальными
+  # дефолтами (week_6.99_not_trial / yearly_49.99_not_trial); TOKENS_* — int-кредиты
+  # в bonus_generations_balance. ADR-038 §D: подписка даёт ТОЛЬКО access_level=pro
+  # (плановая квота 100 ген/мес), НЕ пакет кредитов → SUBSCRIPTION_TOKENS_* = 0
+  # (WEEKLY/YEARLY/GRANT); short-circuit amount<=0 не пишет ledger. GRANT — fallback
+  # для неизвестного SKU подписки.
+  SUBSCRIPTION_PRODUCT_WEEKLY: ${SUBSCRIPTION_PRODUCT_WEEKLY:-week_6.99_not_trial}
+  SUBSCRIPTION_TOKENS_WEEKLY: ${SUBSCRIPTION_TOKENS_WEEKLY:-0}
+  SUBSCRIPTION_PRODUCT_YEARLY: ${SUBSCRIPTION_PRODUCT_YEARLY:-yearly_49.99_not_trial}
+  SUBSCRIPTION_TOKENS_YEARLY: ${SUBSCRIPTION_TOKENS_YEARLY:-0}
+  SUBSCRIPTION_TOKENS_GRANT: ${SUBSCRIPTION_TOKENS_GRANT:-0}
+  # ADR-038 §B: consumable token-паки. CSV пар <vendor_product_id>:<amount>,
+  # приложение парсит в dict[str,int] (стиль NPM_REGISTRY_ALLOWLIST). При событии
+  # non_subscription_purchase с vendor_product_id ∈ списка начисляется amount в
+  # bonus_generations_balance. app-env both=api+worker → ОБЯЗАН быть здесь. Дефолт
+  # ПУСТ (docs/07 env-контракт стр. 109) → паки не сконфигурированы, каждый
+  # non_subscription_purchase → 200 ignored:unknown_token_product + alert
+  # billing_unknown_token_product (оплата без токенов). Реальные SKU — операторская
+  # настройка в .env инстанса (каноническое значение = 5 паков, см. .env.prod.example
+  # / docs/07 env-контракт). Fail-fast на невалидной записи маппинга.
+  TOKEN_PACK_PRODUCTS: ${TOKEN_PACK_PRODUCTS:-}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   BUILD_SANDBOX_RUNTIME: ${BUILD_SANDBOX_RUNTIME:-rootless}
   # PROD: build-контейнеры по-прежнему в изолированной egress-сети build-воркера

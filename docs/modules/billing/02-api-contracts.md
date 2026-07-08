@@ -29,7 +29,7 @@ Base: `https://api.domain/v1`. Все ошибки — RFC-7807 (`application/pr
 - `event_id` = `event_id || id`
 - `event_type` → `.lower()`
 - `customer_user_id` = `customer_user_id || profile.customer_user_id || user_id` (обязан = `user.id`, identity-контракт [ADR-027 §G](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md), [Q-BILLING-3](../../99-open-questions.md#q-billing-3))
-- `vendor_product_id` = `event_properties.vendor_product_id || event_properties.product_id || vendor_product_id || product_id` (тир-маппинг токенов, [03-arch §11](03-architecture.md#11-token-grant-по-тиру-подписки-adr-027))
+- `vendor_product_id` = `event_properties.vendor_product_id || event_properties.product_id || vendor_product_id || product_id` (тир-маппинг токенов, [03-arch §11.1](03-architecture.md#111-тир-маппинг-подписок-env--токены--0-adr-038))
 - `expires_at` (опц.) = `event_properties.expires_at || profile.expires_at`
 
 Полный сырой payload сохраняется в `billing_events.payload` (jsonb) и `subscriptions.raw`. `event_id` → `billing_events.adapty_event_id` (UNIQUE, идемпотентность).
@@ -39,13 +39,14 @@ Base: `https://api.domain/v1`. Все ошибки — RFC-7807 (`application/pr
 
 | `event_type` | Эффект на `subscriptions` |
 |---|---|
-| `subscription_started` / `subscription_renewed` | `status=active`, `access_level` из профиля, `expires_at`/`will_renew` из payload, `grace_until=NULL` **+ token-grant по тиру** ([03-arch §11](03-architecture.md#11-token-grant-по-тиру-подписки-adr-027)) |
+| `subscription_started` / `subscription_renewed` | `status=active`, `access_level` из профиля, `expires_at`/`will_renew` из payload, `grace_until=NULL` **+ token-grant по тиру** (=0, [03-arch §11.1](03-architecture.md#111-тир-маппинг-подписок-env--токены--0-adr-038)) |
 | `access_level_updated` (изменение уровня) | `access_level` ← новое значение; `status=active` если профиль активен |
 | `subscription_cancelled` ([ADR-027 §F](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md)) | подписка не продлится (`will_renew=false`), доступ по grace-семантике; **токены не трогаем** |
 | `subscription_expired` | `status=grace`, `grace_until = expires_at + GRACE_PERIOD_DAYS` (см. §6 grace сайтов); без начисления |
 | `subscription_refunded` | `status=grace`, `grace_until = now() + GRACE_PERIOD_DAYS` |
 | `billing_issue_detected` | `status=billing_issue` (на гейте трактуется как НЕ-активный, см. §4) |
 | `subscription_renewed` в состоянии `grace`/`billing_issue` | `status=active`, `grace_until=NULL` (отмена pending-teardown, [03-arch §6](03-architecture.md#6-grace-период-сайтов-q-billing-1)) |
+| `non_subscription_purchase` ([ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md)) | **разовая покупка токен-пака — НЕ подписка:** `subscriptions`/`access_level` не трогаются; начисление токенов по `vendor_product_id` (`TOKEN_PACK_PRODUCTS`, [03-arch §11.3](03-architecture.md#113-consumable-token-паки-non_subscription_purchase-adr-038)); неизвестный product_id → `ignored: unknown_token_product` |
 
 ### Коды ответов и always-200-on-bad-input ([ADR-027 §B](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md))
 **После успешной Bearer-авторизации НИКОГДА не возвращаем `5xx` на кривой ввод** (иначе Adapty ретраит бесконечно). `5xx` — только при реальном внутреннем сбое (БД).
@@ -60,6 +61,7 @@ Base: `https://api.domain/v1`. Все ошибки — RFC-7807 (`application/pr
 | нет `event_id` | `200` | `{"status":"ignored","reason":"missing_event_id"}` |
 | неизвестный `event_type` | `200` | `{"status":"ignored","event_type":"<type>"}` |
 | нет `customer_user_id` / юзер не найден (рассинхрон identity) | `200` | `{"status":"ignored","reason":"missing_customer_user_id"}` (+ событие в ledger `user_id=NULL` для ресинка) |
+| `non_subscription_purchase` с неизвестным `vendor_product_id` ([ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md)) | `200` | `{"status":"ignored","reason":"unknown_token_product"}` (+ событие в ledger `processed_at=NULL`, alert; токены не начисляются) |
 | валидное событие применено | `200` | `{"status":"applied",...}` |
 | повтор `event_id` (idempotent replay) | `200` | `{"status":"duplicate"}` |
 | реальный внутренний сбой (БД) | `5xx` | Adapty повторит; строка `billing_events` остаётся `processed_at IS NULL`, добивается ресинком |

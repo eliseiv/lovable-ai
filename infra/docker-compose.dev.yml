@@ -141,6 +141,27 @@ x-app-env: &app-env
   # Частота beat-sweeper'а grace-teardown сайтов (billing.subscription_sweep), секунды.
   # 3600 = 1 ч. Потребитель: worker/beat.
   SUBSCRIPTION_SWEEP_INTERVAL_S: "3600"
+  # --- ADR-027 (token-grant по тиру подписки) · ADR-038 §D (подписки = 0 бонус-
+  # токенов) / §B (consumable token-паки). Все шесть — app-env (потребитель
+  # both=api+worker) → ОБЯЗАНЫ быть в x-app-env, иначе extra=ignore молча отдаст
+  # дефолт config.py (.env-override инстанса игнорируется). Дефолты символ-в-символ
+  # с docs/07 env-контрактом (стр. 104-109). ADR-038 §D: подписка даёт ТОЛЬКО
+  # access_level=pro (плановая квота), НЕ пакет кредитов → SUBSCRIPTION_TOKENS_* = 0
+  # (short-circuit amount<=0 не пишет ledger). PRODUCT-дефолты = реальные SKU Adapty
+  # (внешняя зависимость дашборда). Параметризованы ${KEY:-default}, чтобы
+  # .env-override инстанса применялся. ---
+  SUBSCRIPTION_PRODUCT_WEEKLY: ${SUBSCRIPTION_PRODUCT_WEEKLY:-week_6.99_not_trial}
+  SUBSCRIPTION_TOKENS_WEEKLY: ${SUBSCRIPTION_TOKENS_WEEKLY:-0}
+  SUBSCRIPTION_PRODUCT_YEARLY: ${SUBSCRIPTION_PRODUCT_YEARLY:-yearly_49.99_not_trial}
+  SUBSCRIPTION_TOKENS_YEARLY: ${SUBSCRIPTION_TOKENS_YEARLY:-0}
+  SUBSCRIPTION_TOKENS_GRANT: ${SUBSCRIPTION_TOKENS_GRANT:-0}
+  # ADR-038 §B: consumable token-паки. CSV пар <vendor_product_id>:<amount> →
+  # dict[str,int] (стиль NPM_REGISTRY_ALLOWLIST). non_subscription_purchase с
+  # product_id ∈ списка → начисление amount в bonus_generations_balance. Дефолт ПУСТ
+  # (docs/07 стр. 109) → паки не сконфигурированы (200 ignored:unknown_token_product
+  # + alert billing_unknown_token_product). Реальные SKU — операторская настройка
+  # .env (каноническое значение = 5 паков, см. .env.example). Fail-fast на невалидной записи.
+  TOKEN_PACK_PRODUCTS: ${TOKEN_PACK_PRODUCTS:-}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   # Канонические имена и дефолты — docs/07-deployment.md → env-контракт (стр. 80-88).
   # Имена совпадают символ-в-символ с полями Settings (config.py). Поля Settings

@@ -393,8 +393,10 @@ async def test_renew_in_grace_returns_active_grace_null(client, session):
 
 
 async def test_token_grant_weekly(client, session):
+    """ADR-038 §D: подписка (weekly) = 0 бонус-токенов → short-circuit, credit_grants НЕ пишется."""
     user = await _user(session, "u_wh_grweekly0000001")
     settings = get_settings()
+    assert settings.subscription_tokens_weekly == 0  # нормативно 0 (ADR-038 §D)
     body = _body(
         "evt_grant_w",
         "subscription_started",
@@ -404,17 +406,15 @@ async def test_token_grant_weekly(client, session):
     resp = await _post(client, body)
     assert resp.status_code == 200
     assert resp.json()["status"] == "applied"
-    # bonus_generations_balance += SUBSCRIPTION_TOKENS_WEEKLY.
-    assert await _balance(session, user.id) == settings.subscription_tokens_weekly
-    # credit_grants(created_by='adapty', idempotency_key=event_id).
-    grant = (
-        await session.execute(
-            select(CreditGrant).where(CreditGrant.idempotency_key == "evt_grant_w")
-        )
-    ).scalar_one()
-    assert grant.created_by == "adapty"
-    assert grant.amount == settings.subscription_tokens_weekly
-    assert grant.user_id == user.id
+    # bonus_generations_balance не меняется (SUBSCRIPTION_TOKENS_WEEKLY=0).
+    assert await _balance(session, user.id) == 0
+    # Short-circuit amount<=0: credit_grants НЕ пишется (нет мусорной нулевой ledger-строки).
+    grant_count = await session.scalar(
+        select(func.count())
+        .select_from(CreditGrant)
+        .where(CreditGrant.idempotency_key == "evt_grant_w")
+    )
+    assert grant_count == 0
 
 
 async def test_token_grant_yearly(client, session):
@@ -513,7 +513,8 @@ async def test_duplicate_event_id_is_noop_200_no_double_grant(client, session):
         .select_from(CreditGrant)
         .where(CreditGrant.idempotency_key == "evt_dup_1")
     )
-    assert grant_count == 1  # второй credit_grants НЕ создан
+    # ADR-038 §D: подписка = 0 токенов → short-circuit, credit_grants не пишется вовсе.
+    assert grant_count == 0
     sub_count = await session.scalar(
         select(func.count()).select_from(Subscription).where(Subscription.user_id == user.id)
     )
