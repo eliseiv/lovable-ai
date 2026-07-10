@@ -2,6 +2,10 @@
 
 **Статус:** Accepted · **Дата:** 2026-06-09 · **Sprint:** 3.5 (ревизия)
 
+> **Частично ревизован [ADR-040](ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md) (2026-07-10, прод-фикс):** после сверки с first-party документацией Adapty **§C** (извлечение идентификатора `event_id || id`) заменён на `event_properties.profile_event_id`→synthetic; **§B** строка `missing_event_id` упразднена (ключ дедупа выводится всегда, тихий дроп денежного события устранён); **§F** имя `subscription_cancelled` исправлено на фактическое `subscription_renewal_cancelled`. Разделы §A/§D/§E/§G и принцип always-200 (§B) — **в силе**. Читать соответствующие места вместе с ADR-040.
+>
+> **Дополнительно ревизован [ADR-041](ADR-041-adapty-webhook-field-extraction-real-payload.md) (2026-07-10, тот же прод-инцидент, второй дефект):** **§C/§D** извлечение подписочных полей `access_level`/`expires_at`/`will_renew`/`customer_user_id` из несуществующих объектов `profile.*`/`subscription.*` заменено на фактические места (`event_properties.subscription_expires_at`/`.will_renew`/`.is_active`; `access_level`=`pro` константой платного тира для подписочных событий) + инвариант preserve-on-missing («вебхук не понижает права по недостающим данным»). Механика начисления/идемпотентности (§E) не меняется.
+
 Уточняет/ревизует приёмную часть [ADR-004](ADR-004-adapty-source-of-truth.md) и [ADR-009](ADR-009-billing-idempotency-resync-grace.md) (модель приёма вебхука `POST /v1/billing/webhook/adapty`) и **интегрирует** бонус-кредитную модель [ADR-021](ADR-021-admin-plane-and-bonus-credits.md) в поток подписок. **Не пересматривает** dual-source/ресинк/grace-teardown (ADR-009 §B/§C остаются в силе) и не меняет admin-плоскость начисления (ADR-021).
 
 ## Context
@@ -28,7 +32,7 @@
 | пустое тело | `200 {"status":"ignored","reason":"empty_body"}` |
 | не-JSON | `200 {"status":"ignored","reason":"invalid_json"}` |
 | JSON не объект | `200 {"status":"ignored","reason":"not_an_object"}` |
-| нет `event_id` (после дефенсив-извлечения) | `200 {"status":"ignored","reason":"missing_event_id"}` |
+| ~~нет `event_id` (после дефенсив-извлечения) → `200 {"status":"ignored","reason":"missing_event_id"}`~~ **(упразднено [ADR-040 §B](ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md): ключ дедупа выводится всегда)** |
 | неизвестный `event_type` | `200 {"status":"ignored","event_type":"<type>"}` |
 | нет `customer_user_id` (после дефенсив-извлечения) | `200 {"status":"ignored","reason":"missing_customer_user_id"}` |
 | `customer_user_id` не маппится на `user` (рассинхрон identity) | `200 {"status":"ignored","reason":"missing_customer_user_id"}` + событие в ledger (`user_id=NULL`) для ресинка |
@@ -38,14 +42,16 @@
 `5xx` — **только** при реальном внутреннем сбое (например, недоступность БД при коммите транзакции).
 
 ### C. Дефенсивный парсинг (поля разбросаны по версиям SDK)
-- `event_id` = `event_id || id`
+> **Ревизован [ADR-040 §A](ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)** (ключ дедупа) **и [ADR-041 §A](ADR-041-adapty-webhook-field-extraction-real-payload.md)** (подписочные поля): строка `event_id = event_id || id` неверна — в реальном payload Adapty нет верхнеуровневых `event_id`/`id`; ключ дедупа = `event_properties.profile_event_id`→synthetic. **Объектов `profile`/`subscription` в payload НЕТ** (сверено с first-party доке [ADR-041 §Источник](ADR-041-adapty-webhook-field-extraction-real-payload.md)) — цепочки, обращавшиеся к `profile.*`, удалены; фактические места полей ниже.
+- ~~`event_id` = `event_id || id`~~ → **[ADR-040 §A](ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md): `event_properties.profile_event_id` → `adapty-syn:{event_type}:{transaction_id}` → `adapty-syn:body:{sha256}`**
 - `event_type` → `.lower()`
-- `customer_user_id` = `customer_user_id || profile.customer_user_id || user_id`
+- `customer_user_id` = `customer_user_id || user_id` (**`profile.customer_user_id` удалён [ADR-041 §A](ADR-041-adapty-webhook-field-extraction-real-payload.md)** — объекта нет)
 - `vendor_product_id` = `event_properties.vendor_product_id || event_properties.product_id || vendor_product_id || product_id`
-- `expires_at` (опц.) = `event_properties.expires_at || profile.expires_at`
+- `expires_at` (опц.) = **`event_properties.subscription_expires_at || event_properties.expires_at`** (**`profile.expires_at` удалён [ADR-041 §A](ADR-041-adapty-webhook-field-extraction-real-payload.md)**; отсутствует → preserve, [ADR-041 §C](ADR-041-adapty-webhook-field-extraction-real-payload.md))
+- `access_level`/`will_renew`/`is_active` — фактические места и правило preserve-on-missing: **[ADR-041 §A/§B/§C](ADR-041-adapty-webhook-field-extraction-real-payload.md)** (`access_level` не читается из payload для подписочных событий — однотарифная модель ⇒ `pro`)
 
 ### D. Token-grant ДОПОЛНЯЕТ (не заменяет) access_level-модель
-- `subscription_started` / `subscription_renewed` → как раньше ставят `status=active`, `access_level` из профиля, `expires_at`/`will_renew` (ADR-009 §2.3 — существующий quota-gate сохраняется) **И** дополнительно начисляют генерации `bonus_generations_balance += tier_tokens` по тиру `vendor_product_id`.
+- `subscription_started` / `subscription_renewed` → как раньше ставят `status=active`, `access_level` **платного тира (`pro`, однотарифная модель — [ADR-041 §B](ADR-041-adapty-webhook-field-extraction-real-payload.md); ранее ошибочно «из профиля» — объекта `profile` в payload нет)**, `expires_at`=`event_properties.subscription_expires_at` / `will_renew` по семантике event_type ([ADR-041 §A](ADR-041-adapty-webhook-field-extraction-real-payload.md); ADR-009 §2.3 — существующий quota-gate сохраняется) **И** дополнительно начисляют генерации `bonus_generations_balance += tier_tokens` по тиру `vendor_product_id`.
 - Тир-маппинг (env, §07-deployment): `SUBSCRIPTION_PRODUCT_WEEKLY` → `SUBSCRIPTION_TOKENS_WEEKLY`; `SUBSCRIPTION_PRODUCT_YEARLY` → `SUBSCRIPTION_TOKENS_YEARLY`; неизвестный product_id → fallback `SUBSCRIPTION_TOKENS_GRANT`.
 - Существующая `access_level`/`plan_quotas`-модель остаётся неизменной. Кредиты — **сверх** плановой квоты (ADR-021 §модель), плановая квота тратится первой.
 
@@ -54,9 +60,10 @@
 - Повтор `event_id` отбивается UNIQUE `billing_events.adapty_event_id` (ADR-009 §A) → начисление **не** повторяется → `200 duplicate`. Дополнительный партиальный UNIQUE `credit_grants(user_id, idempotency_key)` — вторая страховка от двойного начисления.
 - **Миграция не требуется:** `credit_grants.created_by` (text NOT NULL default 'admin') и `credit_grants.idempotency_key` (партиальный UNIQUE) уже существуют ([03-data-model → credit_grants](../03-data-model.md#credit_grants-бонус-генерации-adr-021), миграция `20260604_0001`); `created_by='adapty'` — новое значение существующей колонки, не новая схема.
 
-### F. Новый event_type `subscription_cancelled`
+### F. event_type отмены автопродления `subscription_renewal_cancelled`
+> **Имя исправлено [ADR-040 §C](ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md):** `subscription_cancelled` у Adapty НЕ существует; фактическое имя — `subscription_renewal_cancelled`. Семантика перехода ниже — без изменений.
 - Семантика: подписка не продлится (`will_renew=false`), доступ — по существующей grace-семантике (как `subscription_expired`-ветка по модели access_level/status), **токены не трогаем**. `subscription_expired` — без начисления, существующая логика.
-- Нормативная таблица event_type→status ([modules/billing/03-architecture.md §2.3](../modules/billing/03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица)) дополняется строкой `subscription_cancelled`.
+- Нормативная таблица event_type→status ([modules/billing/03-architecture.md §2.3](../modules/billing/03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица)) содержит строку `subscription_renewal_cancelled`.
 
 ### G. Identity-контракт
 Adapty `customer_user_id` обязан **=** наш `user_id` (тот, что выдаёт register/login/Apple-вход). iOS вызывает `Adapty.identify(<этот id>)`. Несовпадение → вебхук не находит юзера → `200 ignored` (`missing_customer_user_id`), событие в ledger (`user_id=NULL`) для последующего ресинка/алерта, **НЕ** `5xx`. Это уточнение [Q-BILLING-3](../99-open-questions.md#q-billing-3) (identity-маппинг) под новую модель приёма.

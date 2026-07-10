@@ -98,6 +98,7 @@ TODO|FIXME|XXX|HACK|WIP|stub
 - Race conditions при конкурентных вызовах?
 - Exception handling — конкретные типы, не голый `except`?
 - Retry / circuit breaker для external HTTP?
+- **Тихий success-drop входящего события внешнего провайдера?** В обработчике webhook/callback проверь каждую ветку, которая отбрасывает входящее событие без обработки, но возвращает 2xx (`missing_<id>`, `not_an_object`, неизвестный `event_type`, дедуп-скип): она ОБЯЗАНА логировать причину структурированным логом (warning+, с id/типом события). Ветка, тихо возвращающая 2xx без лога, делает необработанное событие невидимым (провайдер трактует 2xx как доставку и не ретраит) → `severity: "major"` (`category: "observability"`), на денежном/биллинговом пути — обязательный `verdict: "rework"`.
 
 #### Если в diff есть миграция БД (DDL): применимость механизма на фактическом движке
 Открой `migrations/env.py` и установи реальный движок миграций (sync vs async/asyncpg). Проверь, что механизм миграции ДЕЙСТВИТЕЛЬНО применяет DDL на этом движке — не верь словам «вне транзакции» в коде/JSON, проверь совместимость самого механизма. Конкретно: `op.get_context().autocommit_block()` для non-transactional DDL (`ALTER TYPE ... ADD VALUE`, `CREATE INDEX CONCURRENTLY`) при async env.py (asyncpg через `run_sync`) НЕ применяет DDL — `alembic_version` коммитится, а схема не меняется (ложно-зелёный прод). Если механизм несовместим с фактическим движком — `severity: "critical"` (`category: "migration"`), `verdict: "rework"`: указать backend применить проверенно-совместимый с asyncpg паттерн из `docs/`. Также убедись, что backend в `follow_up_for_qa` потребовал проверить РЕАЛЬНОЕ применение DDL (для enum — `pg_enum`), а не только `alembic_version`; если нет — finding `major`.
@@ -177,6 +178,7 @@ TODO|FIXME|XXX|HACK|WIP|stub
 - [ ] Каждая ADR/«revision»-ссылка в коде сверена с `docs/adr/ADR-NNN-*.md` + `INDEX.md`: цитируемая ревизия/ADR реально существует, и код не противоречит нормативу docs (особенно `include_in_schema` / security-модель публичной surface). Фиктивная ссылка или незарегистрированный drift публичной схемы/security = `critical` (`docs_code_mismatch`)
 - [ ] Безопасность проверена (auth, секреты, TLS)
 - [ ] Отказоустойчивость проверена (idempotency, retry, N+1)
+- [ ] Обработчик webhook/callback внешнего провайдера: нет ветки с тихим success-drop (2xx без структурированного лога причины при отбрасывании события) — иначе `major`/`observability`, на денежном пути `rework`
 - [ ] Если в diff миграция БД: сверен фактический движок по `migrations/env.py`; механизм реально применяет DDL на нём (non-transactional DDL не через `autocommit_block()` при async/asyncpg — иначе `critical`); backend потребовал у qa проверку реального применения DDL (для enum — `pg_enum`)
 - [ ] Severity classification применён корректно (функциональный пробел = major)
 - [ ] JSON корректен

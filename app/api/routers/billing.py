@@ -116,8 +116,9 @@ async def adapty_webhook(
         )
 
     # process_webhook сам управляет транзакцией (insert ledger + apply + token-grant).
+    # raw_body передаётся для tier-3 хэша ключа дедупа (ADR-040 §A: adapty-syn:body:{sha256}).
     # WebhookProcessingError всплывает как 5xx (реальный сбой БД, Adapty retry) — НЕ ловим.
-    result = await process_webhook(session, payload)
+    result = await process_webhook(session, payload, raw_body)
     logger.info("billing_webhook_outcome", extra={"outcome": result.outcome.value})
     return _outcome_response(result)
 

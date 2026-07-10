@@ -14,34 +14,44 @@ Base: `https://api.domain/v1`. Все ошибки — RFC-7807 (`application/pr
 - `ADAPTY_WEBHOOK_SECRET` пуст/не задан → `500` с понятным текстом (мисконфигурация сервера).
 - **Авторизация ВСЕГДА выполняется до парсинга тела.** Реализация — [03-architecture §2](03-architecture.md#2-webhook-handler-post-v1billingwebhookadapty), threat-model — [05-security → Webhook forgery](../../05-security.md#threat-model-центр--build-sandbox).
 
-### Body (дефенсивный парсинг — поля разбросаны по версиям SDK, [ADR-027 §C](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md))
+### Body (дефенсивный парсинг — форма сверена с first-party доке Adapty, [ADR-040](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md) ревизует [ADR-027 §C](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md))
+
+> **Фактическая форма payload Adapty** (источник: <https://adapty.io/docs/webhook-event-types-and-fields>, сверка 2026-07-10): **НЕТ** верхнеуровневых `event_id`/`id`; ключ дедупа — **`profile_event_id` (UUID) ВНУТРИ `event_properties`**. Верхнеуровневые поля: `profile_id`, `customer_user_id`, `event_type`, `event_datetime`, `event_properties`, `email`, `idfv`/`idfa`/`advertising_id`, `play_store_purchase_token` и др. (полный список — [ADR-040 §Источник](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)). `event_properties` **варьируются по типу события** (`profile_event_id` не гарантирован для всех типов).
+
 ```json
-{ "event_id": "evt_...",
-  "event_type": "subscription_renewed",
+{ "profile_id": "…",
   "customer_user_id": "u_...",
-  "profile": { "access_level": "pro", "is_active": true },
-  "event_properties": { "vendor_product_id": "lovable.pro.yearly", "expires_at": "2026-07-02T00:00:00Z" },
-  "subscription": { "product_id": "lovable.pro.yearly", "store": "app_store",
-                    "expires_at": "2026-07-02T00:00:00Z", "will_renew": true,
-                    "transaction_id": "...", "started_at": "2026-06-02T00:00:00Z" } }
+  "event_type": "subscription_renewed",
+  "event_datetime": "2026-07-02T00:00:00Z",
+  "event_properties": { "profile_event_id": "550e8400-e29b-41d4-a716-446655440000",
+                        "vendor_product_id": "lovable.pro.yearly",
+                        "transaction_id": "…", "original_transaction_id": "…",
+                        "expires_at": "2026-07-02T00:00:00Z" } }
 ```
 Извлечение полей (первое непустое):
-- `event_id` = `event_id || id`
-- `event_type` → `.lower()`
-- `customer_user_id` = `customer_user_id || profile.customer_user_id || user_id` (обязан = `user.id`, identity-контракт [ADR-027 §G](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md), [Q-BILLING-3](../../99-open-questions.md#q-billing-3))
+- **Ключ дедупа** (→ `billing_events.adapty_event_id`, UNIQUE), резолюция по приоритету ([ADR-040 §A](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)):
+  1. `event_properties.profile_event_id` (канонический UUID);
+  2. `adapty-syn:{event_type}:{event_properties.transaction_id || event_properties.original_transaction_id}` (fallback, endorsed провайдером);
+  3. `adapty-syn:body:{sha256(raw_body)}` (последний резерв — гарантия «никогда не дропнуть тихо»).
+  Тир 2/3 (т.е. `profile_event_id` отсутствовал) → **WARN-диагностика** `reason=profile_event_id_absent` (§D). Ключ выводится **всегда** ⇒ ветки `missing_event_id` больше нет.
+- `event_type` (верхний уровень) → `.lower()`
+- `customer_user_id` (верхний уровень) = `customer_user_id || user_id` (**`profile.customer_user_id` удалён — объекта `profile` в payload нет, [ADR-041 §A](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)**; обязан = `user.id`, identity-контракт [ADR-027 §G](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md), [Q-BILLING-3](../../99-open-questions.md#q-billing-3))
 - `vendor_product_id` = `event_properties.vendor_product_id || event_properties.product_id || vendor_product_id || product_id` (тир-маппинг токенов, [03-arch §11.1](03-architecture.md#111-тир-маппинг-подписок-env--токены--0-adr-038))
-- `expires_at` (опц.) = `event_properties.expires_at || profile.expires_at`
+- **`expires_at`** (опц.) = `event_properties.subscription_expires_at || event_properties.expires_at` (**`profile.expires_at` удалён — объекта нет; `subscription_expires_at` для подписочных событий, `expires_at` для `access_level_updated`, [ADR-041 §A](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)**; отсутствует → preserve)
+- **`access_level`** — **не в payload подписочных событий**: `subscription_started/renewed` ⇒ `pro` (однотарифная модель, [ADR-041 §B](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)); `access_level_updated` — по `event_properties.is_active`/`is_in_grace_period`/`is_refund`
+- **`will_renew`** = `event_properties.will_renew` (для `access_level_updated`) → иначе по семантике `event_type` ([03-arch §2.3](03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица)); наличие `event_properties.cancellation_reason` ⇒ `false`
+- **Инвариант «вебхук не понижает права по недостающим данным»** (preserve-on-missing): отсутствующее поле сохраняет текущее значение в `subscriptions`, не затирает `access_level→free`/`expires_at→NULL`/`will_renew→false` ([ADR-041 §C](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)).
 
-Полный сырой payload сохраняется в `billing_events.payload` (jsonb) и `subscriptions.raw`. `event_id` → `billing_events.adapty_event_id` (UNIQUE, идемпотентность).
+Полный сырой payload сохраняется в `billing_events.payload` (jsonb) и `subscriptions.raw`. Упорядочивание событий — по `billing_events.received_at` (**наше** время приёма), не по `event_datetime` (рекомендация провайдера, [ADR-040 §A](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)).
 
 ### Маппинг `event_type` → `subscriptions.status`/`access_level`
 Нормативная таблица событий → перехода — [03-architecture §2.3](03-architecture.md#23-маппинг-event_type--subscriptions-нормативная-таблица). Кратко:
 
 | `event_type` | Эффект на `subscriptions` |
 |---|---|
-| `subscription_started` / `subscription_renewed` | `status=active`, `access_level` из профиля, `expires_at`/`will_renew` из payload, `grace_until=NULL` **+ token-grant по тиру** (=0, [03-arch §11.1](03-architecture.md#111-тир-маппинг-подписок-env--токены--0-adr-038)) |
-| `access_level_updated` (изменение уровня) | `access_level` ← новое значение; `status=active` если профиль активен |
-| `subscription_cancelled` ([ADR-027 §F](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md)) | подписка не продлится (`will_renew=false`), доступ по grace-семантике; **токены не трогаем** |
+| `subscription_started` / `subscription_renewed` | `status=active`, `access_level=pro` (константа платного тира, [ADR-041 §B](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)), `expires_at`=`event_properties.subscription_expires_at`, `will_renew=true`, `grace_until=NULL` **+ token-grant по тиру** (=0, [03-arch §11.1](03-architecture.md#111-тир-маппинг-подписок-env--токены--0-adr-038)) |
+| `access_level_updated` | по `event_properties.is_active`/`is_in_grace_period`/`is_refund`: `is_active=true`→`access_level=pro`,`status=active`(`grace` если `is_in_grace_period`); `is_refund=true`→`grace`; `is_active=false` (не refund) → `status` **не форсируется** (teardown по `subscription_expired`→grace→sweep, не обход grace); **`access_level` не понижается** (preserve, [ADR-041 §B/§C](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)) |
+| `subscription_renewal_cancelled` ([ADR-027 §F](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md), имя исправлено [ADR-040 §C](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)) | подписка не продлится (`will_renew=false`), доступ по grace-семантике; **токены не трогаем** |
 | `subscription_expired` | `status=grace`, `grace_until = expires_at + GRACE_PERIOD_DAYS` (см. §6 grace сайтов); без начисления |
 | `subscription_refunded` | `status=grace`, `grace_until = now() + GRACE_PERIOD_DAYS` |
 | `billing_issue_detected` | `status=billing_issue` (на гейте трактуется как НЕ-активный, см. §4) |
@@ -58,19 +68,19 @@ Base: `https://api.domain/v1`. Все ошибки — RFC-7807 (`application/pr
 | пустое тело | `200` | `{"status":"ignored","reason":"empty_body"}` |
 | не-JSON | `200` | `{"status":"ignored","reason":"invalid_json"}` |
 | JSON не объект | `200` | `{"status":"ignored","reason":"not_an_object"}` |
-| нет `event_id` | `200` | `{"status":"ignored","reason":"missing_event_id"}` |
-| неизвестный `event_type` | `200` | `{"status":"ignored","event_type":"<type>"}` |
+| осознанно игнорируемый известный `event_type` ([ADR-040 §C.3](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md): `trial_*`/`subscription_paused`/`subscription_deferred`/`subscription_renewal_reactivated`/`entered_grace_period`/`non_subscription_purchase_refunded`) | `200` | `{"status":"ignored","event_type":"<type>"}` + INFO `reason=unhandled_known_event`; `billing_events processed_at=NULL` |
+| неизвестный `event_type` (вне 18 фактических типов Adapty) | `200` | `{"status":"ignored","event_type":"<type>"}` + WARN `reason=unknown_event` |
 | нет `customer_user_id` / юзер не найден (рассинхрон identity) | `200` | `{"status":"ignored","reason":"missing_customer_user_id"}` (+ событие в ledger `user_id=NULL` для ресинка) |
 | `non_subscription_purchase` с неизвестным `vendor_product_id` ([ADR-038](../../adr/ADR-038-adapty-consumable-token-packs.md)) | `200` | `{"status":"ignored","reason":"unknown_token_product"}` (+ событие в ledger `processed_at=NULL`, alert; токены не начисляются) |
 | валидное событие применено | `200` | `{"status":"applied",...}` |
-| повтор `event_id` (idempotent replay) | `200` | `{"status":"duplicate"}` |
+| повтор ключа дедупа `profile_event_id`/synthetic (idempotent replay) | `200` | `{"status":"duplicate"}` |
 | реальный внутренний сбой (БД) | `5xx` | Adapty повторит; строка `billing_events` остаётся `processed_at IS NULL`, добивается ресинком |
 
 Response-схема: `{ "status": "applied"|"ignored"|"duplicate", "reason"?: string, "event_type"?: string }`.
 
 ### Идемпотентность и применение
-- `event_id` уже в `billing_events` → `200 duplicate` (idempotent replay) — начисление токенов **не** повторяется.
-- Новый `event_id` → insert `billing_events(processed_at=NULL)` → маппинг на `user` → апдейт `subscriptions` + (для started/renewed) token-grant — **в одной транзакции** → `processed_at=now()` → `200 applied`.
+- Ключ дедупа (`profile_event_id`/synthetic, [ADR-040 §A](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)) уже в `billing_events.adapty_event_id` → `200 duplicate` (idempotent replay) — начисление токенов **не** повторяется.
+- Новый ключ дедупа → insert `billing_events(processed_at=NULL)` → маппинг на `user` → апдейт `subscriptions` + (для started/renewed) token-grant — **в одной транзакции** → `processed_at=now()` → `200 applied`.
 - `customer_user_id` неизвестен/не маппится (рассинхрон identity) → `billing_events(user_id=NULL, processed_at=NULL)` для последующей обработки/алерта → `200 ignored` (`missing_customer_user_id`); не теряем событие ([Q-BILLING-3](../../99-open-questions.md#q-billing-3), [ADR-027 §G](../../adr/ADR-027-adapty-webhook-bearer-token-grant.md)).
 
 ---

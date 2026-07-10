@@ -22,38 +22,82 @@ from app.db.models import CreditGrant, Subscription
 
 logger = get_logger(__name__)
 
-# Adapty webhook v2 event types (docs/03-data-model.md → billing_events.event_type).
+# Adapty webhook event types (docs/03-data-model.md → billing_events.event_type). Полный
+# фактический перечень провайдера (18) сверен с first-party доке Adapty 2026-07-10
+# (ADR-040 §Источник факт №5). Три непересекающихся множества (объединение = 18, §C).
+
+# --- HANDLED_SUBSCRIPTION_EVENT_TYPES (7): драйвят state-machine subscriptions (§2.3) ---
 EVENT_STARTED = "subscription_started"
 EVENT_RENEWED = "subscription_renewed"
+# ADR-040 §C (факт №6): у Adapty НЕТ типа `subscription_cancelled` — реальное имя события
+# отмены автопродления — `subscription_renewal_cancelled`. Семантика перехода не меняется.
+EVENT_RENEWAL_CANCELLED = "subscription_renewal_cancelled"
 EVENT_EXPIRED = "subscription_expired"
 EVENT_REFUNDED = "subscription_refunded"
 EVENT_BILLING_ISSUE = "billing_issue_detected"
 EVENT_ACCESS_LEVEL_UPDATED = "access_level_updated"
-EVENT_CANCELLED = "subscription_cancelled"
-# Consumable (разовая) покупка токен-пака (ADR-038 §A). Verified first-party Adapty event name.
+
+# --- CONSUMABLE_EVENT_TYPES (1): consumable token-паки (ADR-038 §A) ---
+# Verified first-party Adapty event name.
 EVENT_NON_SUBSCRIPTION_PURCHASE = "non_subscription_purchase"
 
-# Известные event_type Adapty (docs §2.3). Неизвестный → 200 ignored (event_type).
-KNOWN_EVENT_TYPES: frozenset[str] = frozenset(
+# --- CONSCIOUSLY_IGNORED_EVENT_TYPES (10): известны провайдеру, но осознанный no-op (§C.3) ---
+EVENT_RENEWAL_REACTIVATED = "subscription_renewal_reactivated"
+EVENT_PAUSED = "subscription_paused"
+EVENT_DEFERRED = "subscription_deferred"
+EVENT_TRIAL_STARTED = "trial_started"
+EVENT_TRIAL_CONVERTED = "trial_converted"
+EVENT_TRIAL_RENEWAL_CANCELLED = "trial_renewal_cancelled"
+EVENT_TRIAL_RENEWAL_REACTIVATED = "trial_renewal_reactivated"
+EVENT_TRIAL_EXPIRED = "trial_expired"
+EVENT_ENTERED_GRACE_PERIOD = "entered_grace_period"
+EVENT_NON_SUBSCRIPTION_PURCHASE_REFUNDED = "non_subscription_purchase_refunded"
+
+# Драйвят state-machine subscriptions (§2.3): apply_webhook_event.
+HANDLED_SUBSCRIPTION_EVENT_TYPES: frozenset[str] = frozenset(
     {
         EVENT_STARTED,
         EVENT_RENEWED,
+        EVENT_RENEWAL_CANCELLED,
         EVENT_EXPIRED,
         EVENT_REFUNDED,
         EVENT_BILLING_ISSUE,
         EVENT_ACCESS_LEVEL_UPDATED,
-        EVENT_CANCELLED,
-        EVENT_NON_SUBSCRIPTION_PURCHASE,
     }
 )
-
-# event_type → token-grant начисляется (docs §11.2: только started/renewed) — ПОДПИСОЧНЫЙ путь.
-TOKEN_GRANT_EVENT_TYPES: frozenset[str] = frozenset({EVENT_STARTED, EVENT_RENEWED})
 
 # Consumable-события (ADR-038 §A): отдельная ветка process_webhook, МИНУЯ apply_webhook_event
 # (subscriptions/access_level не трогаются) — только начисление токенов по vendor_product_id
 # (docs §11.3). НЕ входит в TOKEN_GRANT_EVENT_TYPES (то — подписочный путь).
 CONSUMABLE_EVENT_TYPES: frozenset[str] = frozenset({EVENT_NON_SUBSCRIPTION_PURCHASE})
+
+# Осознанно игнорируемые известные типы (§C.3): персистятся в billing_events (processed_at=NULL),
+# денежных/state-эффектов не производят, 200 ignored:event_type + INFO unhandled_known_event.
+# Права по подписочным событиям реконсилятся getProfile-resync (§3); non_subscription_purchase_
+# refunded clawback — открытый Q-BILLING-6 (до него no-op с диагностикой).
+CONSCIOUSLY_IGNORED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        EVENT_RENEWAL_REACTIVATED,
+        EVENT_PAUSED,
+        EVENT_DEFERRED,
+        EVENT_TRIAL_STARTED,
+        EVENT_TRIAL_CONVERTED,
+        EVENT_TRIAL_RENEWAL_CANCELLED,
+        EVENT_TRIAL_RENEWAL_REACTIVATED,
+        EVENT_TRIAL_EXPIRED,
+        EVENT_ENTERED_GRACE_PERIOD,
+        EVENT_NON_SUBSCRIPTION_PURCHASE_REFUNDED,
+    }
+)
+
+# Известные event_type Adapty (§C: все 18 фактических типов = объединение трёх множеств).
+# Неизвестный (вне 18) → 200 ignored:event_type + WARN unknown_event.
+KNOWN_EVENT_TYPES: frozenset[str] = (
+    HANDLED_SUBSCRIPTION_EVENT_TYPES | CONSUMABLE_EVENT_TYPES | CONSCIOUSLY_IGNORED_EVENT_TYPES
+)
+
+# event_type → token-grant начисляется (docs §11.2: только started/renewed) — ПОДПИСОЧНЫЙ путь.
+TOKEN_GRANT_EVENT_TYPES: frozenset[str] = frozenset({EVENT_STARTED, EVENT_RENEWED})
 
 # Статусы subscriptions.status.
 STATUS_ACTIVE = "active"
@@ -114,81 +158,122 @@ async def apply_webhook_event(
     *,
     user_id: str,
     event_type: str,
-    profile: dict[str, Any],
-    subscription_payload: dict[str, Any],
+    event_properties: dict[str, Any],
     raw_payload: dict[str, Any],
 ) -> Subscription:
-    """Применяет событие вебхука к subscriptions по нормативной таблице (docs §2.3).
+    """Применяет событие вебхука к subscriptions по нормативной таблице (docs §2.3, ADR-041).
 
-    Коммит — на стороне вызывающего (одна транзакция с billing_events). synced_at
-    выставляется в now() — отметка свежести вебхук-состояния (приоритет над ресинком §3).
+    Field-extraction — из ФАКТИЧЕСКОЙ формы payload Adapty (ADR-041 §A, сверено с first-party
+    доке): в payload НЕТ объектов `profile`/`subscription` — подписочные поля лежат в
+    `event_properties`. Извлекаются:
+      - `expires_at` = `event_properties.subscription_expires_at` (подписочные) →
+        `event_properties.expires_at` (access_level_updated); отсутствует → preserve;
+      - `will_renew` = `event_properties.will_renew` (bool) → иначе по семантике event_type;
+      - `access_level` — НЕ читается из payload: подписочные started/renewed ⇒ константа `pro`
+        (однотарифная модель §9/§B); access_level_updated — по булевам
+        `event_properties.is_active`/`is_in_grace_period`/`is_refund`;
+      - `store` = `event_properties.store` (отсутствует → preserve).
+
+    Инвариант preserve-on-missing (ADR-041 §C): отсутствующее в payload поле СОХРАНЯЕТ текущее
+    значение — вебхук НИКОГДА не понижает `access_level→free` / `expires_at→NULL` /
+    `will_renew→false` из-за отсутствия поля. Понижение прав — только через `status`/sweep
+    (subscription_expired→grace, §6), не затиранием. На НОВОЙ строке (`_ensure_row`)
+    «предыдущего значения» нет ⇒ отсутствующее поле получает событийно-семантический дефолт
+    §2.3 (started/renewed ⇒ access_level=pro/will_renew=true/expires_at=NULL over-grant §C).
+
+    Коммит — на стороне вызывающего (одна транзакция с billing_events). synced_at выставляется
+    в now() — маркер свежести вебхук-состояния (приоритет над ресинком §3). Carve-out ADR-041
+    §G: на `access_level_updated{is_active=false}` (не refund) synced_at НЕ продвигается — событие
+    не делает teardown (§B) и не должно подавлять resync-backstop.
     """
     settings = get_settings()
     existing = await get_subscription(session, user_id)
     sub = _ensure_row(session, user_id, existing)
 
-    profile_access_level = profile.get("access_level")
-    profile_is_active = bool(profile.get("is_active", False))
-    expires_at = _parse_ts(subscription_payload.get("expires_at"))
-    started_at = _parse_ts(subscription_payload.get("started_at"))
+    props = event_properties if isinstance(event_properties, dict) else {}
+    # Срок подписки: subscription_expires_at (подписочные) → expires_at (access_level_updated).
+    expires_at = _parse_ts(props.get("subscription_expires_at") or props.get("expires_at"))
+    # will_renew — булев только в access_level_updated (факт №4); None ⇒ отсутствует (preserve).
+    will_renew_prop = props.get("will_renew")
+    store = props.get("store")
     grace_days = timedelta(days=settings.grace_period_days)
     now = datetime.now(UTC)
+    advance_synced_at = True
 
-    # Общие поля из payload (где применимо).
-    if subscription_payload.get("product_id"):
-        sub.product_id = subscription_payload["product_id"]
-    if subscription_payload.get("store"):
-        sub.store = subscription_payload["store"]
-    if subscription_payload.get("transaction_id"):
-        sub.adapty_transaction_id = subscription_payload["transaction_id"]
+    # store — из event_properties (ADR-041 §A); отсутствует → preserve.
+    if store:
+        sub.store = store
 
     if event_type in (EVENT_STARTED, EVENT_RENEWED):
-        # started/renewed → active; renew/start в grace/billing_issue → grace_until=NULL.
+        # started/renewed → active + access_level='pro' КОНСТАНТОЙ платного тира (ADR-041 §B —
+        # ключевой фикс: access_level_id из payload НЕ требуется). renew/start в grace/
+        # billing_issue → grace_until=NULL (отмена pending-teardown §6). expires_at из
+        # event_properties.subscription_expires_at (отсутствует → preserve, §C).
         sub.status = STATUS_ACTIVE
-        if profile_access_level:
-            sub.access_level = profile_access_level
+        sub.access_level = "pro"
         sub.grace_until = None
         if expires_at is not None:
             sub.expires_at = expires_at
-        if started_at is not None:
-            sub.started_at = started_at
-        sub.will_renew = bool(subscription_payload.get("will_renew", True))
+        sub.will_renew = bool(will_renew_prop) if will_renew_prop is not None else True
     elif event_type == EVENT_ACCESS_LEVEL_UPDATED:
-        # Новый уровень из профиля; status=active если профиль активен.
-        if profile_access_level:
-            sub.access_level = profile_access_level
-        if profile_is_active:
-            sub.status = STATUS_ACTIVE
+        # Решение по документированным булевам event_properties (ADR-041 §B), НЕ по имени уровня.
+        is_active = bool(props.get("is_active", False))
+        is_in_grace = bool(props.get("is_in_grace_period", False))
+        is_refund = bool(props.get("is_refund", False))
+        if is_refund:
+            # refund → grace (как subscription_refunded §2.3); access_level НЕ понижается (§C).
+            sub.status = STATUS_GRACE
+            sub.grace_until = now + grace_days
+        elif is_active:
+            # активные права → pro; grace при is_in_grace_period, иначе active; grace_until=NULL.
+            sub.access_level = "pro"
+            sub.status = STATUS_GRACE if is_in_grace else STATUS_ACTIVE
             sub.grace_until = None
+        else:
+            # is_active=false (не refund): status НЕ форсируется в expired (иначе обход grace §6),
+            # access_level НЕ затирается в free (preserve §B/§C) — teardown по subscription_expired
+            # →grace→sweep. Carve-out §G: synced_at НЕ продвигается (не подавлять resync-backstop).
+            advance_synced_at = False
+        # expires_at/will_renew фиксируются из event_properties при наличии (иначе preserve).
+        if expires_at is not None:
+            sub.expires_at = expires_at
+        if will_renew_prop is not None:
+            sub.will_renew = bool(will_renew_prop)
     elif event_type == EVENT_EXPIRED:
-        # expired → grace, grace_until = expires_at + GRACE_PERIOD_DAYS. access_level
-        # сохраняется (grace проходит гейт §4). will_renew=false.
+        # expired → grace, grace_until = subscription_expires_at + GRACE_PERIOD_DAYS (отсутствует
+        # → now() + GRACE_PERIOD_DAYS, §C). access_level сохраняется (grace проходит гейт §4).
         sub.status = STATUS_GRACE
-        base = expires_at or sub.expires_at or now
+        base = expires_at or now
         sub.grace_until = base + grace_days
         sub.will_renew = False
     elif event_type == EVENT_REFUNDED:
-        # refunded → grace, grace_until = now() + GRACE_PERIOD_DAYS.
+        # refunded → grace, grace_until = now() + GRACE_PERIOD_DAYS. access_level preserve (§C).
         sub.status = STATUS_GRACE
         sub.grace_until = now + grace_days
         sub.will_renew = False
     elif event_type == EVENT_BILLING_ISSUE:
-        # billing_issue → НЕ-активный на гейте (§4). grace_until=NULL.
+        # billing_issue → НЕ-активный на гейте (§4). grace_until=NULL. access_level preserve (§C).
+        # will_renew — из event_properties при наличии, иначе preserve (§2.3).
         sub.status = STATUS_BILLING_ISSUE
         sub.grace_until = None
-        sub.will_renew = bool(subscription_payload.get("will_renew", sub.will_renew))
-    elif event_type == EVENT_CANCELLED:
-        # cancelled (ADR-027 §F): «не продлится» — will_renew=false. status/access_level/
-        # grace_until НЕ меняем (teardown позже по subscription_expired). Токены не трогаем.
+        if will_renew_prop is not None:
+            sub.will_renew = bool(will_renew_prop)
+    elif event_type == EVENT_RENEWAL_CANCELLED:
+        # renewal_cancelled (ADR-027 §F, имя исправлено ADR-040 §C; ранее ошибочно
+        # subscription_cancelled — такого типа у Adapty нет): «не продлится» — will_renew=false.
+        # status/access_level/grace_until НЕ меняем (teardown позже по subscription_expired).
+        # Токены не трогаем.
         sub.will_renew = False
     else:
-        # Неизвестный event_type: не меняем status, фиксируем raw (для аудита/алерта).
+        # Неизвестный event_type (недостижимо: в apply_webhook_event попадают только
+        # HANDLED_SUBSCRIPTION_EVENT_TYPES). Дефенсивно: не меняем status, фиксируем raw.
         logger.warning(
             "billing_unknown_event_type", extra={"event_type": event_type, "user_id": user_id}
         )
 
     sub.raw = raw_payload
-    sub.synced_at = now
+    if advance_synced_at:
+        sub.synced_at = now
     return sub
 
 

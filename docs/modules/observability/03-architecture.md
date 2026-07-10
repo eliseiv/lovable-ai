@@ -118,7 +118,8 @@
 |---|---|---|---|---|
 | `lovable_quota_rejected_total` | Counter | `reason` (`no_entitlement`/`quota_exhausted`/`project_limit`/`concurrency_limit`/`edit_quota_exhausted`) | отказы `402` quota-gate по reason | [billing §4](../billing/03-architecture.md#4-entitlements--quota-gate) |
 | `lovable_concurrency_block_by_kind_total` | Counter | `blocked_kind` (`generation`/`edit`/`rollback`), `holder_kind` (`generation`/`edit`/`rollback`) | отказ старта из-за занятого слота `max_concurrent_jobs`, с разбивкой «какой kind заблокирован каким kind» ([TD-012](../../100-known-tech-debt.md#td-012) — закрытие наблюдаемостью) | [billing §4.3](../billing/03-architecture.md#4-entitlements--quota-gate), [TD-012](../../100-known-tech-debt.md#td-012) |
-| `lovable_adapty_resync_lag_seconds` | Gauge | — | максимальный возраст `subscriptions.synced_at` среди протухших (отставание ресинка) | [billing §3.1](../billing/03-architecture.md#31-периодический-celery-beat-billingresync) |
+| `lovable_adapty_resync_lag_seconds` | Gauge | — | максимальный возраст `subscriptions.synced_at` среди протухших (отставание ресинка; при невалидном `ADAPTY_API_KEY`/`401` растёт монотонно — сигнал ops, [ADR-041 §D](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)) | [billing §3.1](../billing/03-architecture.md#31-периодический-celery-beat-billingresync) |
+| `lovable_billing_webhook_dropped_total` | Counter | `reason` (`profile_event_id_absent`/`unknown_event`/`unhandled_known_event`/`missing_customer_user_id`/`unknown_token_product`), `event_type` (категория Adapty) | вебхук-события, не приведшие к штатной обработке или потребовавшие fallback/диагностики ([ADR-040 §D](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)/[ADR-041 §E](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)); низкокардинальные лейблы; `reason="unknown_token_product"` покрывает прежний consumable-alert `billing_unknown_token_product` | [billing §2.5](../billing/03-architecture.md#25-known_event_types-и-наблюдаемость-отброшенных-событий-adr-040-cd), [billing §11.3](../billing/03-architecture.md#113-consumable-token-паки-non_subscription_purchase-adr-038) |
 | `lovable_rate_limit_rejected_total` | Counter | `scope` (`api_key`/`apple_login_ip`) | отказы `429` token-bucket rate-limit (60/min) | [auth §5](../auth/03-architecture.md) |
 
 ## 3. Grafana дашборды
@@ -132,7 +133,7 @@
 | **SSE / realtime** | `sse-realtime.json` | `lovable_sse_streams_open` (sum по репликам), `lovable_sse_rejected_total` (429-rate), `lovable_sse_stream_duration_seconds`, `lovable_sse_heartbeat_catchup_total` | нагрузка realtime, исчерпание `SSE_MAX_STREAMS_PER_KEY` |
 | **APNs** | `apns.json` | `lovable_apns_push_total` (по `result`/`apns_status`), `lovable_apns_tokens_invalidated_total`, `lovable_apns_request_latency_seconds` | здоровье push (drop/retry/invalidate по Apple-кодам) |
 | **Build-ферма** | `build-farm.json` | `lovable_queue_depth{queue="build"}`, `lovable_worker_busy{queue="build"}`, `lovable_build_duration_seconds`, `lovable_redeploy_duration_seconds`, `lovable_dist_artifact_source_total`, `lovable_project_gc_pending`/`_duration` | utilization build-хостов, gc-lag, cache-hit re-deploy |
-| **Billing / quota** | `billing-quota.json` | `lovable_quota_rejected_total` (по reason), `lovable_concurrency_block_by_kind_total`, `lovable_adapty_resync_lag_seconds`, `lovable_billing_resync_batch`, `lovable_rate_limit_rejected_total` | 402/429-rate, concurrency-блокировки ([TD-012](../../100-known-tech-debt.md#td-012)), resync-lag ([TD-009](../../100-known-tech-debt.md#td-009)) |
+| **Billing / quota** | `billing-quota.json` | `lovable_quota_rejected_total` (по reason), `lovable_concurrency_block_by_kind_total`, `lovable_adapty_resync_lag_seconds`, `lovable_billing_resync_batch`, `lovable_billing_webhook_dropped_total` (по `reason`/`event_type`), `lovable_rate_limit_rejected_total` | 402/429-rate, concurrency-блокировки ([TD-012](../../100-known-tech-debt.md#td-012)), resync-lag ([TD-009](../../100-known-tech-debt.md#td-009)), дропы/диагностика вебхука ([ADR-041 §E](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)) |
 
 **Provisioning (нормативно, конфиг-артефакт):**
 - `infra/grafana/provisioning/datasources/*.yml` — Prometheus + Postgres datasources (URL/креды из env, не хардкод).
@@ -144,7 +145,8 @@
 - `project_gc_pending > 0` дольше порога → gc-lag ([TD-010](../../100-known-tech-debt.md#td-010)).
 - `lovable_job_cost_usd` p95 приближается к `JOB_BUDGET_USD` → budget-burn ([TD-006](../../100-known-tech-debt.md#td-006)).
 - `lovable_queue_depth{queue="build"}` устойчиво растёт → нужен ручной scale build-хостов ([ADR-016](../../adr/ADR-016-scale-topology-redis-pool.md)).
-- `lovable_adapty_resync_lag_seconds` выше `2×BILLING_RESYNC_INTERVAL_S` → resync отстаёт ([TD-009](../../100-known-tech-debt.md#td-009)).
+- `lovable_adapty_resync_lag_seconds` выше `2×BILLING_RESYNC_INTERVAL_S` → resync отстаёт ([TD-009](../../100-known-tech-debt.md#td-009); монотонный рост при невалидном `ADAPTY_API_KEY`/`401` — сигнал ops, [ADR-041 §D](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)/[Q-BILLING-10](../../99-open-questions.md#q-billing-10)).
+- `lovable_billing_webhook_dropped_total{reason=~"profile_event_id_absent|unknown_event"}` ненулевая скорость → рассинхрон со схемой провайдера / потерянные денежные события ([ADR-040 §D](../../adr/ADR-040-adapty-webhook-dedup-key-event-type-reconciliation.md)/[ADR-041 §E](../../adr/ADR-041-adapty-webhook-field-extraction-real-payload.md)); `reason="unknown_token_product"` → забытый/рассинхронизированный `TOKEN_PACK_PRODUCTS` (прежний alert `billing_unknown_token_product`).
 
 ## 4. Sentry
 
