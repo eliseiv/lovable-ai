@@ -140,7 +140,7 @@ async def get_user_quota(
     "/users/{user_id}/subscription/legacy",
     response_model=AdminUserResponse,
     status_code=status.HTTP_200_OK,
-    summary="Выдать pro-подписку (legacy ADR-037, duration_days/expires_at)",
+    summary="Выдать pro-подписку (legacy, duration_days/expires_at)",
     responses=problem_responses(401, 403, 404, 422),
 )
 async def grant_subscription_legacy(
