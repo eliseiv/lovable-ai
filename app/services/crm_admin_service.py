@@ -145,23 +145,31 @@ def _payment_title(event_type: str, product_id: str | None) -> str:
 
 async def _payment_agg_for_user(session: AsyncSession, user_id: str) -> _UserPaymentAgg:
     events = (
-        await session.execute(
-            select(BillingEvent)
-            .where(
-                BillingEvent.user_id == user_id,
-                BillingEvent.event_type.in_(tuple(_PAYMENT_SUCCESS_EVENTS)),
-                BillingEvent.processed_at.is_not(None),
+        (
+            await session.execute(
+                select(BillingEvent)
+                .where(
+                    BillingEvent.user_id == user_id,
+                    BillingEvent.event_type.in_(tuple(_PAYMENT_SUCCESS_EVENTS)),
+                    BillingEvent.processed_at.is_not(None),
+                )
+                .order_by(BillingEvent.received_at.desc())
             )
-            .order_by(BillingEvent.received_at.desc())
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     store_rows = (
-        await session.execute(
-            select(StoreTransaction)
-            .where(StoreTransaction.user_id == user_id)
-            .order_by(StoreTransaction.created_at.desc())
+        (
+            await session.execute(
+                select(StoreTransaction)
+                .where(StoreTransaction.user_id == user_id)
+                .order_by(StoreTransaction.created_at.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     payments_count = len(events) + len(store_rows)
     renewals_count = sum(1 for e in events if e.event_type in _RENEWAL_EVENTS)
@@ -356,23 +364,31 @@ async def list_payments(
         raise not_found("User not found.")
 
     events = (
-        await session.execute(
-            select(BillingEvent)
-            .where(
-                BillingEvent.user_id == user_id,
-                BillingEvent.event_type.in_(tuple(_PAYMENT_SUCCESS_EVENTS)),
-                BillingEvent.processed_at.is_not(None),
+        (
+            await session.execute(
+                select(BillingEvent)
+                .where(
+                    BillingEvent.user_id == user_id,
+                    BillingEvent.event_type.in_(tuple(_PAYMENT_SUCCESS_EVENTS)),
+                    BillingEvent.processed_at.is_not(None),
+                )
+                .order_by(BillingEvent.received_at.desc())
             )
-            .order_by(BillingEvent.received_at.desc())
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     store_rows = (
-        await session.execute(
-            select(StoreTransaction)
-            .where(StoreTransaction.user_id == user_id)
-            .order_by(StoreTransaction.created_at.desc())
+        (
+            await session.execute(
+                select(StoreTransaction)
+                .where(StoreTransaction.user_id == user_id)
+                .order_by(StoreTransaction.created_at.desc())
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     items: list[CrmPaymentItem] = []
     for event in events:
