@@ -611,10 +611,7 @@ async def grant_subscription_crm(
         base = sub.expires_at
     expires_at = base + timedelta(days=expires_in_days)
 
-    await apply_admin_grant(session, user_id=user_id, expires_at=expires_at)
-    updated_sub = (
-        await session.execute(select(Subscription).where(Subscription.user_id == user_id))
-    ).scalar_one()
+    updated_sub = await apply_admin_grant(session, user_id=user_id, expires_at=expires_at)
     updated_sub.product_id = product_id
     raw = dict(updated_sub.raw) if isinstance(updated_sub.raw, dict) else {}
     crm_grants = dict(_crm_grants_map(updated_sub))
