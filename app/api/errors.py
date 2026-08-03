@@ -134,6 +134,16 @@ def unauthorized(detail: str = "Invalid or missing API key.") -> ProblemExceptio
     )
 
 
+def forbidden(detail: str = "Missing X-Admin-Key header.") -> ProblemException:
+    return ProblemException(status=403, title="Forbidden", detail=detail, problem_type="forbidden")
+
+
+def bad_request(detail: str) -> ProblemException:
+    return ProblemException(
+        status=400, title="Bad Request", detail=detail, problem_type="bad-request"
+    )
+
+
 def not_found(detail: str = "Resource not found.") -> ProblemException:
     return ProblemException(status=404, title="Not Found", detail=detail, problem_type="not-found")
 

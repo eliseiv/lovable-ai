@@ -24,6 +24,12 @@ async def healthz() -> HealthResponse:
     return HealthResponse(status="ok")
 
 
+@router.get("/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    """Alias для CRM-мониторинга (broad-crm проверяет GET /health)."""
+    return HealthResponse(status="ok")
+
+
 @router.get("/readyz")
 async def readyz(session: SessionDep) -> JSONResponse:
     settings = get_settings()

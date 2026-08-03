@@ -15,7 +15,7 @@ from fastapi import Depends, Header, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.errors import too_many_requests, unauthorized
+from app.api.errors import forbidden, too_many_requests, unauthorized
 from app.auth import token_service
 from app.auth.rate_limit import check_key_rate_limit
 from app.core.config import get_settings
@@ -128,9 +128,12 @@ async def require_admin(
     settings = get_settings()
     configured = settings.admin_api_key
     provided = x_admin_key or ""
-    # Пустой/None ключ или пустой заголовок → плоскость отключена/невалидно → 401.
     secret = configured.get_secret_value() if configured is not None else ""
-    if not secret or not hmac.compare_digest(provided, secret):
+    if not secret:
+        raise unauthorized("Invalid or missing admin credentials.")
+    if not provided:
+        raise forbidden("Missing X-Admin-Key header.")
+    if not hmac.compare_digest(provided, secret):
         raise unauthorized("Invalid or missing admin credentials.")
 
 

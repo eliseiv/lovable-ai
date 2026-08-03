@@ -38,18 +38,18 @@ async def test_invalid_admin_key_401() -> None:
     assert exc.value.problem_type == "unauthorized"
 
 
-async def test_empty_admin_key_header_401() -> None:
-    """Пустая строка в заголовке → 401."""
+async def test_empty_admin_key_header_403() -> None:
+    """Пустая строка в заголовке → 403 (CRM контракт)."""
     with pytest.raises(ProblemException) as exc:
         await require_admin(x_admin_key="")
-    assert exc.value.status == 401
+    assert exc.value.status == 403
 
 
-async def test_missing_admin_key_header_401() -> None:
-    """Отсутствующий заголовок (None) → 401."""
+async def test_missing_admin_key_header_403() -> None:
+    """Отсутствующий заголовок (None) → 403 (CRM контракт)."""
     with pytest.raises(ProblemException) as exc:
         await require_admin(x_admin_key=None)
-    assert exc.value.status == 401
+    assert exc.value.status == 403
 
 
 @pytest.mark.parametrize("disabled_value", [None, SecretStr("")])

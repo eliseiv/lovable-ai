@@ -48,14 +48,14 @@ async def _admin_request(client, method, path, **kwargs):  # noqa: ANN001
 
 
 @pytest.mark.parametrize(("method", "path"), _ADMIN_PATHS)
-async def test_admin_endpoint_without_key_401_problem_json(client, method, path):
-    """Любой админ-эндпоинт без X-Admin-Key → 401 application/problem+json (RFC-7807)."""
+async def test_admin_endpoint_without_key_403_problem_json(client, method, path):
+    """Любой админ-эндпоинт без X-Admin-Key → 403 application/problem+json (CRM)."""
     resp = await _admin_request(client, method, path)
-    assert resp.status_code == 401
+    assert resp.status_code == 403
     assert resp.headers["content-type"].startswith("application/problem+json")
     body = resp.json()
-    assert body["status"] == 401
-    assert body["title"] == "Unauthorized"
+    assert body["status"] == 403
+    assert body["title"] == "Forbidden"
     assert {"type", "title", "status", "detail"} <= set(body)
 
 
@@ -239,12 +239,12 @@ async def test_credits_unknown_user_404(client, admin_headers):
     assert resp.json()["status"] == 404
 
 
-# ============================ GET /admin/users/{user_id} ============================
+# ============================ GET /admin/users/{user_id}/quota ============================
 
 
 async def test_get_user_unknown_404(client, admin_headers):
-    """GET несуществующего user → 404."""
-    resp = await client.get("/v1/admin/users/u_admin_getnone01", headers=admin_headers)
+    """GET quota несуществующего user → 404."""
+    resp = await client.get("/v1/admin/users/u_admin_getnone01/quota", headers=admin_headers)
     assert resp.status_code == 404
 
 
@@ -263,7 +263,7 @@ async def test_get_user_returns_balance_and_quota(client, session, admin_headers
     session.add(UsageCounter(user_id=user.id, period=period, generations_used=3))
     await session.flush()
 
-    resp = await client.get(f"/v1/admin/users/{user.id}", headers=admin_headers)
+    resp = await client.get(f"/v1/admin/users/{user.id}/quota", headers=admin_headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["user_id"] == user.id

@@ -23,7 +23,7 @@ from app.db.models import BillingEvent, CreditGrant, Subscription, User
 
 pytestmark = pytest.mark.asyncio
 
-_SUB_PATH = "/v1/admin/users/{uid}/subscription"
+_SUB_PATH = "/v1/admin/users/{uid}/subscription/legacy"
 
 
 async def _user(session, uid: str, *, balance: int = 0) -> User:  # noqa: ANN001
@@ -46,12 +46,12 @@ def _grant(client, uid: str, body: dict, headers):  # noqa: ANN001, ANN202
 # ============================ auth (X-Admin-Key) ============================
 
 
-async def test_grant_subscription_without_key_401_problem_json(client, admin_headers):
-    """Без X-Admin-Key → 401 application/problem+json (плоскость защищена)."""
+async def test_grant_subscription_without_key_403_problem_json(client, admin_headers):
+    """Без X-Admin-Key → 403 application/problem+json (плоскость защищена)."""
     resp = await client.post(_SUB_PATH.format(uid="u_x"), json={})
-    assert resp.status_code == 401
+    assert resp.status_code == 403
     assert resp.headers["content-type"].startswith("application/problem+json")
-    assert resp.json()["title"] == "Unauthorized"
+    assert resp.json()["title"] == "Forbidden"
 
 
 async def test_grant_subscription_invalid_key_401(client):
@@ -269,7 +269,7 @@ async def test_grant_does_not_touch_tokens(client, session, admin_headers):
 
 
 async def test_grant_response_equals_get_user_snapshot(client, session, admin_headers):
-    """Ответ 200 == снимок GET /admin/users/{user_id} (access_level=pro, обновлённые pro-квоты)."""
+    """Ответ 200 == снимок GET /admin/users/{user_id}/quota (access_level=pro, pro-квоты)."""
     uid = "u_sub_snap00000001"
     await _user(session, uid, balance=3)
 
@@ -277,7 +277,7 @@ async def test_grant_response_equals_get_user_snapshot(client, session, admin_he
     assert grant_resp.status_code == 200
     grant_body = grant_resp.json()
 
-    get_resp = await client.get(f"/v1/admin/users/{uid}", headers=admin_headers)
+    get_resp = await client.get(f"/v1/admin/users/{uid}/quota", headers=admin_headers)
     assert get_resp.status_code == 200
     assert get_resp.json() == grant_body  # снимки идентичны
 
