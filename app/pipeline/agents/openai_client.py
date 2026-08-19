@@ -31,6 +31,7 @@ from openai import AsyncOpenAI
 
 from app.core.config import Settings
 from app.pipeline.agents.base import AgentCall, ImageInput
+from app.workers.retry_policy import IncompleteLLMStreamError
 
 # Себестоимость per-1M токенов (USD) OpenAI-моделей — НОРМАТИВНАЯ таблица
 # docs/modules/observability/03-architecture.md §2.2A (верифицирована по каталогу OpenAI
@@ -213,19 +214,20 @@ class OpenAIAgentClient:
         """Транспорт: Responses API stream + финальный response (ADR-032 §2).
 
         kwargs БЕЗ `text.format`/`json_schema` (текстовый режим, §3) и БЕЗ `cache_control`
-        (caching автоматический, §6). `reasoning.effort` per-agent: agent3/4 → none (весь cap
-        под вывод), agent1/2 → openai_agent_effort. `max_output_tokens` ← per-agent cap (§2).
+        (caching автоматический, §6). `reasoning.effort` per-agent: agent3/4 → none (весь
+        cap под вывод), agent1/2 → openai_agent_effort. `max_output_tokens` ← per-agent
+        cap (§2).
 
-        Ошибки/ретраи (ADR-032 §5): ВСЕ исключения openai SDK пробрасываются БЕЗ обёртки —
-        классифицирует `retry_policy` (единственная точка решения retry vs graceful-fail).
-        Транзиентные (RateLimitError/APIConnectionError/APITimeoutError/APIStatusError 5xx) →
-        Celery-ретрай; не-ретраябельные (AuthenticationError 401 / PermissionDeniedError 403 /
-        BadRequestError 400) → FAILED(agent_unavailable). Credential-кейс: пустой ключ отсекается
-        preflight'ом (§G); невалидный (непустой) ключ НЕ валидируется SDK client-side (см.
-        __init__) — даёт request-time AuthenticationError(401), уже трактуемую как не-транзиентную.
-        Поэтому, в отличие от Anthropic (client-side TypeError ДО HTTP), здесь обёртки в
-        LLMCredentialError НЕТ — она исказила бы транзиентную классификацию (перемапила бы
-        транзиентные 429/5xx/timeout в non-retryable).
+        Ошибки/ретраи (ADR-032 §5): исключения иерархии openai SDK (`APIError`)
+        пробрасываются БЕЗ обёртки — классифицирует `retry_policy`. Транзиентные
+        (RateLimitError/APIConnectionError/APITimeoutError/APIStatusError 5xx) →
+        Celery-ретрай; не-ретраябельные (401/403/400) → FAILED(agent_unavailable).
+        Пустой ключ отсекается preflight'ом; невалидный непустой → request-time
+        AuthenticationError(401). Обёртки в LLMCredentialError на openai-пути нет.
+
+        Исключение: stdlib RuntimeError «Didn't receive a `response.completed` event.»
+        из `get_final_response` (HTTP 200, truncated SSE) узко оборачивается в
+        IncompleteLLMStreamError → транзиентный Celery-ретрай.
         """
         kwargs: dict[str, Any] = {
             "model": model,
@@ -235,7 +237,16 @@ class OpenAIAgentClient:
             "input": self._input_payload(user_content, images),
         }
         async with self._client.responses.stream(**kwargs) as stream:
-            return await stream.get_final_response()
+            try:
+                return await stream.get_final_response()
+            except RuntimeError as exc:
+                # SDK бросает stdlib RuntimeError, не openai.APIError, если SSE закрылся
+                # без response.completed (HTTP 200, но стрим truncated). Узкая обёртка на
+                # этой точке вызова — иначе retry_policy не ретраит, джоба висит до
+                # stuck_timeout (nexoraweb j_vdn7eussn31o3ijpeuoss02g, 2026-08-19).
+                if "response.completed" in str(exc):
+                    raise IncompleteLLMStreamError(str(exc)) from exc
+                raise
 
     def _build_call(self, model: str, response: Any, text: str) -> AgentCall:
         """Собирает AgentCall (текст + учёт токенов/стоимости) из финального response SDK.

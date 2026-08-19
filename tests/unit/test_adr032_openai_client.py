@@ -46,7 +46,9 @@ from app.core.config import Settings
 from app.pipeline.agents.base import AgentCall
 from app.pipeline.agents.openai_client import OpenAIAgentClient
 from app.workers.retry_policy import (
+    IncompleteLLMStreamError,
     LLMCredentialError,
+    is_llm_failure,
     is_non_retryable_llm_failure,
     is_transient,
 )
@@ -374,3 +376,38 @@ async def test_transient_from_get_final_response_propagates_and_is_transient(exc
         )
     assert not isinstance(ei.value, LLMCredentialError)
     assert is_transient(ei.value) is True
+
+
+async def test_incomplete_stream_runtime_error_wrapped_as_transient_llm():
+    """get_final_response RuntimeError без response.completed → IncompleteLLMStreamError.
+
+    Прод-инцидент nexoraweb 2026-08-19: SDK закрыл стрим (HTTP 200) без финального события.
+    Обёртка на точке get_final_response → Celery-ретрай (is_transient), не stuck_timeout.
+    """
+    client = OpenAIAgentClient(_openai_settings())
+    client._client.responses.stream = _stream_raising_in_final(  # type: ignore[method-assign]
+        RuntimeError("Didn't receive a `response.completed` event.")
+    )
+
+    with pytest.raises(IncompleteLLMStreamError) as ei:
+        await client.run_agent(
+            agent="agent2", model="gpt-5.5", system_prompt="sys", user_content="user"
+        )
+    assert is_transient(ei.value) is True
+    assert is_llm_failure(ei.value) is True
+    assert is_non_retryable_llm_failure(ei.value) is False
+
+
+async def test_unrelated_runtime_error_from_stream_not_wrapped():
+    """Прочий RuntimeError из get_final_response НЕ маскируется IncompleteLLMStreamError."""
+    client = OpenAIAgentClient(_openai_settings())
+    client._client.responses.stream = _stream_raising_in_final(  # type: ignore[method-assign]
+        RuntimeError("unrelated boom")
+    )
+
+    with pytest.raises(RuntimeError) as ei:
+        await client.run_agent(
+            agent="agent2", model="gpt-5.5", system_prompt="sys", user_content="user"
+        )
+    assert not isinstance(ei.value, IncompleteLLMStreamError)
+    assert str(ei.value) == "unrelated boom"

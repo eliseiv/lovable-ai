@@ -63,6 +63,21 @@ class TransientInfraError(RuntimeError):
     """
 
 
+class IncompleteLLMStreamError(RuntimeError):
+    """Стрим OpenAI Responses API закрылся без `response.completed` (прод-инцидент 2026-08-19).
+
+    `openai.lib.streaming.responses.get_final_response()` бросает **stdlib `RuntimeError`**
+    («Didn't receive a `response.completed` event.»), когда HTTP 200 уже пришёл, но SSE
+    оборвался без финального события. Это **не** `openai.APIError` → классификатор его не
+    видел → Celery не ретраил → джоба висела в SPECCING до reconciler `stuck_timeout`.
+
+    `OpenAIAgentClient._stream_final_response` узко перехватывает этот RuntimeError на
+    точке `get_final_response` (не по всему стеку таски) и поднимает это исключение.
+    Классификатор трактует его как **транзиентный LLM-сбой** → Celery autoretry;
+    исчерпание max_retries → FAILED(agent_unavailable), не infra_error / stuck_timeout.
+    """
+
+
 class LLMCredentialError(RuntimeError):
     """Client-side auth-resolution сбой Anthropic SDK ДО HTTP (ADR-019 §Fix round 3, §G).
 
@@ -108,6 +123,8 @@ TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (
     DBAPIError,
     # Явный инфра-сбой из subprocess-обёртки Docker.
     TransientInfraError,
+    # Обрыв OpenAI Responses-стрима без response.completed (stdlib RuntimeError SDK).
+    IncompleteLLMStreamError,
 )
 
 
@@ -170,8 +187,10 @@ def is_llm_failure(exc: BaseException) -> bool:
     `LLMCredentialError` (client-side auth-resolution-сбой SDK, ADR-019 §Fix round 3) —
     тоже LLM-недоступность, хотя и вне иерархии APIError. OpenAI SDK (ADR-032 §5) тоже поднимает
     подклассы своего `APIError` на все сбои LLM — классификатор покрывает ОБА SDK.
+    `IncompleteLLMStreamError` (обрыв Responses-стрима без response.completed) — тоже LLM:
+    исчерпание ретраев → agent_unavailable, не infra_error.
     """
-    return isinstance(exc, (APIError, OpenAIAPIError, LLMCredentialError))
+    return isinstance(exc, (APIError, OpenAIAPIError, LLMCredentialError, IncompleteLLMStreamError))
 
 
 # --- ADR-019 §Fix round 3: per-job fail-fast preflight LLM-credential (основной путь) ---

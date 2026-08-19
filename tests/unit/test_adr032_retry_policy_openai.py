@@ -35,6 +35,7 @@ from openai import (
 )
 
 from app.workers.retry_policy import (
+    IncompleteLLMStreamError,
     LLMCredentialError,
     is_llm_failure,
     is_non_retryable_llm_failure,
@@ -149,6 +150,14 @@ def test_openai_connection_error_is_llm_failure():
 
 def test_llm_credential_error_is_llm_failure():
     assert is_llm_failure(LLMCredentialError("x")) is True
+
+
+def test_incomplete_llm_stream_error_is_transient_llm_failure():
+    """Обрыв OpenAI-стрима без response.completed → Celery-ретрай, не stuck_timeout."""
+    exc = IncompleteLLMStreamError("Didn't receive a `response.completed` event.")
+    assert is_transient(exc) is True
+    assert is_llm_failure(exc) is True
+    assert is_non_retryable_llm_failure(exc) is False
 
 
 def test_non_llm_infra_not_llm_failure():

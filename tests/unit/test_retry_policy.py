@@ -19,7 +19,7 @@ from anthropic import APIConnectionError, APIStatusError, APITimeoutError, RateL
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.exc import OperationalError
 
-from app.workers.retry_policy import TransientInfraError, is_transient
+from app.workers.retry_policy import IncompleteLLMStreamError, TransientInfraError, is_transient
 
 
 def _make_request() -> httpx.Request:
@@ -105,5 +105,12 @@ def test_plain_value_error_not_transient():
 
 
 def test_runtime_error_not_transient():
-    """Generic RuntimeError (не TransientInfraError) — доменный, НЕ transient."""
+    """Generic RuntimeError (не TransientInfraError / IncompleteLLMStreamError) — НЕ transient."""
     assert is_transient(RuntimeError("vite build exit 1")) is False
+
+
+def test_incomplete_llm_stream_error_is_transient():
+    assert (
+        is_transient(IncompleteLLMStreamError("Didn't receive a `response.completed` event."))
+        is True
+    )
