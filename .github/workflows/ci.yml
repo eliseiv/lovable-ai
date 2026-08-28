@@ -179,6 +179,7 @@ jobs:
   #   nexoraweb   -> /opt/nexoraweb   -p nexoraweb
   #   qyvrenzo    -> /opt/qyvrenzo    -p qyvrenzo
   #   lumorix     -> /opt/lumorix     -p lumorix
+  #   appbekprobot -> /opt/appbekprobot -p appbekprobot
   # Инстансы держатся МАССИВОМ (INSTANCES ниже): N-й инстанс = +1 строка,
   # без правки логики деплоя (требование расширяемости, docs/07 §315/§432).
   # Чужие /opt/music-backend, /opt/edge НЕ трогаются (ADR-018: изоляция).
@@ -243,7 +244,7 @@ jobs:
             # Нормативный список инстансов {dir, project} (docs/07 таблица).
             # Порядок: corelysite первым (приоритет доставки в основной прод,
             # docs/07 §334). Расширение: N-й инстанс = +1 строка "dir:project".
-            INSTANCES="corelysite:corelysite nexoraweb:nexoraweb qyvrenzo:qyvrenzo lumorix:lumorix"
+            INSTANCES="corelysite:corelysite nexoraweb:nexoraweb qyvrenzo:qyvrenzo lumorix:lumorix appbekprobot:appbekprobot"
             for entry in $INSTANCES; do
               dir="${entry%%:*}"
               project="${entry##*:}"
