@@ -238,6 +238,12 @@ x-app-env: &app-env
   # self-sign'ит Xcode-JWS → бесплатные токены/pro). Дефолт кода "" (skip bundle-check)
   # — ТОЛЬКО тест/dev; в prod-стеке secure-by-default = реальный bundle id.
   APPSTORE_BUNDLE_ID: ${APPSTORE_BUNDLE_ID:-mba.gipsy.lovable}
+  # ⚠️ ВРЕМЕННЫЙ ТЕСТОВЫЙ ОБХОД (ADR-043): true → верификатор НЕ проверяет x5c-цепочку и
+  # ES256-подпись StoreKit JWS (клиент тестирует покупки через Xcode StoreKit Testing).
+  # Поле Settings (storekit_insecure_skip_verify), потребитель api → обязано быть здесь,
+  # иначе extra=ignore молча отдаст дефолт. Secure-by-default false; включается ТОЛЬКО
+  # явным ключом в .env конкретного тест-инстанса и снимается после тестирования.
+  STOREKIT_INSECURE_SKIP_VERIFY: ${STOREKIT_INSECURE_SKIP_VERIFY:-false}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   BUILD_SANDBOX_RUNTIME: ${BUILD_SANDBOX_RUNTIME:-rootless}
   # PROD: build-контейнеры по-прежнему в изолированной egress-сети build-воркера

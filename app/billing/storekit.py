@@ -138,12 +138,35 @@ def _verify_chain(chain: list[x509.Certificate], roots: list[x509.Certificate]) 
     raise StoreKitVerificationError("StoreKit certificate chain not anchored to a trusted root")
 
 
+def _decode_unverified_payload(signed_transaction: str) -> dict[str, Any]:
+    """Payload JWS БЕЗ проверки подписи — только для тестового обхода (ADR-043).
+
+    Используется исключительно при STOREKIT_INSECURE_SKIP_VERIFY=true. Невалидный
+    base64url/JSON или не-объект → StoreKitVerificationError (структурный fail остаётся).
+    """
+    try:
+        payload = jwt.decode(
+            signed_transaction,
+            options={"verify_signature": False, "verify_aud": False, "verify_exp": False},
+            algorithms=["ES256"],
+        )
+    except jwt.InvalidTokenError as exc:
+        raise StoreKitVerificationError("StoreKit JWS payload is not decodable") from exc
+    if not isinstance(payload, dict):
+        raise StoreKitVerificationError("StoreKit JWS payload must be a JSON object")
+    return payload
+
+
 class StoreKitVerifier:
     """Верифицирует Apple-подписанные StoreKit JWS-транзакции (ES256 + x5c → Apple root)."""
 
     def __init__(self, settings: Settings) -> None:
         self._bundle_id = settings.appstore_bundle_id
         self._roots = self._load_roots(settings.appstore_root_cert_dir)
+        # ⚠️ ВРЕМЕННЫЙ ТЕСТОВЫЙ ОБХОД (ADR-043): пропуск крипто-проверки JWS на тест-инстансе.
+        self._skip_verify = settings.storekit_insecure_skip_verify
+        if self._skip_verify:
+            logger.warning("storekit_signature_verification_disabled")
 
     @staticmethod
     def _load_roots(cert_dir: str) -> list[x509.Certificate]:
@@ -173,6 +196,13 @@ class StoreKitVerifier:
         """
         if not isinstance(signed_transaction, str) or signed_transaction.count(".") != 2:
             raise StoreKitVerificationError("StoreKit transaction must be a compact JWS string")
+
+        if self._skip_verify:
+            # ⚠️ ВРЕМЕННЫЙ ТЕСТОВЫЙ ОБХОД (ADR-043, STOREKIT_INSECURE_SKIP_VERIFY=true):
+            # цепочка и подпись НЕ проверяются, payload берётся как есть. Структурная
+            # валидация (_normalize_payload: bundleId/transactionId) сохраняется.
+            logger.warning("storekit_verification_bypassed")
+            return self._normalize_payload(_decode_unverified_payload(signed_transaction))
 
         chain = _load_certificate_chain(signed_transaction)
         leaf = chain[0]

@@ -25,9 +25,13 @@ from app.billing.storekit import StoreKitVerificationError, StoreKitVerifier
 from tests.support import storekit_jws as sk
 
 
-def _settings(cert_dir: str, bundle_id: str = ""):  # noqa: ANN202
-    """Минимальный стенд-ин Settings (верификатор читает только эти два поля)."""
-    return SimpleNamespace(appstore_root_cert_dir=cert_dir, appstore_bundle_id=bundle_id)
+def _settings(cert_dir: str, bundle_id: str = "", skip_verify: bool = False):  # noqa: ANN202
+    """Минимальный стенд-ин Settings (верификатор читает только эти три поля)."""
+    return SimpleNamespace(
+        appstore_root_cert_dir=cert_dir,
+        appstore_bundle_id=bundle_id,
+        storekit_insecure_skip_verify=skip_verify,
+    )
 
 
 # ============================ валидная транзакция ============================
@@ -308,3 +312,80 @@ def test_payload_and_jws_not_logged_on_failure(tmp_path, caplog):
     with caplog.at_level("DEBUG"), pytest.raises(StoreKitVerificationError):
         StoreKitVerifier(_settings(str(empty))).verify(jws)
     assert jws not in caplog.text
+
+
+# ============ ВРЕМЕННЫЙ тестовый обход верификации (ADR-043) ============
+
+
+def test_skip_verify_accepts_transaction_not_anchored_to_trusted_root(tmp_path):
+    """STOREKIT_INSECURE_SKIP_VERIFY=true → цепочка/подпись не проверяются, payload читается."""
+    foreign_root = sk.make_root()
+    leaf = sk.make_leaf(foreign_root)
+    # В каталоге доверенных roots — ЧУЖОЙ root: при обычном режиме это отказ.
+    sk.write_roots(tmp_path, [sk.make_root()])
+    payload = sk.transaction_payload(transaction_id="t_skip_1", product_id="week_6.99_not_trial")
+    jws = sk.sign_jws(payload, leaf, [leaf, foreign_root])
+
+    with pytest.raises(StoreKitVerificationError):
+        StoreKitVerifier(_settings(str(tmp_path))).verify(jws)
+
+    txn = StoreKitVerifier(_settings(str(tmp_path), skip_verify=True)).verify(jws)
+    assert txn.transaction_id == "t_skip_1"
+    assert txn.product_id == "week_6.99_not_trial"
+
+
+def test_skip_verify_accepts_tampered_signature(tmp_path):
+    """Подделанный payload (подпись невалидна) при обходе принимается — это цена режима."""
+    root = sk.make_root()
+    leaf = sk.make_leaf(root)
+    sk.write_roots(tmp_path, [root])
+    jws = sk.sign_jws(
+        sk.transaction_payload(transaction_id="t_skip_2", product_id="week_6.99_not_trial"),
+        leaf,
+        [leaf, root],
+    )
+    header, _payload_b64, signature = jws.split(".")
+    forged = json.dumps(
+        {**sk.transaction_payload(transaction_id="t_forged", product_id="week_6.99_not_trial")}
+    ).encode()
+    tampered = ".".join([header, base64.urlsafe_b64encode(forged).decode().rstrip("="), signature])
+
+    with pytest.raises(StoreKitVerificationError):
+        StoreKitVerifier(_settings(str(tmp_path))).verify(tampered)
+
+    txn = StoreKitVerifier(_settings(str(tmp_path), skip_verify=True)).verify(tampered)
+    assert txn.transaction_id == "t_forged"
+
+
+def test_skip_verify_still_rejects_non_jws_and_broken_payload(tmp_path):
+    """Обход снимает только крипто-проверку: структурные отказы остаются."""
+    verifier = StoreKitVerifier(_settings(str(tmp_path), skip_verify=True))
+
+    with pytest.raises(StoreKitVerificationError):
+        verifier.verify("not-a-jws")
+
+    root = sk.make_root()
+    leaf = sk.make_leaf(root)
+    # payload без transactionId → отказ даже при обходе.
+    jws = sk.sign_jws({"bundleId": "mba.gipsy.lovable"}, leaf, [leaf, root])
+    with pytest.raises(StoreKitVerificationError):
+        verifier.verify(jws)
+
+
+def test_skip_verify_does_not_log_payload_or_jws(tmp_path, caplog):
+    """В режиме обхода в логи идёт только предупреждение, без payload/JWS (docs/05-security)."""
+    root = sk.make_root()
+    leaf = sk.make_leaf(root)
+    jws = sk.sign_jws(
+        sk.transaction_payload(transaction_id="t_skip_3", product_id="week_6.99_not_trial"),
+        leaf,
+        [leaf, root],
+    )
+
+    with caplog.at_level("WARNING"):
+        StoreKitVerifier(_settings(str(tmp_path), skip_verify=True)).verify(jws)
+
+    text = " ".join(record.getMessage() for record in caplog.records)
+    assert "storekit_verification_bypassed" in text
+    assert jws not in text
+    assert "t_skip_3" not in text

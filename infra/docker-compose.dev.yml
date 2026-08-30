@@ -176,6 +176,12 @@ x-app-env: &app-env
   # переопределяет APPSTORE_ROOT_CERT_DIR_HOST на каталог с Xcode тест-сертификатом
   # (certs/appstore-xcode). Пустой bundle + Xcode-cert разрешены ТОЛЬКО тест/dev (docs/05).
   APPSTORE_BUNDLE_ID: ${APPSTORE_BUNDLE_ID:-}
+  # ⚠️ ВРЕМЕННЫЙ ТЕСТОВЫЙ ОБХОД (ADR-043): true → верификатор НЕ проверяет x5c-цепочку и
+  # ES256-подпись StoreKit JWS (клиент тестирует покупки через Xcode StoreKit Testing).
+  # Поле Settings (storekit_insecure_skip_verify), потребитель api → обязано быть здесь,
+  # иначе extra=ignore молча отдаст дефолт. Secure-by-default false; включается ТОЛЬКО
+  # явным ключом в .env конкретного тест-инстанса и снимается после тестирования.
+  STOREKIT_INSECURE_SKIP_VERIFY: ${STOREKIT_INSECURE_SKIP_VERIFY:-false}
   # --- Sprint 4: Sandbox & security (ADR-010 rootless+egress, ADR-011 GC) ---
   # Канонические имена и дефолты — docs/07-deployment.md → env-контракт (стр. 80-88).
   # Имена совпадают символ-в-символ с полями Settings (config.py). Поля Settings

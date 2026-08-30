@@ -369,6 +369,18 @@ class Settings(BaseSettings):
         "422); пусто → bundle-check пропускается (тест/dev ТОЛЬКО). env APPSTORE_BUNDLE_ID "
         "(ADR-039).",
     )
+    # ⚠️ ВРЕМЕННЫЙ ТЕСТОВЫЙ ОБХОД (ADR-043). True → верификатор НЕ проверяет x5c-цепочку и
+    # ES256-подпись JWS: payload читается как есть (структурная валидация transactionId/bundleId
+    # сохраняется). Предназначен ТОЛЬКО для тест-инстанса, где клиент шлёт транзакции Xcode
+    # StoreKit Testing; на инстансе с реальными деньгами включать нельзя — любой обладатель
+    # Bearer сможет самоподписать транзакцию и получить pro/токены. Secure-by-default: False;
+    # включается ТОЛЬКО явным env на конкретном инстансе. env STOREKIT_INSECURE_SKIP_VERIFY.
+    storekit_insecure_skip_verify: bool = Field(
+        default=False,
+        description="ВРЕМЕННО (ADR-043): True → пропуск проверки цепочки и подписи StoreKit JWS "
+        "(тестовый режим инстанса). Дефолт False (fail-closed). "
+        "env STOREKIT_INSECURE_SKIP_VERIFY.",
+    )
 
     # --- Sprint 4: build-sandbox runtime + egress (ADR-010, docs/07 env-контракт) ---
     # Имена/типы/дефолты — символ-в-символ с docs/07-deployment.md «Канонический список».
