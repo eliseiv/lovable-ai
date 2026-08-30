@@ -155,6 +155,39 @@ class CrmGrantSubscriptionResponse(BaseModel):
     applied: bool
 
 
+# Имена полей ниже заморожены на стороне broad-crm (её ADR-084 «контракт бэков v1.3»):
+# `date`/`provider`/`spend_usd`/`requests`/`tokens` — переименование ломает интеграцию.
+# Нормативные ссылки держим в комментариях: docstring схемы уходит в публичный
+# /openapi.json, где внутренние маркеры запрещены (contract-тесты B.7).
+class CrmDailyCostItem(BaseModel):
+    """Строка дневных расходов инстанса: один день × один провайдер LLM.
+
+    `null` в величине означает «инстанс её не измеряет»; отсутствие строки за пару
+    (день, провайдер) означает, что расхода не было.
+    """
+
+    date: str = Field(description="День расхода, `YYYY-MM-DD` (UTC).")
+    provider: str = Field(
+        min_length=1,
+        description="Провайдер LLM: `anthropic` / `openai`; для нераспознанной модели — "
+        "сырое имя модели (CRM отнесёт его в `other`).",
+    )
+    spend_usd: float | None = Field(description="Расход за день по провайдеру, USD.")
+    requests: int | None = Field(description="Число вызовов LLM за день по провайдеру.")
+    tokens: float | None = Field(
+        description="Суммарные токены за день (input + output + cache_read + cache_write)."
+    )
+
+
+class CrmDailyCostsResponse(BaseModel):
+    """Ответ `GET /v1/admin/costs/daily`: общее число строк периода и страница строк."""
+
+    total: int = Field(description="Общее число строк (день × провайдер) за период, до пагинации.")
+    items: list[CrmDailyCostItem] = Field(
+        description="Строки периода, отсортированы `date ASC, provider ASC`."
+    )
+
+
 def format_utc(dt: datetime | None) -> str | None:
     """Сериализует datetime в ISO 8601 UTC (…Z)."""
     if dt is None:

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from datetime import date as date_
 from datetime import datetime
 from typing import Annotated
 
@@ -25,6 +26,7 @@ from app.schemas.api import (
 from app.schemas.crm_admin import (
     CrmAdjustTokensRequest,
     CrmAdjustTokensResponse,
+    CrmDailyCostsResponse,
     CrmGrantSubscriptionRequest,
     CrmGrantSubscriptionResponse,
     CrmPaymentListResponse,
@@ -297,4 +299,33 @@ async def crm_grant_subscription(
         product_id=body.product_id,
         expires_in_days=body.expires_in_days,
         grant_id=body.grant_id,
+    )
+
+
+@router.get(
+    "/costs/daily",
+    response_model=CrmDailyCostsResponse,
+    summary="CRM: дневные расходы LLM по провайдерам",
+    description=(
+        "Расход инстанса за период с гранулярностью **день × провайдер** (расширение "
+        "контракта broad-crm v1.3). `date_from`/`date_to` — `YYYY-MM-DD`, UTC, включительно "
+        "с обеих сторон; период не длиннее 92 дней. Сортировка `date ASC, provider ASC`. "
+        "Отсутствие строки за (день, провайдер) означает, что расхода не было."
+    ),
+    responses=problem_responses(400, 401, 403),
+)
+async def crm_daily_costs(
+    session: SessionDep,
+    _admin: RequireAdmin,
+    date_from: Annotated[date_, Query(description="Первый день периода (UTC, включительно).")],
+    date_to: Annotated[date_, Query(description="Последний день периода (UTC, включительно).")],
+    limit: Annotated[int, Query(ge=1, le=1000)] = 1000,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> CrmDailyCostsResponse:
+    return await crm_admin_service.daily_costs(
+        session,
+        date_from=date_from,
+        date_to=date_to,
+        limit=limit,
+        offset=offset,
     )

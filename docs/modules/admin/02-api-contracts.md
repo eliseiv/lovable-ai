@@ -12,6 +12,7 @@ Base: `https://api.domain/v1` · Auth: **`X-Admin-Key: <ADMIN_API_KEY>`** (НЕ 
 | POST | `/admin/users/{user_id}/credits` | начислить/скорректировать бонус-генерации | `X-Admin-Key` | `200` |
 | POST | `/admin/users/{user_id}/subscription` | выдать pro-подписку (`access_level=pro`) на срок/бессрочно ([ADR-037](../../adr/ADR-037-admin-grant-pro-subscription.md)) | `X-Admin-Key` | `200` |
 | GET | `/admin/users/{user_id}` | баланс кредитов + квота юзера | `X-Admin-Key` | `200` |
+| GET | `/admin/costs/daily` | дневные расходы LLM день × провайдер (расширение контракта broad-crm v1.3, [ADR-044](../../adr/ADR-044-crm-daily-costs-endpoint.md)) | `X-Admin-Key` | `200` |
 
 ## Аутентификация админ-эндпоинтов ([ADR-021 §A](../../adr/ADR-021-admin-plane-and-bonus-credits.md))
 - Заголовок **`X-Admin-Key: <ADMIN_API_KEY>`**. Dependency `require_admin` сравнивает значение constant-time (`hmac.compare_digest`) с `settings.admin_api_key`.
@@ -94,6 +95,36 @@ Base: `https://api.domain/v1` · Auth: **`X-Admin-Key: <ADMIN_API_KEY>`** (НЕ 
 - **Источник:** те же агрегаты, что `GET /billing/me` ([billing §2](../billing/02-api-contracts.md#2-get-v1billingme)) + `users.bonus_generations_balance`, но **за указанного `user_id`** (а не за текущего Bearer). `generations_remaining = max(0, monthly_generations - generations_used) + bonus_generations_balance`. В примере: `max(0, 3-3)=0` план + `25` кредитов = `25`.
 - **Ошибки:** `401`, `404` (нет такого `user_id`).
 
+## GET /admin/costs/daily
+
+Дневные расходы LLM инстанса с гранулярностью **день × провайдер** ([ADR-044](../../adr/ADR-044-crm-daily-costs-endpoint.md)). Реализует расширение **v1.3** контракта бэков broad-crm — путь, имена query-параметров и полей ответа заморожены на стороне CRM, менять их односторонне нельзя.
+
+**Query:**
+
+| Параметр | Тип | Обяз. | Семантика |
+|---|---|---|---|
+| `date_from` | `YYYY-MM-DD` | да | Первый день периода **включительно**, UTC |
+| `date_to` | `YYYY-MM-DD` | да | Последний день периода **включительно**, UTC |
+| `limit` | int `1…1000` | нет | Размер страницы, дефолт `1000` |
+| `offset` | int `≥ 0` | нет | Смещение страницы, дефолт `0` |
+
+**`200`** → `{ "total": int, "items": CrmDailyCostItem[] }`, где элемент — `{ date, provider, spend_usd, requests, tokens }`:
+
+```json
+{ "total": 3,
+  "items": [
+    { "date": "2026-08-10", "provider": "anthropic", "spend_usd": 0.03, "requests": 2, "tokens": 32.0 },
+    { "date": "2026-08-10", "provider": "openai", "spend_usd": 0.03, "requests": 1, "tokens": 16.0 },
+    { "date": "2026-08-11", "provider": "openai", "spend_usd": 0.04, "requests": 1, "tokens": 16.0 }
+  ] }
+```
+
+- **Источник** — cost-ledger `llm_usage` ([03-data-model](../../03-data-model.md)): `spend_usd` = `SUM(cost_usd)`, `requests` = число записей ledger, `tokens` = `SUM(input + output + cache_read + cache_write)`.
+- **`provider` выводится из `llm_usage.model`, а НЕ из `LLM_PROVIDER` инстанса** (нормативно, [ADR-044](../../adr/ADR-044-crm-daily-costs-endpoint.md)): `claude*` → `anthropic`, `gpt*` → `openai`, нераспознанная модель → её сырое имя. В ledger одного инстанса сосуществуют записи обоих провайдеров (переключение по [ADR-032](../../adr/ADR-032-llm-provider-abstraction-openai.md)), поэтому подстановка текущего провайдера переписала бы историю.
+- **Сортировка** — `date ASC, provider ASC`; пара `(date, provider)` уникальна, поэтому порядок полный и `limit/offset` даёт стабильные страницы. `total` — число строк за период **до** пагинации.
+- **Отсутствие строки** за `(день, провайдер)` означает «расхода не было» — нули не досыпаются.
+- **Ошибки:** `400` (`date_from > date_to`; период длиннее **92** дней), `401`/`403` (админ-гейт), `422` (нераспознанная дата — стандартная валидация FastAPI).
+
 ## Конвенции ошибок (RFC-7807)
 ```json
 { "type": "https://api.domain/errors/unauthorized",
@@ -101,4 +132,4 @@ Base: `https://api.domain/v1` · Auth: **`X-Admin-Key: <ADMIN_API_KEY>`** (НЕ 
   "status": 401,
   "detail": "Invalid or missing admin credentials." }
 ```
-- Все админ-провалы (`X-Admin-Key`) → `401` без раскрытия причины. Валидационные `422`/конфликтные `409` — тоже `application/problem+json` (глобальный обработчик [api §Обработчики ошибок](../api/03-architecture.md#обработчики-ошибок--rfc-7807-нормативно-все-ошибки-включая-422)).
+- Провалы `X-Admin-Key` → `401` без раскрытия причины; **отсутствие заголовка** → `403` (`require_admin`: нет заголовка → `forbidden`, неверный ключ или отключённая плоскость → `unauthorized`). Валидационные `422`/конфликтные `409` — тоже `application/problem+json` (глобальный обработчик [api §Обработчики ошибок](../api/03-architecture.md#обработчики-ошибок--rfc-7807-нормативно-все-ошибки-включая-422)).

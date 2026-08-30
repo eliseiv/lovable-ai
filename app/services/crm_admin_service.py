@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
+from datetime import date as date_
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select
@@ -21,12 +22,15 @@ from app.db.models import (
     BillingEvent,
     CreditGrant,
     GenerationJob,
+    LlmUsage,
     Project,
     StoreTransaction,
     Subscription,
     User,
 )
 from app.schemas.crm_admin import (
+    CrmDailyCostItem,
+    CrmDailyCostsResponse,
     CrmGrantSubscriptionResponse,
     CrmMediaAvgGenerationSec,
     CrmMediaStats,
@@ -311,7 +315,7 @@ async def get_user_detail(session: AsyncSession, user_id: str) -> CrmUserDetailR
         revenue = CrmUserRevenue(
             income_usd=agg.payments_sum_usd,
             api_cost_usd=float(spent_jobs or 0),
-            providers={"anthropic": float(spent_jobs or 0)},
+            providers=await _spend_by_provider(session, user_id, total_usd=float(spent_jobs or 0)),
         )
 
     media_stats = await _build_media_stats(session, user_id)
@@ -633,4 +637,132 @@ async def grant_subscription_crm(
         subscription_active=_subscription_active(updated_sub),
         subscription_expires_at=format_utc(updated_sub.expires_at),
         applied=True,
+    )
+
+
+# ============ Расходы LLM: провайдер по модели + дневная агрегация ============
+#
+# broad-crm нормализует `provider` сама (её ADR-084: точные ключи + префиксы `gpt*`/`claude*`),
+# но опирается на то, что бэк отдаёт СВОЙ сырой ключ. Наш сырой ключ расхода — модель
+# (`llm_usage.model`), поэтому провайдер выводится из имени модели, а НЕ из `LLM_PROVIDER`
+# инстанса: в ledger одного инстанса сосуществуют записи обоих провайдеров (инстанс мог
+# переключаться, ADR-032), и подстановка текущего провайдера переписала бы историю.
+
+# Префиксы имён моделей → провайдер. Порядок не важен (префиксы не пересекаются).
+_PROVIDER_BY_MODEL_PREFIX: tuple[tuple[str, str], ...] = (
+    ("claude", "anthropic"),
+    ("gpt", "openai"),
+)
+
+# Максимальная длина периода `GET /admin/costs/daily` (контракт broad-crm v1.3).
+MAX_DAILY_COSTS_PERIOD_DAYS = 92
+
+
+def provider_of_model(model: str) -> str:
+    """Провайдер по имени модели cost-ledger; нераспознанная модель → её сырое имя.
+
+    Нераспознанное имя отдаётся как есть (а не «other»): CRM отнесёт его в `other`, но
+    оператор увидит, какая именно модель не покрыта маппингом.
+    """
+    normalized = model.strip().lower()
+    for prefix, provider in _PROVIDER_BY_MODEL_PREFIX:
+        if normalized.startswith(prefix):
+            return provider
+    return model.strip() or "other"
+
+
+async def _spend_by_provider(
+    session: AsyncSession, user_id: str, *, total_usd: float
+) -> dict[str, float]:
+    """Разбивка расхода пользователя по провайдерам из cost-ledger (`llm_usage`).
+
+    Сумма разбивки равна `generation_jobs.spend_usd` пользователя: агрегат джобы
+    инкрементируется той же записью ledger (`app/pipeline/cost.record_usage`). Если ledger
+    по джобам пуст, а агрегат ненулевой (исторические строки) — расход отдаётся как `other`,
+    чтобы не потерять сумму.
+    """
+    rows = (
+        await session.execute(
+            select(LlmUsage.model, func.coalesce(func.sum(LlmUsage.cost_usd), 0))
+            .join(GenerationJob, GenerationJob.id == LlmUsage.job_id)
+            .where(GenerationJob.user_id == user_id)
+            .group_by(LlmUsage.model)
+        )
+    ).all()
+
+    breakdown: dict[str, float] = {}
+    for model, spend in rows:
+        provider = provider_of_model(model)
+        breakdown[provider] = round(breakdown.get(provider, 0.0) + float(spend or 0), 4)
+    if not breakdown and total_usd > 0:
+        breakdown["other"] = total_usd
+    return breakdown
+
+
+async def daily_costs(
+    session: AsyncSession,
+    *,
+    date_from: date_,
+    date_to: date_,
+    limit: int,
+    offset: int,
+) -> CrmDailyCostsResponse:
+    """Дневные расходы день × провайдер за период (расширение контракта broad-crm v1.3).
+
+    Границы периода — календарные дни UTC, включительно с обеих сторон. Отсутствие строки
+    за (день, провайдер) означает «расхода не было» — нули не досыпаются. Сортировка
+    `date ASC, provider ASC` (пара уникальна → пагинация `limit/offset` стабильна).
+    """
+    if date_from > date_to:
+        raise bad_request("date_from must not be after date_to.")
+    if (date_to - date_from).days + 1 > MAX_DAILY_COSTS_PERIOD_DAYS:
+        raise bad_request(f"Period must not exceed {MAX_DAILY_COSTS_PERIOD_DAYS} days.")
+
+    start = datetime.combine(date_from, time.min, tzinfo=UTC)
+    end = datetime.combine(date_to, time.min, tzinfo=UTC) + timedelta(days=1)
+    day = func.date(func.timezone("UTC", LlmUsage.created_at)).label("day")
+    tokens_sum = func.sum(
+        LlmUsage.input_tokens
+        + LlmUsage.output_tokens
+        + LlmUsage.cache_read_tokens
+        + LlmUsage.cache_write_tokens
+    )
+
+    rows = (
+        await session.execute(
+            select(
+                day,
+                LlmUsage.model,
+                func.count().label("requests"),
+                func.coalesce(func.sum(LlmUsage.cost_usd), 0).label("spend_usd"),
+                func.coalesce(tokens_sum, 0).label("tokens"),
+            )
+            .where(LlmUsage.created_at >= start, LlmUsage.created_at < end)
+            .group_by(day, LlmUsage.model)
+        )
+    ).all()
+
+    # Свёртка модель → провайдер выполняется в приложении: маппинг живёт в коде, а не в SQL.
+    aggregated: dict[tuple[str, str], dict[str, float]] = {}
+    for day_value, model, requests, spend_usd, tokens in rows:
+        key = (day_value.isoformat(), provider_of_model(model))
+        bucket = aggregated.setdefault(key, {"spend_usd": 0.0, "requests": 0.0, "tokens": 0.0})
+        bucket["spend_usd"] += float(spend_usd or 0)
+        bucket["requests"] += int(requests or 0)
+        bucket["tokens"] += float(tokens or 0)
+
+    ordered = sorted(aggregated.items())
+    page = ordered[offset : offset + limit]
+    return CrmDailyCostsResponse(
+        total=len(ordered),
+        items=[
+            CrmDailyCostItem(
+                date=day_value,
+                provider=provider,
+                spend_usd=round(bucket["spend_usd"], 4),
+                requests=int(bucket["requests"]),
+                tokens=bucket["tokens"],
+            )
+            for (day_value, provider), bucket in page
+        ],
     )
