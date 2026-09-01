@@ -192,7 +192,7 @@ Scrape-конфиг Prometheus и provisioning/дашборды Grafana — **к
 
 Env-контракт эндпоинтов `POST /v1/tokens/purchase` / `POST /v1/subscription/sync` (собственный JWS-верификатор `app/billing/storekit.py`). Два ключа, потребитель — **api**:
 - **`APPSTORE_ROOT_CERT_DIR`** (`str`, дефолт `certs/appstore`) — каталог доверенных root-сертификатов; пусто/нет сертификатов → **fail-closed `422`**.
-- **`APPSTORE_BUNDLE_ID`** (`str`, дефолт `""`) — ожидаемый bundle id; **пусто → bundle-check пропускается (тест/dev ТОЛЬКО)**; prod → реальный bundle id.
+- **`APPSTORE_BUNDLE_ID`** (`str`, дефолт кода `""`) — ожидаемый bundle id; **пусто → bundle-check пропускается (тест/dev ТОЛЬКО)**; prod → реальный bundle id. ⚠️ **Подстановка в `docker-compose.prod.yml` — `${APPSTORE_BUNDLE_ID-<prod-дефолт>}` (без двоеточия, нормативно):** форма `:-` вернула бы прод-дефолт и на пустой строке, и режим «пусто → skip» нельзя было бы включить через `.env` инстанса. Дефолт применяется только когда ключ в `.env` **отсутствует**; явно заданное пустое значение доходит до `Settings`.
 - **`STOREKIT_INSECURE_SKIP_VERIFY`** (`bool`, дефолт `false`) — **временный тестовый обход** крипто-верификации ([ADR-043](adr/ADR-043-temporary-storekit-verification-bypass.md)): `true` → цепочка и подпись не проверяются. **Только тест-инстанс, только на время тестирования**; на инстансе с реальными покупками — дыра (самоподписанная транзакция → `pro`/токены).
 
 **Механизм потребления** — поля `Settings` (стилем `apns_bundle_id`); ⚠️ обе — app-env api → при энфорсе через `Settings` **ОБЯЗАНЫ** быть в `x-app-env` compose api (иначе `extra=ignore` молча отдаст дефолт `certs/appstore`/`""`). **Без новых секретов** (сертификаты публичны; JWS-транзакция приходит от клиента в теле запроса).
