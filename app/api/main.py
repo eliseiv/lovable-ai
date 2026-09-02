@@ -28,6 +28,7 @@ from app.api.routers import (
     jobs,
     projects,
     storekit,
+    templates,
 )
 from app.core.config import get_settings
 from app.core.logging import configure_logging
@@ -170,6 +171,7 @@ app.include_router(health.router)
 # Версионированные доменные роутеры под /v1.
 app.include_router(auth.router, prefix="/v1")
 app.include_router(projects.router, prefix="/v1")
+app.include_router(templates.router, prefix="/v1")
 app.include_router(jobs.router, prefix="/v1")
 app.include_router(billing.router, prefix="/v1")
 # ADR-039: прямой StoreKit-путь покупок (POST /v1/tokens/purchase · /subscription/sync),

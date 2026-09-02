@@ -24,7 +24,12 @@ from app.schemas.api import (
     RevisionsListResponse,
     RollbackResponse,
 )
-from app.services import attachments_service, edit_service, project_service
+from app.services import (
+    attachments_service,
+    edit_service,
+    project_service,
+    template_service,
+)
 
 router = APIRouter(prefix="/projects")
 
@@ -52,7 +57,9 @@ async def _read_uploads(images: list[UploadFile]) -> list[tuple[str | None, byte
     tags=["Проекты"],
     summary="Создать проект и запустить генерацию",
     description=(
-        "Создаёт новый проект и запускает асинхронную генерацию сайта по текстовому промту. "
+        "Создаёт новый проект и запускает асинхронную генерацию сайта по текстовому промту "
+        "или по выбранному шаблону (`template_id` из `GET /templates`; тогда `prompt` "
+        "необязателен и служит уточнением). Лимиты и списание в обоих случаях одинаковы. "
         "Обязателен заголовок `Idempotency-Key` (защищает от повторного создания при "
         "повторной отправке запроса). В ответ возвращаются идентификаторы проекта "
         "(`project_id`) и задачи генерации (`job_id`); статус отслеживается через "
@@ -70,7 +77,24 @@ async def _read_uploads(images: list[UploadFile]) -> list[tuple[str | None, byte
 async def create_project(
     user: CurrentUser,
     session: SessionDep,
-    prompt: Annotated[str, Form(min_length=1, description="Текстовое описание желаемого сайта.")],
+    prompt: Annotated[
+        str | None,
+        Form(
+            description="Текстовое описание желаемого сайта. Необязательно, если задан "
+            "`template_id` — тогда служит уточнением к шаблону."
+        ),
+    ] = None,
+    template_id: Annotated[
+        str | None,
+        Form(
+            description=(
+                "Идентификатор шаблона из `GET /templates`. Генерация стартует с промптом "
+                "шаблона; `prompt` (если передан) добавляется как уточнение. Вместе с "
+                "`template_id` передавайте `locale` — иначе язык сайта определится по "
+                "англоязычному промпту шаблона."
+            )
+        ),
+    ] = None,
     title: Annotated[str | None, Form(description="Необязательное название проекта.")] = None,
     locale: Annotated[
         str | None,
@@ -91,6 +115,16 @@ async def create_project(
     # ADR-034 §D11: multipart (prompt+title как Form, images как list[UploadFile]).
     if not idempotency_key:
         raise unprocessable("Idempotency-Key header is required.")
+    # Шаблон (ADR-048) — предзаполненный промпт, а не отдельный режим генерации: подставляем
+    # текст шаблона и дальше идём тем же путём, что свободный ввод (те же квоты, гейт,
+    # идемпотентность). Неизвестный id — ошибка клиента, а не молчаливый старт «пустышки».
+    if template_id is not None:
+        template = template_service.get_template(template_id)
+        if template is None:
+            raise unprocessable("Unknown template_id.")
+        prompt = template_service.build_prompt(template, prompt)
+    elif not (prompt or "").strip():
+        raise unprocessable("Either prompt or template_id is required.")
     # ADR-034 §D2: валидация (sniff magic bytes + лимиты) ДО создания джобы. Нарушение → 422.
     validated = attachments_service.validate_images(get_settings(), await _read_uploads(images))
     # ADR-036 §4: нормализация явного locale в ОДНОМ месте (роутер) → в сервис попадает уже
@@ -98,7 +132,7 @@ async def create_project(
     result = await project_service.create_project_with_job(
         session,
         user_id=user.id,
-        prompt=prompt,
+        prompt=prompt or "",
         title=title,
         idempotency_key=idempotency_key,
         requested_locale=normalize_locale(locale),

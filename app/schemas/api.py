@@ -104,6 +104,26 @@ class JobStatusResponse(BaseModel):
     updated_at: datetime = Field(description="Время последнего обновления статуса.")
 
 
+# --- GET /templates ---
+
+
+class TemplateOut(BaseModel):
+    """Шаблон сайта: карточка каталога."""
+
+    id: str = Field(description="Идентификатор шаблона — передаётся в `POST /projects`.")
+    title: str = Field(description="Название шаблона для карточки.")
+    preview_url: str | None = Field(
+        description="Абсолютный URL превью-картинки; `null` — картинки пока нет, клиент "
+        "показывает собственную заглушку."
+    )
+
+
+class TemplateListResponse(BaseModel):
+    """Каталог шаблонов в порядке показа."""
+
+    items: list[TemplateOut] = Field(description="Шаблоны в порядке показа карточек.")
+
+
 # --- GET /jobs/{jid}/plan ---
 
 

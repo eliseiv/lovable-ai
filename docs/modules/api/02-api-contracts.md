@@ -12,6 +12,8 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 | GET | `/auth/tokens` | список токенов/устройств (S3) | Bearer | `200` |
 | DELETE | `/auth/tokens/{id}` | отозвать токен / logout (S3) | Bearer | `204` |
 | POST | `/projects` | создать проект + старт генерации (**multipart**: `prompt`+опц.`images`, [ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) | Bearer | `202` |
+| GET | `/templates` | каталог шаблонов сайтов ([ADR-048](../../adr/ADR-048-site-templates-catalog.md)) | Bearer | `200` |
+| GET | `/templates/{id}/preview` | превью-картинка шаблона | Bearer | `200` (jpeg) |
 | GET | `/projects` | список проектов пользователя | Bearer | `200` |
 | GET | `/projects/{pid}` | детали проекта + live URL | Bearer | `200` |
 | DELETE | `/projects/{pid}` | удалить проект + полный GC ресурсов (S4) | Bearer | `202` |
@@ -41,6 +43,18 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 - Гейтинг: quota-gate (активный entitlement + остаток квоты — генерации/`max_projects`/`max_concurrent`). Нарушение → `402`. Контракт гейта — [modules/billing/02-api-contracts.md §3](../billing/02-api-contracts.md#3-quota-gate-на-post-v1projects-и-post-v1projectspidedits).
 - `202` → `{ "project_id": "p_...", "job_id": "j_..." }`.
 - Ошибки: `401`, `402` (RFC-7807, поля `required_entitlement` + `reason` ∈ `no_entitlement`/`quota_exhausted`/`project_limit`/`concurrency_limit`), `422`.
+
+- **`template_id`** (Form, опц., [ADR-048](../../adr/ADR-048-site-templates-catalog.md)) — старт по шаблону: промпт берётся из каталога, `prompt` при этом **необязателен** и добавляется отдельным абзацем как уточнение («Additional requirements from the user: …»).
+  - Ни `prompt`, ни `template_id` → **`422`**; неизвестный `template_id` → **`422`**.
+  - ⚠️ Вместе с `template_id` клиент обязан передавать **`locale`**: промпты шаблонов англоязычные, и без явного locale авто-детект ([ADR-025](../../adr/ADR-025-content-language-detection.md)) сделает сайт на английском.
+  - Квоты, гейт `402`, идемпотентность и списание — те же, что у свободного промпта: шаблон не отдельный тариф.
+
+## GET /templates · GET /templates/{id}/preview ([ADR-048](../../adr/ADR-048-site-templates-catalog.md))
+Каталог шаблонов для экрана выбора. Шаблон — **предзаполненный промпт**, отдельного режима генерации нет.
+- `GET /templates` → `{ "items": [ { "id", "title", "preview_url" } ] }`; порядок = порядок карточек.
+- `preview_url` — абсолютный URL на этом же домене (`https://{APPS_DOMAIN}/v1/templates/{id}/preview`) либо **`null`**, если картинки в образе ещё нет (штатное состояние: клиент рисует заглушку).
+- `GET /templates/{id}/preview` → `image/jpeg` (`Cache-Control: public, max-age=86400`); неизвестный шаблон или отсутствующая картинка → `404`.
+- Каталог одинаков для всех пользователей инстанса и меняется вместе с образом (деплой), релиз приложения для нового шаблона не нужен.
 
 ## GET /projects · GET /projects/{pid}
 - `200` список / детали: `{ "id", "title", "prompt", "current_revision_id", "live_url": "string?", "created_at" }`.
