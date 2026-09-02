@@ -23,7 +23,7 @@ from app.db.models import JobSection
 from app.db.session import session_scope
 from app.pipeline.agents.agent2 import PlannedSection
 from app.pipeline.agents.base import TextDeltaHook
-from app.pipeline.events import publish_event
+from app.pipeline.events import publish_event, record_event
 
 logger = get_logger(__name__)
 
@@ -61,11 +61,16 @@ async def list_sections(session: AsyncSession, job_id: str) -> list[JobSection]:
 
 
 async def _mark_done(job_id: str, section_id: str, title: str) -> None:
-    """Отмечает секцию готовой в своей короткой транзакции + публикует событие.
+    """Отмечает секцию готовой в своей короткой транзакции + доставляет событие клиенту.
 
     Своя сессия, а не сессия шага: шаг держит открытую транзакцию всего шага генерации,
     и коммит прогресса в ней опубликовал бы незавершённое состояние шага.
+
+    Событие пишется в `job_events` И публикуется в Redis — ровно как переходы state
+    (ADR-012 §2): SSE-кадры формируются ИЗ `job_events` (там же replay по Last-Event-ID),
+    а pub/sub — лишь wake-сигнал. Без записи в БД событие не дошло бы до клиента вовсе.
     """
+    payload = {"section_id": section_id, "title": title}
     async with session_scope() as progress_session:
         await progress_session.execute(
             update(JobSection)
@@ -76,12 +81,9 @@ async def _mark_done(job_id: str, section_id: str, title: str) -> None:
             )
             .values(status=SECTION_STATUS_DONE, completed_at=datetime.now(UTC))
         )
+        await record_event(progress_session, job_id, "section_completed", payload=payload)
         await progress_session.commit()
-    await publish_event(
-        job_id,
-        "section_completed",
-        payload={"section_id": section_id, "title": title},
-    )
+    await publish_event(job_id, "section_completed", payload=payload)
 
 
 def make_progress_hook(job_id: str, sections: Sequence[PlannedSection]) -> TextDeltaHook | None:

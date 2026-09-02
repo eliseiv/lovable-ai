@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import json
 import zipfile
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -274,3 +275,66 @@ async def test_download_source_of_foreign_project_is_404(client, session, storag
 
     resp = await client.get(f"/v1/projects/{pid}/source", headers=_auth())
     assert resp.status_code == 404
+
+
+async def test_section_completion_lands_in_job_events(client, session, monkeypatch):
+    """Отметка секции пишется в job_events — иначе событие не дошло бы до SSE.
+
+    SSE-кадры формируются ИЗ `job_events` (Redis — лишь wake-сигнал), поэтому запись в БД
+    здесь не деталь реализации, а условие доставки прогресса клиенту.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import JobEvent
+    from app.services import plan_service
+
+    await _user(session, _UID)
+    _pid, jid = await _project_with_job(session, state=JobState.BUILDING)
+    session.add(
+        JobSection(job_id=jid, section_id="gallery", title="Галерея", position=0, status="pending")
+    )
+    await session.commit()
+
+    published: list[tuple[str, str]] = []
+
+    async def fake_publish(job_id, event_type, **kwargs):  # noqa: ANN001, ANN202
+        published.append((job_id, event_type))
+
+    @asynccontextmanager
+    async def test_session_scope():  # noqa: ANN202
+        # Прогресс пишется в СВОЕЙ сессии; в тесте она подменяется на транзакционную
+        # сессию стенда, иначе другое соединение не увидит неоткоммиченных данных теста.
+        yield session
+
+    monkeypatch.setattr(plan_service, "publish_event", fake_publish)
+    monkeypatch.setattr(plan_service, "session_scope", test_session_scope)
+    await plan_service._mark_done(jid, "gallery", "Галерея")
+
+    events = (
+        (
+            await session.execute(
+                select(JobEvent).where(
+                    JobEvent.job_id == jid, JobEvent.event_type == "section_completed"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(events) == 1
+    assert events[0].payload == {"section_id": "gallery", "title": "Галерея"}
+    assert published == [(jid, "section_completed")]
+
+    row = (
+        (
+            await session.execute(
+                select(JobSection).where(
+                    JobSection.job_id == jid, JobSection.section_id == "gallery"
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert row.status == "done"
+    assert row.completed_at is not None
