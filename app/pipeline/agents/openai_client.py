@@ -30,7 +30,7 @@ import httpx
 from openai import AsyncOpenAI
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall, ImageInput
+from app.pipeline.agents.base import AgentCall, ImageInput, TextDeltaHook
 from app.workers.retry_policy import IncompleteLLMStreamError
 
 # Себестоимость per-1M токенов (USD) OpenAI-моделей — НОРМАТИВНАЯ таблица
@@ -153,6 +153,7 @@ class OpenAIAgentClient:
         system_prompt: str,
         user_content: str,
         images: list[ImageInput] | None = None,
+        on_text_delta: TextDeltaHook | None = None,
     ) -> AgentCall:
         """Один текстовый вызов агента через Responses API (ADR-032 §2/§3).
 
@@ -177,6 +178,7 @@ class OpenAIAgentClient:
             system_prompt=system_prompt,
             user_content=user_content,
             images=images,
+            on_text_delta=on_text_delta,
         )
         text = response.output_text
         return self._build_call(model, response, text)
@@ -205,6 +207,7 @@ class OpenAIAgentClient:
     async def _stream_final_response(
         self,
         *,
+        on_text_delta: TextDeltaHook | None = None,
         agent: str,
         model: str,
         system_prompt: str,
@@ -238,6 +241,14 @@ class OpenAIAgentClient:
         }
         async with self._client.responses.stream(**kwargs) as stream:
             try:
+                if on_text_delta is not None:
+                    # Текстовые дельты Responses API (ADR-046 §B): хук видит вывод по мере
+                    # генерации. Без хука итерация не запускается — прежний путь байт-в-байт.
+                    async for event in stream:
+                        if getattr(event, "type", "") == "response.output_text.delta":
+                            delta = getattr(event, "delta", "")
+                            if delta:
+                                await on_text_delta(delta)
                 return await stream.get_final_response()
             except RuntimeError as exc:
                 # SDK бросает stdlib RuntimeError, не openai.APIError, если SSE закрылся

@@ -31,7 +31,7 @@ from typing import Any
 from app.core.config import Settings
 from app.observability.sentry import scrub_text
 from app.observability.timing import timed_agent_call
-from app.pipeline.agents.base import AgentCall, ImageInput, LLMAgentClient
+from app.pipeline.agents.base import AgentCall, ImageInput, LLMAgentClient, TextDeltaHook
 
 # Классы фейла structured-output (§I.4): parse — структура не извлеклась; schema — извлеклась,
 # но не прошла доменную валидацию.
@@ -257,6 +257,10 @@ class StructuredResult[T]:
 
     value: T
     call: AgentCall
+    # Извлечённая из ответа структура ДО доменной валидации: нужна вызывающему, когда
+    # помимо валидированного значения из того же ответа читаются необязательные поля
+    # (план сайта Agent 2, ADR-046) — повторно парсить call.text не приходится.
+    raw: Any
 
 
 async def run_structured_agent[T](
@@ -272,6 +276,7 @@ async def run_structured_agent[T](
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
     images: list[ImageInput] | None = None,
+    on_text_delta: TextDeltaHook | None = None,
     retry_nudge: str = (
         "\n\nReturn the result STRICTLY as raw JSON — no markdown fences, no prose."
     ),
@@ -313,6 +318,7 @@ async def run_structured_agent[T](
                 system_prompt=strict_system_prompt,
                 user_content=content,
                 images=images,
+                on_text_delta=on_text_delta,
             )
         # Вызов оплачен — учитываем usage ВСЕГДА (включая последующий parse/schema-фейл, §I.3).
         await after_call(call)
@@ -367,7 +373,7 @@ async def run_structured_agent[T](
             last_error.__dict__["domain_exc"] = exc
             continue
 
-        return StructuredResult(value=value, call=call)
+        return StructuredResult(value=value, call=call, raw=structure)
 
     # Ретраи исчерпаны: пробрасываем исходное доменное исключение, если было (для §I.3 Agent 3/4
     # — встраивание в agent_output_invalid), иначе StructuredOutputError (Agent 1/2 → §I.3).

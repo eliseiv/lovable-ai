@@ -262,6 +262,37 @@ class JobEvent(Base):
     __table_args__ = (Index("ix_job_events_job_id_id", "job_id", "id"),)
 
 
+class JobSection(Base):
+    """Пункт плана сайта и его прогресс (ADR-046, docs/03-data-model.md → job_sections).
+
+    План формирует Agent 2 вместе со спекой; статус `done` проставляется, когда секция
+    распознана в потоке кодогенерации Agent 3. Строки живут в рамках джобы: у правок и
+    откатов своего плана нет, поэтому таблица пуста для них — это не ошибка, а отсутствие
+    плана (клиент показывает чат без чек-листа).
+    """
+
+    __tablename__ = "job_sections"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("generation_jobs.id"), nullable=False)
+    # Латиница kebab-case: он же токен детекта секции в потоке Agent 3 (ADR-046 §B).
+    section_id: Mapped[str] = mapped_column(String, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    # "pending" | "done" — промежуточного "in_progress" нет: поток даёт момент готовности
+    # секции, а не её начало (ADR-046 §B).
+    status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("job_id", "section_id", name="uq_job_sections_job_section"),
+        Index("ix_job_sections_job_id_position", "job_id", "position"),
+    )
+
+
 class Question(Base):
     __tablename__ = "questions"
 

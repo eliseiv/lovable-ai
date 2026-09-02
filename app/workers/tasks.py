@@ -59,7 +59,14 @@ from app.pipeline.agents.structured import (
 )
 from app.pipeline.cost import record_usage
 from app.pipeline.dispatcher import dispatch_for_state
-from app.pipeline.events import fail_job, load_job, record_event, touch_heartbeat, transition
+from app.pipeline.events import (
+    fail_job,
+    load_job,
+    publish_event,
+    record_event,
+    touch_heartbeat,
+    transition,
+)
 from app.pipeline.failure_signature import (
     build_failure_log,
     compute_failure_signature,
@@ -75,6 +82,7 @@ from app.pipeline.guards import (
 )
 from app.pipeline.language import detect_language, language_from_bcp47
 from app.schemas.agent_output import AgentOutputError
+from app.services import plan_service
 from app.storage import s3
 from app.storage.s3 import S3Storage, get_storage
 from app.workers.celery_app import celery_app
@@ -337,6 +345,18 @@ async def _spec(job_id: str) -> None:
             return
 
         spec_md = spec_result.spec_markdown
+        # План сайта (ADR-046): пишется в той же транзакции, что и спека, и публикуется
+        # клиенту одним событием — чат показывает чек-лист до начала кодогенерации.
+        plan_rows = await plan_service.save_plan(session, job.id, spec_result.sections)
+        if plan_rows:
+            await record_event(
+                session,
+                job.id,
+                "plan_ready",
+                payload={
+                    "sections": [{"id": row.section_id, "title": row.title} for row in plan_rows]
+                },
+            )
         if len(spec_md.encode("utf-8")) <= settings.spec_inline_max_bytes:
             job.spec_tz = spec_md
             job.spec_ref = None
@@ -345,6 +365,17 @@ async def _spec(job_id: str) -> None:
             job.spec_tz = None
             job.spec_ref = ref
         await session.commit()
+
+        if plan_rows:
+            # publish — ПОСЛЕ commit (SSE не должен видеть незакоммиченный план); best-effort,
+            # источник истины плана — job_sections + job_events (ADR-046 §C).
+            await publish_event(
+                job.id,
+                "plan_ready",
+                payload={
+                    "sections": [{"id": row.section_id, "title": row.title} for row in plan_rows]
+                },
+            )
 
         # Agent 3: дерево файлов (валидируется строго).
         await record_event(session, job.id, "agent_started", payload={"agent": "agent3"})
@@ -360,6 +391,7 @@ async def _spec(job_id: str) -> None:
                 before_call=a3_before,
                 after_call=a3_after,
                 on_attempt_failure=a3_fail,
+                on_text_delta=plan_service.make_progress_hook(job.id, spec_result.sections),
             )
         except PreCallGuardTripped as exc:
             await fail_job(session, job, failure_reason=exc.reason)

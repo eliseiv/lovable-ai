@@ -17,7 +17,7 @@ from anthropic import AsyncAnthropic
 from anthropic.types import OutputConfigParam
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall, ImageInput
+from app.pipeline.agents.base import AgentCall, ImageInput, TextDeltaHook
 from app.workers.retry_policy import LLMCredentialError
 
 # `AgentCall` — провайдер-нейтральный тип, перенесён в base.py (ADR-032 §1, единый источник для
@@ -91,6 +91,7 @@ class ClaudeAgentClient:
         system_prompt: str,
         user_content: str,
         images: list[ImageInput] | None = None,
+        on_text_delta: TextDeltaHook | None = None,
     ) -> AgentCall:
         """Один текстовый вызов агента (ADR-020 §I.1, revised): стабильный system кэшируется,
         user — волатильная часть. Стримим (длинный вывод) + собираем финальное сообщение —
@@ -117,6 +118,7 @@ class ClaudeAgentClient:
             system_prompt=system_prompt,
             user_content=user_content,
             images=images,
+            on_text_delta=on_text_delta,
         )
         text = "".join(block.text for block in message.content if block.type == "text")
         return self._build_call(model, message, text)
@@ -147,6 +149,7 @@ class ClaudeAgentClient:
     async def _stream_final_message(
         self,
         *,
+        on_text_delta: TextDeltaHook | None = None,
         agent: str,
         model: str,
         system_prompt: str,
@@ -188,6 +191,12 @@ class ClaudeAgentClient:
         }
         try:
             async with self._client.messages.stream(**kwargs) as stream:
+                if on_text_delta is not None:
+                    # Итерируем текстовые дельты ДО get_final_message (ADR-046 §B): хук видит
+                    # вывод по мере генерации. Без хука итерация не запускается — прежний
+                    # путь остаётся байт-в-байт.
+                    async for chunk in stream.text_stream:
+                        await on_text_delta(chunk)
                 return await stream.get_final_message()
         except TypeError as exc:
             raise LLMCredentialError(

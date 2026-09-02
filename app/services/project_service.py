@@ -20,6 +20,7 @@ from app.core.ids import new_job_id, new_project_id
 from app.core.logging import get_logger
 from app.db.enums import JobState
 from app.db.models import GenerationJob, Project, Revision, SiteDeployment
+from app.deploy.workspace import SourceBundleTooLarge, repack_source_tgz_to_zip
 from app.pipeline.dispatcher import dispatch_for_state
 from app.pipeline.events import record_event
 from app.services.attachments_service import ValidatedImage, persist_images
@@ -361,3 +362,54 @@ async def get_live_urls_for_projects(
         if url is not None:
             live_by_project[project_id] = url
     return live_by_project
+
+
+@dataclass(frozen=True)
+class SourceBundle:
+    """Готовый к отдаче архив исходников ревизии (`GET /projects/{pid}/source`)."""
+
+    revision_no: int
+    filename: str
+    content: bytes
+
+
+async def get_source_bundle(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    project_id: str,
+    revision_no: int | None = None,
+) -> SourceBundle:
+    """Исходники ревизии проекта одним zip-архивом (ADR-047).
+
+    `revision_no=None` → текущая активная ревизия проекта. Чужой/несуществующий/удалённый
+    проект и отсутствие такой ревизии → 404 (существование чужого проекта не раскрываем);
+    проект без единой опубликованной ревизии → 404 с говорящим detail; архив больше предела
+    распаковки → 409 (ошибка не тихая, оператор видит причину).
+    """
+    project = await get_project(session, user_id, project_id)
+    if project is None:
+        raise not_found("Project not found.")
+
+    if revision_no is not None:
+        revision = await get_revision_by_no(session, project_id, revision_no)
+        if revision is None:
+            raise not_found("Revision not found.")
+    elif project.current_revision_id is None:
+        raise not_found("Project has no published revision yet.")
+    else:
+        revision = await session.get(Revision, project.current_revision_id)
+        if revision is None:  # pragma: no cover — FK гарантирует наличие строки
+            raise not_found("Project has no published revision yet.")
+
+    source_tgz = await get_storage().get_bytes(revision.source_artifact_ref)
+    try:
+        content = repack_source_tgz_to_zip(source_tgz)
+    except SourceBundleTooLarge as exc:
+        raise conflict(str(exc)) from exc
+
+    return SourceBundle(
+        revision_no=revision.revision_no,
+        filename=f"{project_id}-rev{revision.revision_no}.zip",
+        content=content,
+    )

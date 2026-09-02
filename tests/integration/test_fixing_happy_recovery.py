@@ -124,6 +124,7 @@ class _FakeClient:
         system_prompt,
         user_content,  # noqa: ANN001
         images=None,  # noqa: ANN001 — ADR-034 §D3: vision-вход (дефолт None = текстовый путь)
+        on_text_delta=None,  # noqa: ANN001 — ADR-046: хук потока (дефолт None = прежний путь)
     ):
         text = type(self)._texts.pop(0) if type(self)._texts else "{}"
         return _call(text)

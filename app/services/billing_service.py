@@ -10,7 +10,9 @@ user_id (а не за текущего Bearer).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing import entitlements, usage
@@ -19,7 +21,8 @@ from app.billing.subscription_state import (
     STATUS_ACTIVE,
     get_subscription,
 )
-from app.db.models import User
+from app.db.enums import JobState
+from app.db.models import GenerationJob, User
 from app.schemas.api import BillingQuota
 
 
@@ -91,4 +94,31 @@ async def build_billing_snapshot(session: AsyncSession, user: User) -> BillingSn
     )
 
 
-__all__ = ["BillingSnapshot", "build_billing_snapshot"]
+# Окно усреднения стоимости генерации (ADR-045). 30 дней, а не «за всё время»: цены моделей
+# и состав пайплайна меняются, и среднее по всей истории отражало бы уже неактуальные тарифы.
+AVG_GENERATION_COST_WINDOW_DAYS = 30
+
+
+async def get_avg_generation_cost_usd(session: AsyncSession) -> float | None:
+    """Средняя стоимость одной успешной генерации по сервису за окно усреднения (ADR-045).
+
+    Считается по терминально успешным (`LIVE`) джобам генерации с ненулевым расходом:
+    нулевые (rollback-публикации, аварийно оборванные до первого вызова модели) занизили бы
+    среднее, не отражая стоимость самой генерации. Нет данных за окно → `None` (а не `0.0`):
+    «неизвестно» и «бесплатно» — разные состояния.
+    """
+    since = datetime.now(UTC) - timedelta(days=AVG_GENERATION_COST_WINDOW_DAYS)
+    avg = (
+        await session.execute(
+            select(func.avg(GenerationJob.spend_usd)).where(
+                GenerationJob.kind == "generation",
+                GenerationJob.state == JobState.LIVE,
+                GenerationJob.created_at >= since,
+                GenerationJob.spend_usd > 0,
+            )
+        )
+    ).scalar_one_or_none()
+    return None if avg is None else round(float(avg), 4)
+
+
+__all__ = ["BillingSnapshot", "build_billing_snapshot", "get_avg_generation_cost_usd"]

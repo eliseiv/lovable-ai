@@ -17,6 +17,7 @@ import io
 import json
 import re
 import tarfile
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -271,3 +272,51 @@ def safe_extract_tgz(data: bytes, dest: Path) -> None:
             if member.name == _BUILD_MANIFEST_NAME:
                 continue  # все дубликаты уже отвергнуты на проверочном проходе
             tar.extract(member, path=base, set_attrs=False)
+
+
+# Предел суммарного распакованного размера при перепаковке исходников в zip
+# (`GET /projects/{pid}/source`, ADR-047). Дерево Agent 3 — текстовые файлы плюс инжектированные
+# ассеты пользователя; предел отсекает патологический архив, не читая его целиком в память.
+SOURCE_ZIP_MAX_TOTAL_BYTES = 64 * 1024 * 1024
+
+
+class SourceBundleTooLarge(ValueError):
+    """Распакованные исходники превышают SOURCE_ZIP_MAX_TOTAL_BYTES (роутер → 409)."""
+
+
+def repack_source_tgz_to_zip(
+    data: bytes, *, max_total_bytes: int = SOURCE_ZIP_MAX_TOTAL_BYTES
+) -> bytes:
+    """Перепаковывает source.tgz ревизии в zip для выгрузки пользователю.
+
+    Отдаёт РОВНО исходники сайта: служебный манифест сборки `.build.json` исключается
+    (он часть контракта воркера, а не дерева проекта — тот же пропуск, что в
+    `safe_extract_tgz`). Не-regular членов в архиве быть не может (`pack_source_tgz`
+    пишет только regular files), но проверка сохраняется как defense-in-depth: чужой
+    entry отвергается, а не переносится в zip.
+
+    Суммарный распакованный размер ограничен `max_total_bytes` → `SourceBundleTooLarge`.
+    """
+    buffer = io.BytesIO()
+    total = 0
+    with (
+        tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar,
+        zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf,
+    ):
+        for member in tar.getmembers():
+            if member.name == _BUILD_MANIFEST_NAME:
+                continue
+            if member.isdir():
+                continue
+            if not member.isreg():
+                raise ValueError(f"non-regular tar entry rejected: {member.name!r}")
+            total += member.size
+            if total > max_total_bytes:
+                raise SourceBundleTooLarge(
+                    f"source bundle exceeds {max_total_bytes} bytes when unpacked"
+                )
+            extracted = tar.extractfile(member)
+            if extracted is None:  # pragma: no cover — regular member всегда читаем
+                raise ValueError(f"unreadable tar entry: {member.name!r}")
+            zf.writestr(member.name, extracted.read())
+    return buffer.getvalue()

@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Protocol
@@ -52,6 +53,13 @@ class ImageInput:
     media_type: str
 
 
+# Колбэк на текстовые дельты ответа (ADR-046 §B): вызывается по мере поступления вывода
+# модели, до её завершения. Нужен посекционному прогрессу генерации — детект «секция
+# сгенерирована» смотрит на растущий текст. `None` (дефолт) ⇒ стрим не итерируется вовсе и
+# путь обоих провайдеров остаётся прежним байт-в-байт (инвариант обратной совместимости).
+TextDeltaHook = Callable[[str], Awaitable[None]]
+
+
 class LLMAgentClient(Protocol):
     """Провайдер-агностичный контракт клиента агента (ADR-032 §1).
 
@@ -70,6 +78,7 @@ class LLMAgentClient(Protocol):
         system_prompt: str,
         user_content: str,
         images: list[ImageInput] | None = None,
+        on_text_delta: TextDeltaHook | None = None,
     ) -> AgentCall: ...
 
 

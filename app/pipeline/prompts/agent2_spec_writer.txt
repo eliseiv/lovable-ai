@@ -56,10 +56,23 @@ Constraints:
   and state it plainly.
 
 Output format: respond with a single JSON object and nothing else (no markdown fences,
-no prose before or after it). The object has EXACTLY one top-level key:
+no prose before or after it). The object has EXACTLY two top-level keys:
 
   "spec_markdown" — a string whose value is the full specification written as
   GitHub-flavored Markdown.
+
+  "sections" — an array of the site sections the builder will create, in the order they
+  will appear on the page. Each element is an object with exactly two string fields:
+    "id"    — lowercase latin kebab-case identifier of the section, matching the id you
+              use for it in the spec (e.g. "navbar", "hero", "gallery", "contact-form").
+              Latin letters, digits and single hyphens only — never spaces, underscores
+              or non-latin characters, whatever the content language is.
+    "title" — short human-readable name of the section, written IN THE CONTENT LANGUAGE
+              (the same language as the spec text), shown to the user as a progress
+              checklist item — e.g. "Gallery" for an English site, and the local-language
+              equivalent for any other content language.
+  List every section a visitor will see, at most 12, no duplicates. This array is the
+  plan the app shows while the site is being built — keep it faithful to the spec.
 
 The Markdown is the VALUE of the "spec_markdown" string field; it is NOT the format of
 the whole response. Embed it as a JSON string (newlines as \n, quotes escaped). Do not
@@ -68,4 +81,4 @@ add meta-commentary about being an AI or about the pipeline. The string value of
 "spec_markdown" MUST start with the `**Content language:** <name> (<code>)` marker line.
 
 Minimal valid object:
-{"spec_markdown":"**Content language:** English (en)\n\n# Specification\n…"}
+{"spec_markdown":"**Content language:** English (en)\n\n# Specification\n…","sections":[{"id":"navbar","title":"Navigation"},{"id":"hero","title":"Hero"}]}

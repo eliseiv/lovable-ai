@@ -7,6 +7,7 @@ Output → generation_jobs.spec_tz (inline ≤ 16 KB) или spec_ref в S3. Str
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -45,8 +46,22 @@ class AssetManifestEntry:
 
 
 @dataclass(frozen=True)
+class PlannedSection:
+    """Пункт плана сайта: что Agent 3 будет строить (ADR-046).
+
+    `id` — латиницей в kebab-case: он же токен, по которому прогресс детектится в потоке
+    кодогенерации. `title` — человекочитаемое название на языке контента (показывается
+    в чате приложения).
+    """
+
+    id: str
+    title: str
+
+
+@dataclass(frozen=True)
 class Agent2Result:
     spec_markdown: str
+    sections: tuple[PlannedSection, ...]
     call: AgentCall
 
 
@@ -99,6 +114,45 @@ def _build_user_content(
         lines.append(_build_asset_manifest(assets))
     lines.append("\nWrite the specification now.")
     return "\n".join(lines)
+
+
+# Верхняя граница числа пунктов плана: длинный «план» в чате бесполезен, а раздутый
+# список — это ещё и лишние токены детекта. Лишние пункты отбрасываются, шаг не падает.
+_MAX_PLAN_SECTIONS = 12
+# Допустимая форма id секции — токен для детекта в потоке Agent 3 (ADR-046 §B).
+_SECTION_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _parse_sections(data: Any) -> tuple[PlannedSection, ...]:
+    """План сайта из вывода Agent 2 — best-effort, НЕ повод завалить шаг (ADR-046 §A).
+
+    План — вспомогательный UX-канал (прогресс в чате), а не артефакт сборки: отсутствующий,
+    неполный или кривой `sections` даёт пустой план (клиент просто не покажет чек-лист),
+    но НЕ схема-фейл, который сжёг бы ретрай и мог терминализировать оплаченную генерацию.
+    Записи без валидного id/title пропускаются, дубликаты id схлопываются, порядок
+    сохраняется, длина ограничена `_MAX_PLAN_SECTIONS`.
+    """
+    raw = data.get("sections") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return ()
+    out: list[PlannedSection] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        section_id = entry.get("id")
+        title = entry.get("title")
+        if not isinstance(section_id, str) or not isinstance(title, str):
+            continue
+        section_id = section_id.strip().lower()
+        title = title.strip()
+        if not _SECTION_ID_RE.match(section_id) or not title or section_id in seen:
+            continue
+        seen.add(section_id)
+        out.append(PlannedSection(id=section_id, title=title))
+        if len(out) == _MAX_PLAN_SECTIONS:
+            break
+    return tuple(out)
 
 
 def _validate_spec(data: Any) -> str:
@@ -164,4 +218,8 @@ async def run_agent2(
         on_attempt_failure=on_attempt_failure,
         images=images,
     )
-    return Agent2Result(spec_markdown=result.value, call=result.call)
+    return Agent2Result(
+        spec_markdown=result.value,
+        sections=_parse_sections(result.raw),
+        call=result.call,
+    )

@@ -17,11 +17,13 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 | DELETE | `/projects/{pid}` | удалить проект + полный GC ресурсов (S4) | Bearer | `202` |
 | POST | `/projects/{pid}/edits` | post-delivery правка → Agent 4 (S5; **multipart**: `instruction`+опц.`images`, [ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) | Bearer | `202` |
 | GET | `/projects/{pid}/revisions` | история ревизий | Bearer | `200` |
+| GET | `/projects/{pid}/source` | исходники сайта одним zip-архивом ([ADR-047](../../adr/ADR-047-project-source-download.md)) | Bearer | `200` (zip) |
 | POST | `/projects/{pid}/revisions/{revision_no}/rollback` | откат на good-ревизию (S5) | Bearer | `202` |
 | POST | `/devices` | регистрация APNs device token (S5) | Bearer | `201` |
 | DELETE | `/devices/{apns_token}` | отписка устройства (S5) | Bearer | `204` |
 | GET | `/jobs/{jid}` | poll статуса (канонический) | Bearer | `200` |
 | GET | `/jobs/{jid}/events` | SSE live-статус (reconnect/Last-Event-ID, S5) | Bearer | `200` (event-stream) |
+| GET | `/jobs/{jid}/plan` | план сайта + прогресс по секциям ([ADR-046](../../adr/ADR-046-site-plan-and-section-progress.md)) | Bearer | `200` |
 | GET | `/jobs/{jid}/questions` | уточняющие вопросы | Bearer | `200` |
 | POST | `/jobs/{jid}/answers` | ответы → резюм пайплайна (→ SPECCING) | Bearer | `202` |
 | GET | `/billing/me` | тариф/entitlement + остаток квоты | Bearer | `200` |
@@ -56,9 +58,18 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 
 ## GET /jobs/{jid}
 Канонический статус.
-- `200` → `{ "id", "project_id", "state", "retry_count", "failure_reason": "string?", "live_url": "string?", "updated_at" }`.
+- `200` → `{ "id", "project_id", "state", "retry_count", "failure_reason": "string?", "live_url": "string?", "cost_usd", "updated_at" }`.
+- **`cost_usd`** ([ADR-045](../../adr/ADR-045-generation-cost-in-client-api.md)) — фактическая стоимость задачи в USD (`generation_jobs.spend_usd`): сумма оплаченных вызовов модели к моменту запроса. Растёт по ходу выполнения, окончательна в терминальном состоянии.
 - `state` ∈ `CREATED, INTERVIEWING, AWAITING_CLARIFICATION, SPECCING, BUILDING, DEPLOYING, LIVE, FIXING, FAILED`.
 - **Cross-tenant:** чужой/несуществующий `jid` → `404` (фильтр по `user_id`, не раскрываем существование). Этот же инвариант наследует SSE `GET /jobs/{jid}/events`.
+
+## GET /jobs/{jid}/plan ([ADR-046](../../adr/ADR-046-site-plan-and-section-progress.md))
+План сайта и прогресс по секциям — источник чек-листа в чате приложения.
+- `200` → `{ "sections": [ { "id", "title", "status" } ] }`, порядок = порядок секций на странице.
+- `id` — латиница kebab-case (он же токен детекта прогресса), `title` — на языке контента, `status` ∈ `pending | done`.
+- **Пустой `sections`** — плана нет: задача-правка, откат, задача до этапа `SPECCING` или созданная до появления планов. Это не ошибка: клиент показывает чат без чек-листа.
+- Прогресс в реальном времени — события `plan_ready` и `section_completed` в SSE (см. ниже).
+- **Cross-tenant:** чужой/несуществующий `jid` → `404`.
 
 ## GET /jobs/{jid}/events (SSE) — полный контракт Sprint 5 ([ADR-012](../../adr/ADR-012-sse-realtime-transport.md))
 
@@ -132,6 +143,13 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
 - `200` → `{ "current_revision_id": "r_...", "revisions": [ { "id", "revision_no", "is_good", "created_from_job_id", "created_at" } ] }`.
 - `current_revision_id` — активная good-ревизия (= `projects.current_revision_id`), чтобы UI отметил текущую для rollback. `404` если проект не принадлежит пользователю.
 
+## GET /projects/{pid}/source ([ADR-047](../../adr/ADR-047-project-source-download.md))
+Исходный код опубликованного сайта одним zip — для сохранения и шаринга из приложения.
+- `200` → `application/zip`, имя файла в `Content-Disposition`: `{pid}-rev{N}.zip`.
+- Query `revision_no` (опц., ≥1) — конкретная ревизия; по умолчанию текущая активная (`projects.current_revision_id`).
+- Содержимое = дерево Agent 3 ревизии из `source.tgz`; служебный манифест сборки `.build.json` в архив **не** попадает.
+- `404` — чужой/несуществующий проект, нет такой ревизии, у проекта ещё нет ни одной опубликованной ревизии. `409` — распакованный архив превышает предел (`SOURCE_ZIP_MAX_TOTAL_BYTES`).
+
 ## POST /projects/{pid}/revisions/{revision_no}/rollback (Sprint 5)
 Откат на ранее задеплоенную good-ревизию ([ADR-014 §B](../../adr/ADR-014-edit-limit-revision-rollback.md), [08 §5-3](../../08-product-decisions.md#sprint-5--realtime--edits)). Передеплой существующей ревизии без новой генерации/правки — **лимитом правок/генераций не гейтится**.
 - Auth: Bearer; владение → `404` (cross-tenant).
@@ -142,6 +160,7 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
 
 ## GET /billing/me
 - `200` → `{ "access_level", "status", "period": "YYYY-MM", "quota": { "monthly_generations", "generations_used", "generations_remaining", "monthly_edits", "edits_used", "edits_remaining", "max_concurrent_jobs", "active_jobs", "max_projects", "projects_used" } }` (поля правок — S5, [ADR-014](../../adr/ADR-014-edit-limit-revision-rollback.md)).
+- **`avg_generation_cost_usd`** ([ADR-045](../../adr/ADR-045-generation-cost-in-client-api.md)) — средняя стоимость одной успешной генерации сайта за последние 30 дней по сервису; `null`, если таких генераций за окно не было.
 - Полная схема + источники — [modules/billing/02-api-contracts.md §2](../billing/02-api-contracts.md#2-get-v1billingme) (нормативный источник). Источник: кэш `subscriptions` (lazy-ресинк при протухшем `synced_at`) + `usage_counters`/`edit_usage_counters`/`plan_quotas`.
 
 ## POST /billing/webhook/adapty

@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.core.config import Settings
-from app.pipeline.agents.base import AgentCall, build_agent_client
+from app.pipeline.agents.base import AgentCall, TextDeltaHook, build_agent_client
 from app.pipeline.agents.structured import (
     DiagnosticsHook,
     GuardHook,
@@ -39,6 +39,7 @@ async def run_agent3(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    on_text_delta: TextDeltaHook | None = None,
 ) -> Agent3Result:
     """Один шаг Agent 3 (текстовый режим + строгий промт + extract_json + bounded retry +
     доменная валидация, ADR-020 §I).
@@ -61,5 +62,6 @@ async def run_agent3(
         before_call=before_call,
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
+        on_text_delta=on_text_delta,
     )
     return Agent3Result(tree=result.value, call=result.call)

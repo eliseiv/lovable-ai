@@ -96,7 +96,32 @@ class JobStatusResponse(BaseModel):
     live_url: str | None = Field(
         default=None, description="Адрес работающего сайта (по завершении, `LIVE`)."
     )
+    cost_usd: float = Field(
+        description="Фактическая стоимость этой задачи в USD — израсходовано на вызовы "
+        "модели к текущему моменту. Растёт по ходу выполнения, окончательна в терминальном "
+        "состоянии (`LIVE` / `FAILED`)."
+    )
     updated_at: datetime = Field(description="Время последнего обновления статуса.")
+
+
+# --- GET /jobs/{jid}/plan ---
+
+
+class JobPlanSection(BaseModel):
+    """Пункт плана сайта и его состояние."""
+
+    id: str = Field(description="Идентификатор секции (латиница, kebab-case).")
+    title: str = Field(description="Название секции на языке контента — для показа в чате.")
+    status: str = Field(description="`pending` — ещё создаётся, `done` — готова.")
+
+
+class JobPlanResponse(BaseModel):
+    """План сайта: что будет создано и что уже готово."""
+
+    sections: list[JobPlanSection] = Field(
+        description="Секции в порядке появления на странице. Пустой список — план для этой "
+        "задачи не составлялся (правка, откат или задача, созданная до появления планов)."
+    )
 
 
 # --- GET /jobs/{jid}/questions ---
@@ -296,6 +321,12 @@ class BillingMeResponse(BaseModel):
     status: str = Field(description="Статус подписки.")
     period: str = Field(description="Расчётный период в формате `YYYY-MM`.")
     quota: BillingQuota = Field(description="Лимиты и остатки квот.")
+    avg_generation_cost_usd: float | None = Field(
+        default=None,
+        description="Средняя стоимость одной успешной генерации сайта в USD за последние "
+        "30 дней (по всем пользователям сервиса). `null` — за период не было ни одной "
+        "успешной генерации с ненулевой стоимостью.",
+    )
 
 
 class AdaptyWebhookResponse(BaseModel):

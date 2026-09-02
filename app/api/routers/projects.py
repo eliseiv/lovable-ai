@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, Header, UploadFile, status
+from fastapi import APIRouter, File, Form, Header, Query, Response, UploadFile, status
 
 from app.api.dependencies import CurrentUser, SessionDep
 from app.api.errors import not_found, problem_responses, unprocessable
@@ -244,6 +244,47 @@ async def list_revisions(
     return RevisionsListResponse(
         current_revision_id=project.current_revision_id,
         revisions=[RevisionOut.model_validate(r) for r in revisions],
+    )
+
+
+@router.get(
+    "/{project_id}/source",
+    tags=["Правки и ревизии"],
+    summary="Скачать исходники сайта (zip)",
+    description=(
+        "Отдаёт исходный код опубликованного сайта одним zip-архивом — для сохранения "
+        "или отправки из приложения. По умолчанию берётся текущая активная ревизия; "
+        "конкретную ревизию можно выбрать параметром `revision_no` (номера — из "
+        "`GET /projects/{project_id}/revisions`). "
+        "Ответ — `application/zip` с именем файла в `Content-Disposition`. Чужой или "
+        "несуществующий проект, отсутствующая ревизия и проект без единой опубликованной "
+        "ревизии → `404`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    response_class=Response,
+    responses={
+        200: {
+            "content": {"application/zip": {"schema": {"type": "string", "format": "binary"}}},
+            "description": "Архив исходников ревизии.",
+        },
+        **problem_responses(401, 404, 409, 429),
+    },
+)
+async def download_project_source(
+    project_id: str,
+    user: CurrentUser,
+    session: SessionDep,
+    revision_no: Annotated[
+        int | None, Query(ge=1, description="Номер ревизии; по умолчанию — текущая.")
+    ] = None,
+) -> Response:
+    """Zip-архив исходников ревизии проекта. Чужой/несуществующий проект → 404."""
+    bundle = await project_service.get_source_bundle(
+        session, user_id=user.id, project_id=project_id, revision_no=revision_no
+    )
+    return Response(
+        content=bundle.content,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{bundle.filename}"'},
     )
 
 

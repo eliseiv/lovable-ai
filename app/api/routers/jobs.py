@@ -26,13 +26,15 @@ from app.api.errors import (
 from app.db.enums import JobState
 from app.db.models import GenerationJob, Question
 from app.schemas.api import (
+    JobPlanResponse,
+    JobPlanSection,
     JobStatusResponse,
     QuestionOut,
     QuestionsResponse,
     SubmitAnswersRequest,
     SubmitAnswersResponse,
 )
-from app.services import project_service
+from app.services import plan_service, project_service
 from app.services.answers_service import AnswersOutcome, submit_answers
 
 router = APIRouter(prefix="/jobs", tags=["Джобы генерации"])
@@ -57,7 +59,8 @@ async def _load_owned_job(session: SessionDep, user_id: str, job_id: str) -> Gen
         "(`CREATED`, `INTERVIEWING`, `AWAITING_CLARIFICATION`, `SPECCING`, `EDITING`, "
         "`BUILDING`, `DEPLOYING`, `LIVE`, `FIXING`, `FAILED`). `EDITING` — применение правки "
         "агентом-редактором. По завершении (`LIVE`) заполняется "
-        "`live_url`; при неудаче (`FAILED`) — `failure_reason`. Чужая или несуществующая "
+        "`live_url`; при неудаче (`FAILED`) — `failure_reason`. Поле `cost_usd` — фактическая "
+        "стоимость задачи в USD, накопленная к моменту запроса. Чужая или несуществующая "
         "задача → `404`. Требуется заголовок `Authorization: Bearer <api-key>`."
     ),
     responses=problem_responses(401, 404, 429),
@@ -74,6 +77,7 @@ async def get_job(job_id: str, user: CurrentUser, session: SessionDep) -> JobSta
         retry_count=job.retry_count,
         failure_reason=job.failure_reason,
         live_url=live_url,
+        cost_usd=float(job.spend_usd),
         updated_at=job.updated_at,
     )
 
@@ -150,6 +154,33 @@ def _parse_last_event_id(header_value: str | None, query_value: int | None) -> i
 
 
 @router.get(
+    "/{job_id}/plan",
+    response_model=JobPlanResponse,
+    summary="План сайта и прогресс по секциям",
+    description=(
+        "Возвращает план сайта — секции, которые создаёт агент, — и состояние каждой: "
+        "`pending` (ещё создаётся) или `done` (готова). Порядок элементов совпадает с "
+        "порядком секций на странице. План появляется после этапа `SPECCING`; до этого, "
+        "а также для правок и откатов список пуст. Прогресс в реальном времени приходит "
+        "событиями `plan_ready` и `section_completed` в `GET /jobs/{job_id}/events`. "
+        "Чужая или несуществующая задача → `404`. Требуется заголовок "
+        "`Authorization: Bearer <api-key>`."
+    ),
+    responses=problem_responses(401, 404, 429),
+)
+async def get_job_plan(job_id: str, user: CurrentUser, session: SessionDep) -> JobPlanResponse:
+    """План сайта и прогресс по секциям. Чужая/несуществующая задача → 404."""
+    job = await _load_owned_job(session, user.id, job_id)
+    sections = await plan_service.list_sections(session, job.id)
+    return JobPlanResponse(
+        sections=[
+            JobPlanSection(id=row.section_id, title=row.title, status=row.status)
+            for row in sections
+        ]
+    )
+
+
+@router.get(
     "/{job_id}/events",
     summary="Поток событий задачи (SSE)",
     description=(
@@ -157,7 +188,9 @@ def _parse_last_event_id(header_value: str | None, query_value: int | None) -> i
         "(`text/event-stream`). Каждое событие несёт идентификатор `id`; при "
         "переподключении клиент передаёт заголовок `Last-Event-ID` (или query-параметр "
         "`last_event_id`), чтобы получить пропущенные события. Поток завершается событием "
-        "`done` при достижении конечного статуса (`LIVE` или `FAILED`).\n\n"
+        "`done` при достижении конечного статуса (`LIVE` или `FAILED`). Среди событий — "
+        "`plan_ready` (план сайта: список секций) и `section_completed` (секция готова), "
+        "по которым чат показывает чек-лист прогресса. "
         "Количество одновременных потоков на ключ ограничено — при превышении `429`. Чужая "
         "или несуществующая задача → `404`. Альтернатива потоку — опрос статуса "
         "`GET /jobs/{jid}`. Требуется заголовок `Authorization: Bearer <api-key>`."
