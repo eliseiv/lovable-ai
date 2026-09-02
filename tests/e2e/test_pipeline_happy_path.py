@@ -25,6 +25,7 @@ from app.db.models import (
     Answer,
     GenerationJob,
     JobEvent,
+    JobSection,
     LlmUsage,
     Project,
     Question,
@@ -35,7 +36,7 @@ from app.db.models import (
 )
 from app.db.session import session_scope
 from app.pipeline.agents.agent1 import Agent1Result, ParsedQuestion
-from app.pipeline.agents.agent2 import Agent2Result
+from app.pipeline.agents.agent2 import Agent2Result, PlannedSection
 from app.pipeline.agents.agent3 import Agent3Result
 from app.pipeline.agents.claude_client import AgentCall
 from app.schemas.agent_output import ValidatedFile, ValidatedTree
@@ -153,6 +154,7 @@ async def _purge(uid: str) -> None:
         if job_ids:
             await s.execute(delete(LlmUsage).where(LlmUsage.job_id.in_(job_ids)))
             await s.execute(delete(JobEvent).where(JobEvent.job_id.in_(job_ids)))
+            await s.execute(delete(JobSection).where(JobSection.job_id.in_(job_ids)))
             await s.execute(delete(Answer).where(Answer.job_id.in_(job_ids)))
             await s.execute(delete(Question).where(Question.job_id.in_(job_ids)))
             await s.execute(delete(Revision).where(Revision.created_from_job_id.in_(job_ids)))
@@ -231,10 +233,24 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
         return Agent2Result(
             spec_markdown=f"**Content language:** {language.marker_value}"
             "\n\n# Spec\nCoffee shop landing.",
+            # План сайта (ADR-046): happy-path проходит с непустым планом — фаза SPECCING
+            # обязана сохранить job_sections, не влияя на остальной пайплайн.
+            sections=(
+                PlannedSection(id="hero", title="Hero"),
+                PlannedSection(id="menu", title="Menu"),
+            ),
             call=call,
         )
 
-    async def _fake_agent3(settings, spec, *, before_call, after_call, on_attempt_failure):  # noqa: ANN001, ANN202
+    async def _fake_agent3(  # noqa: ANN202
+        settings,  # noqa: ANN001
+        spec,  # noqa: ANN001
+        *,
+        before_call,  # noqa: ANN001
+        after_call,  # noqa: ANN001
+        on_attempt_failure,  # noqa: ANN001
+        on_text_delta=None,  # noqa: ANN001 — ADR-046: хук потока
+    ):
         await before_call()
         call = _call(model="claude-sonnet-4-6")
         await after_call(call)

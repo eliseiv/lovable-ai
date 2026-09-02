@@ -19,12 +19,12 @@ from decimal import Decimal
 
 import pytest
 
+from app.core.config import get_settings
 from app.core.ids import new_job_id, new_project_id
 from app.core.security import hash_api_key
 from app.db.enums import JobState
 from app.db.models import GenerationJob, JobSection, Project, Revision, User
 from app.deploy import workspace
-from app.core.config import get_settings
 from app.schemas.agent_output import validate_agent_output
 
 pytestmark = pytest.mark.asyncio

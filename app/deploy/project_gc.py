@@ -40,6 +40,7 @@ from app.db.models import (
     Attachment,
     GenerationJob,
     JobEvent,
+    JobSection,
     LlmUsage,
     Project,
     Question,
@@ -180,6 +181,7 @@ async def _hard_delete_db_rows(session: AsyncSession, project_id: str) -> None:
         await session.execute(delete(Answer).where(Answer.job_id.in_(job_ids)))
         await session.execute(delete(Question).where(Question.job_id.in_(job_ids)))
         await session.execute(delete(LlmUsage).where(LlmUsage.job_id.in_(job_ids)))
+        await session.execute(delete(JobSection).where(JobSection.job_id.in_(job_ids)))
         # generation_jobs (FK→projects) — после своих дочерних.
         await session.execute(delete(GenerationJob).where(GenerationJob.project_id == project_id))
 
