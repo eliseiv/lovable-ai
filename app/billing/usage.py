@@ -16,6 +16,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing import entitlements
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import EditUsageCounter, GenerationJob, JobEvent, UsageCounter, User
 from app.pipeline.events import record_event
@@ -111,15 +112,18 @@ async def count_generation_start(session: AsyncSession, job: GenerationJob) -> b
 
 
 async def _try_decrement_credit(session: AsyncSession, user_id: str) -> bool:
-    """Атомарный декремент users.bonus_generations_balance на 1, если баланс > 0.
+    """Атомарное списание цены генерации с users.bonus_generations_balance (ADR-049).
 
-    Условный UPDATE (WHERE balance > 0) — конкурентно-безопасен (одна джоба декрементит).
-    True, если списание прошло (была хотя бы 1 единица кредита). Инвариант >= 0 сохраняется.
+    Списывается `GENERATION_COST_TOKENS` токенов (дефолт 1) одним условным UPDATE
+    (`WHERE balance >= цена`) — конкурентно-безопасно и не уводит баланс ниже нуля: при
+    недостатке токенов rowcount=0 и списания не происходит вовсе (частичного нет).
+    True, если списание прошло.
     """
+    cost = get_settings().generation_cost_tokens
     result: CursorResult[Any] = await session.execute(  # type: ignore[assignment]
         update(User)
-        .where(User.id == user_id, User.bonus_generations_balance > 0)
-        .values(bonus_generations_balance=User.bonus_generations_balance - 1)
+        .where(User.id == user_id, User.bonus_generations_balance >= cost)
+        .values(bonus_generations_balance=User.bonus_generations_balance - cost)
     )
     return result.rowcount > 0
 

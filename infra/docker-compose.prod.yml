@@ -231,6 +231,10 @@ x-app-env: &app-env
   # APPSTORE_ROOT_CERT_DIR — фиксированное местоположение в образе certs/appstore
   # (относительно WORKDIR /app → /app/certs/appstore); каталог провижится bind-mount'ом
   # в сервис api (volume ниже). Пустой/несконфигурированный каталог → 422 fail-closed.
+  # Цена одной генерации сайта в токенах (ADR-049): отдаётся клиенту в GET /billing/me
+  # и применяется при списании с бонус-баланса. Поле Settings, потребители api+worker →
+  # обязано быть здесь, иначе extra=ignore молча вернул бы дефолт 1 при смене тарифа.
+  GENERATION_COST_TOKENS: ${GENERATION_COST_TOKENS:-1}
   APPSTORE_ROOT_CERT_DIR: ${APPSTORE_ROOT_CERT_DIR:-certs/appstore}
   # PER-INSTANCE БЕЗОПАСНОСТЬ (КРИТИЧНО — docs/05-security §Прямой StoreKit-путь):
   # PROD — РЕАЛЬНЫЙ bundle id (как APNS_BUNDLE_ID/APPLE_AUDIENCE = mba.gipsy.lovable).

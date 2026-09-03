@@ -2,9 +2,8 @@
 
 Покрытие:
   - `GET /jobs/{jid}/plan` — секции по порядку со статусами; пустой план у задачи без плана;
-  - `cost_usd` в `GET /jobs/{jid}` — фактический расход задачи;
-  - `avg_generation_cost_usd` в `GET /billing/me` — среднее по успешным генерациям, `null`
-    при отсутствии данных;
+  - `cost_tokens` в `GET /billing/me` — цена одной генерации в токенах (ADR-049);
+  - USD-полей (`cost_usd`, `avg_generation_cost_usd`) в клиентском API больше нет;
   - `GET /projects/{pid}/source` — zip исходников текущей и указанной ревизии, служебный
     `.build.json` в архив не попадает; чужой проект и проект без ревизий → 404.
 """
@@ -15,7 +14,6 @@ import io
 import json
 import zipfile
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -122,48 +120,32 @@ async def test_job_plan_of_foreign_job_is_404(client, session):
 # ============================ стоимость ============================
 
 
-async def test_job_status_exposes_cost(client, session):
+async def test_billing_me_exposes_cost_tokens(client, session):
+    """Цена генерации в токенах — тарифная величина из настройки, а не расход задачи."""
+    await _user(session, _UID)
+
+    resp = await client.get("/v1/billing/me", headers=_auth())
+    assert resp.status_code == 200
+    assert resp.json()["cost_tokens"] == get_settings().generation_cost_tokens
+
+
+async def test_job_status_has_no_usd_cost(client, session):
+    """Себестоимость в USD наружу не отдаётся (ADR-049 отменил `cost_usd`)."""
     await _user(session, _UID)
     _pid, jid = await _project_with_job(session, spend="0.1234")
 
-    resp = await client.get(f"/v1/jobs/{jid}", headers=_auth())
-    assert resp.status_code == 200
-    assert resp.json()["cost_usd"] == pytest.approx(0.1234)
+    body = (await client.get(f"/v1/jobs/{jid}", headers=_auth())).json()
+    assert "cost_usd" not in body
 
 
-async def test_billing_me_avg_generation_cost(client, session):
-    user = await _user(session, _UID)
-    await _project_with_job(session, spend="0.1000")
-    await _project_with_job(session, spend="0.3000")
-    # Не считаются: правка, незавершённая генерация и нулевой расход.
-    await _project_with_job(session, spend="9.0000", kind="edit")
-    await _project_with_job(session, spend="9.0000", state=JobState.BUILDING)
-    await _project_with_job(session, spend="0.0000")
-    assert user is not None
-
-    resp = await client.get("/v1/billing/me", headers=_auth())
-    assert resp.status_code == 200
-    assert resp.json()["avg_generation_cost_usd"] == pytest.approx(0.2)
-
-
-async def test_billing_me_avg_cost_is_null_without_data(client, session):
+async def test_billing_me_has_no_usd_average(client, session):
+    """`avg_generation_cost_usd` больше не публикуется (ADR-049)."""
     await _user(session, _UID)
 
-    resp = await client.get("/v1/billing/me", headers=_auth())
-    assert resp.status_code == 200
-    assert resp.json()["avg_generation_cost_usd"] is None
-
-
-async def test_billing_me_avg_cost_ignores_old_jobs(client, session):
-    await _user(session, _UID)
-    _pid, jid = await _project_with_job(session, spend="0.5000")
-    job = await session.get(GenerationJob, jid)
-    assert job is not None
-    job.created_at = datetime.now(UTC) - timedelta(days=60)
-    await session.flush()
-
-    resp = await client.get("/v1/billing/me", headers=_auth())
-    assert resp.json()["avg_generation_cost_usd"] is None
+    assert (
+        "avg_generation_cost_usd"
+        not in (await client.get("/v1/billing/me", headers=_auth())).json()
+    )
 
 
 # ============================ исходники ============================
@@ -338,3 +320,44 @@ async def test_section_completion_lands_in_job_events(client, session, monkeypat
     )
     assert row.status == "done"
     assert row.completed_at is not None
+
+
+async def test_generation_costs_configured_tokens(client, session, monkeypatch):
+    """Списание с бонус-баланса идёт по цене генерации, а не всегда по одному токену."""
+    from app.billing import usage
+    from app.db.models import UsageCounter
+
+    user = await _user(session, _UID)
+    user.bonus_generations_balance = 5
+    _pid, jid = await _project_with_job(session, state=JobState.CREATED)
+    job = await session.get(GenerationJob, jid)
+    assert job is not None
+    # Плановая квота исчерпана → списание идёт с токенов.
+    session.add(UsageCounter(user_id=_UID, period=usage.current_period(), generations_used=99))
+    await session.flush()
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "generation_cost_tokens", 2, raising=False)
+    assert await usage.count_generation_start(session, job) is True
+    await session.flush()
+    await session.refresh(user)
+    assert user.bonus_generations_balance == 3
+
+
+async def test_generation_blocked_when_tokens_below_price(client, session, monkeypatch):
+    """Баланса меньше цены генерации → гейт отдаёт 402, а не пропускает задачу бесплатно."""
+    from app.api.errors import ProblemException
+    from app.billing import usage
+    from app.billing.quota_gate import enforce_quota_gate
+    from app.db.models import UsageCounter
+
+    user = await _user(session, _UID)
+    user.bonus_generations_balance = 1
+    session.add(UsageCounter(user_id=_UID, period=usage.current_period(), generations_used=99))
+    await session.flush()
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "generation_cost_tokens", 2, raising=False)
+    with pytest.raises(ProblemException) as exc:
+        await enforce_quota_gate(session, _UID, check_project_limit=False)
+    assert exc.value.status == 402

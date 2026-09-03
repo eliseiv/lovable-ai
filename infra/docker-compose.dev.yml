@@ -161,6 +161,10 @@ x-app-env: &app-env
   # (docs/07 стр. 109) → паки не сконфигурированы (200 ignored:unknown_token_product
   # + alert billing_unknown_token_product). Реальные SKU — операторская настройка
   # .env (каноническое значение = 5 паков, см. .env.example). Fail-fast на невалидной записи.
+  # Цена одной генерации сайта в токенах (ADR-049): отдаётся клиенту в GET /billing/me
+  # и применяется при списании с бонус-баланса. Поле Settings, потребители api+worker →
+  # обязано быть здесь, иначе extra=ignore молча вернул бы дефолт 1 при смене тарифа.
+  GENERATION_COST_TOKENS: ${GENERATION_COST_TOKENS:-1}
   TOKEN_PACK_PRODUCTS: ${TOKEN_PACK_PRODUCTS:-}
   # --- ADR-039: прямой StoreKit JWS-путь (POST /v1/tokens/purchase,
   # /v1/subscription/sync; верификатор app/billing/storekit.py). Оба ключа — поля

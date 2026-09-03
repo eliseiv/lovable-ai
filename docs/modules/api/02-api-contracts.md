@@ -72,8 +72,7 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 
 ## GET /jobs/{jid}
 Канонический статус.
-- `200` → `{ "id", "project_id", "state", "retry_count", "failure_reason": "string?", "live_url": "string?", "cost_usd", "updated_at" }`.
-- **`cost_usd`** ([ADR-045](../../adr/ADR-045-generation-cost-in-client-api.md)) — фактическая стоимость задачи в USD (`generation_jobs.spend_usd`): сумма оплаченных вызовов модели к моменту запроса. Растёт по ходу выполнения, окончательна в терминальном состоянии.
+- `200` → `{ "id", "project_id", "state", "retry_count", "failure_reason": "string?", "live_url": "string?", "updated_at" }`.
 - `state` ∈ `CREATED, INTERVIEWING, AWAITING_CLARIFICATION, SPECCING, BUILDING, DEPLOYING, LIVE, FIXING, FAILED`.
 - **Cross-tenant:** чужой/несуществующий `jid` → `404` (фильтр по `user_id`, не раскрываем существование). Этот же инвариант наследует SSE `GET /jobs/{jid}/events`.
 
@@ -174,7 +173,7 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
 
 ## GET /billing/me
 - `200` → `{ "access_level", "status", "period": "YYYY-MM", "quota": { "monthly_generations", "generations_used", "generations_remaining", "monthly_edits", "edits_used", "edits_remaining", "max_concurrent_jobs", "active_jobs", "max_projects", "projects_used" } }` (поля правок — S5, [ADR-014](../../adr/ADR-014-edit-limit-revision-rollback.md)).
-- **`avg_generation_cost_usd`** ([ADR-045](../../adr/ADR-045-generation-cost-in-client-api.md)) — средняя стоимость одной успешной генерации сайта за последние 30 дней по сервису; `null`, если таких генераций за окно не было.
+- **`cost_tokens`** ([ADR-049](../../adr/ADR-049-generation-price-in-tokens.md)) — сколько токенов стоит одна генерация сайта (тарифная величина, не расход конкретной задачи; сейчас `1`, настраивается `GENERATION_COST_TOKENS`). Клиент показывает её на кнопке запуска и **не зашивает** значение у себя. USD-полей (`cost_usd` в статусе задачи, `avg_generation_cost_usd`) в клиентском API больше нет — себестоимость видна только в админ-плоскости (`GET /admin/costs/daily`).
 - Полная схема + источники — [modules/billing/02-api-contracts.md §2](../billing/02-api-contracts.md#2-get-v1billingme) (нормативный источник). Источник: кэш `subscriptions` (lazy-ресинк при протухшем `synced_at`) + `usage_counters`/`edit_usage_counters`/`plan_quotas`.
 
 ## POST /billing/webhook/adapty

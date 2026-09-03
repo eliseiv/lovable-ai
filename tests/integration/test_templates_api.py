@@ -160,3 +160,26 @@ async def test_plain_prompt_still_works(client, session):
     project = await session.get(Project, resp.json()["project_id"])
     assert project is not None
     assert project.prompt == "лендинг для кофейни"
+
+
+async def test_catalog_has_six_templates_with_previews(client, session):
+    """Шесть карточек экрана «Templates», у каждой есть превью в образе (ADR-048 §C)."""
+    await _user(session)
+
+    items = (await client.get("/v1/templates", headers=_auth())).json()["items"]
+    assert [i["id"] for i in items] == [
+        "landing-page",
+        "online-shop",
+        "medical",
+        "travel-landing",
+        "restaurant",
+        "portfolio",
+    ]
+    assert all(i["preview_url"] and i["preview_url"].endswith(f"/{i['id']}/preview") for i in items)
+
+    for item in items:
+        preview = await client.get(f"/v1/templates/{item['id']}/preview", headers=_auth())
+        assert preview.status_code == 200
+        assert preview.headers["content-type"] == "image/jpeg"
+        # JPEG SOI-маркер: отдаётся картинка, а не пустышка/HTML.
+        assert preview.content[:2] == b"\xff\xd8"

@@ -331,6 +331,13 @@ class Settings(BaseSettings):
     # Fallback-число бонус-токенов для неизвестного vendor_product_id (не WEEKLY/YEARLY).
     # Нормативно 0 (ADR-038 §D): подписки токенов не дают.
     subscription_tokens_grant: int = Field(default=0, ge=0)
+    # Цена ОДНОЙ генерации сайта в токенах (ADR-049). Тарифная величина, отдаётся клиенту в
+    # GET /billing/me и применяется при списании с бонус-баланса: плановая квота тарифа
+    # по-прежнему считает генерации штуками, а токены списываются по этой цене. ge=1 —
+    # бесплатная генерация обесценила бы паки, а 0 сделал бы гейт квоты бессмысленным.
+    # env GENERATION_COST_TOKENS.
+    generation_cost_tokens: int = Field(default=1, ge=1)
+
     # --- Consumable token-паки (ADR-038 §B, docs §11.3, 07-deployment env-контракт) ---
     # Маппинг consumable-паков токенов: CSV пар <vendor_product_id>:<amount>, парсится
     # приложением в dict[str,int] (parse_token_pack_products, стиль NPM_REGISTRY_ALLOWLIST).

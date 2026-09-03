@@ -130,8 +130,8 @@ async def adapty_webhook(
     description=(
         "Возвращает текущий тариф (`access_level`), статус подписки и остаток квот: "
         "генерации, правки, число одновременных задач и проектов (поля `quota.*`). "
-        "Поле `avg_generation_cost_usd` — средняя стоимость одной успешной генерации "
-        "сайта за последние 30 дней (`null`, если таких генераций не было). "
+        "Поле `cost_tokens` — цена одной генерации сайта в токенах (тарифная величина, "
+        "не расход конкретной задачи). "
         "Пустые значения лимитов (`null`) означают безлимит. Требуется заголовок "
         "`Authorization: Bearer <api-key>`."
     ),
@@ -150,5 +150,5 @@ async def billing_me(user: CurrentUser, session: SessionDep) -> BillingMeRespons
         status=snapshot.status,
         period=snapshot.period,
         quota=snapshot.quota,
-        avg_generation_cost_usd=await billing_service.get_avg_generation_cost_usd(session),
+        cost_tokens=get_settings().generation_cost_tokens,
     )

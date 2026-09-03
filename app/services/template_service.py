@@ -93,6 +93,33 @@ _CATALOG: tuple[SiteTemplate, ...] = (
             "Airy layout, large photography, warm accent colour."
         ),
     ),
+    SiteTemplate(
+        id="restaurant",
+        title="Restaurant",
+        prompt=(
+            "Create a website for a restaurant. Include a navigation bar, a hero section with an "
+            "appetising photo, the restaurant name, a one-line pitch and a reservation "
+            "call-to-action, an about block with the chef's story, a menu block with four "
+            "categories and six dishes each (name, short description, price), a gallery of "
+            "interior and dish photos, an opening-hours block, a reservation form with date, "
+            "time and party size, a guest reviews block and a footer with address, phone and map "
+            "placeholder. Warm palette, appetising large photography, the form is presentational "
+            "only — no backend."
+        ),
+    ),
+    SiteTemplate(
+        id="portfolio",
+        title="Portfolio",
+        prompt=(
+            "Create a personal portfolio site for a designer. Include a navigation bar, a hero "
+            "section with the person's name, role and a short positioning line, an about block "
+            "with a photo and a brief bio, a skills block with six skills, a works grid of six "
+            "projects (cover image, title, category, short result), an experience timeline with "
+            "four entries, a client testimonials block and a contact block with email and social "
+            "links. Minimal editorial layout, plenty of whitespace, one accent colour, typography "
+            "carries the design."
+        ),
+    ),
 )
 
 _BY_ID: dict[str, SiteTemplate] = {template.id: template for template in _CATALOG}

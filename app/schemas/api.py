@@ -96,11 +96,6 @@ class JobStatusResponse(BaseModel):
     live_url: str | None = Field(
         default=None, description="Адрес работающего сайта (по завершении, `LIVE`)."
     )
-    cost_usd: float = Field(
-        description="Фактическая стоимость этой задачи в USD — израсходовано на вызовы "
-        "модели к текущему моменту. Растёт по ходу выполнения, окончательна в терминальном "
-        "состоянии (`LIVE` / `FAILED`)."
-    )
     updated_at: datetime = Field(description="Время последнего обновления статуса.")
 
 
@@ -341,11 +336,10 @@ class BillingMeResponse(BaseModel):
     status: str = Field(description="Статус подписки.")
     period: str = Field(description="Расчётный период в формате `YYYY-MM`.")
     quota: BillingQuota = Field(description="Лимиты и остатки квот.")
-    avg_generation_cost_usd: float | None = Field(
-        default=None,
-        description="Средняя стоимость одной успешной генерации сайта в USD за последние "
-        "30 дней (по всем пользователям сервиса). `null` — за период не было ни одной "
-        "успешной генерации с ненулевой стоимостью.",
+    cost_tokens: int = Field(
+        description="Сколько токенов стоит одна генерация сайта. Значение тарифицирования, "
+        "а не расход конкретной задачи: показывайте его на кнопке запуска. Сейчас `1`, но "
+        "величина настраиваемая — не зашивайте её в клиент.",
     )
 
 

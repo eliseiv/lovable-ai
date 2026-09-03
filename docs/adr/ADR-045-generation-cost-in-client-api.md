@@ -1,6 +1,8 @@
 # ADR-045 — Стоимость генерации в клиентском API: `cost_usd` задачи и среднее по сервису
 
-**Статус:** Accepted · **Дата:** 2026-09-02 · **Sprint:** клиентский API (запрос iOS)
+**Статус:** ~~Accepted~~ **Superseded** ([ADR-049](ADR-049-generation-price-in-tokens.md), 2026-09-03) · **Дата:** 2026-09-02 · **Sprint:** клиентский API (запрос iOS)
+
+> **Отменён целиком.** Клиенту нужна цена запуска в токенах, а не себестоимость в долларах: `cost_usd` и `avg_generation_cost_usd` удалены из клиентского API и заменены полем `cost_tokens` ([ADR-049](ADR-049-generation-price-in-tokens.md)). Себестоимость осталась во внутреннем контуре (`generation_jobs.spend_usd`, `llm_usage`, `GET /admin/costs/daily`). Документ сохранён как запись о принятом и отменённом решении.
 
 Расширяет клиентский контракт (`GET /jobs/{jid}`, `GET /billing/me`) двумя read-only полями. Не меняет cost-ledger ([03-data-model → llm_usage](../03-data-model.md#llm_usage-cost-ledger)), биллинг-логику и квоты; миграции не требует.
 

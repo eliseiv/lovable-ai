@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.dependencies import get_current_user
 from app.api.errors import payment_required
 from app.billing import entitlements, usage
+from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.models import User
 from app.db.session import get_session
@@ -121,7 +122,11 @@ async def enforce_quota_gate(
         # кредиты. Списание (плановая первой, затем кредит) — на старте джобы (usage §10.3).
         used = await usage.get_usage(session, user_id)
         bonus = await _bonus_balance(session, user_id)
-        if used >= quota.monthly_generations and bonus <= 0:
+        # Цена генерации в токенах (ADR-049): плановая квота считает генерации штуками, а
+        # бонус-баланс тратится по цене — на 0 < bonus < цены генерацию пускать нельзя,
+        # иначе списание не пройдёт (WHERE balance >= цена) и джоба стартовала бы бесплатно.
+        cost_tokens = get_settings().generation_cost_tokens
+        if used >= quota.monthly_generations and bonus < cost_tokens:
             metrics.quota_rejected_total.labels(reason="quota_exhausted").inc()
             raise payment_required(
                 f"Monthly generation quota exhausted ({used}/{quota.monthly_generations} "

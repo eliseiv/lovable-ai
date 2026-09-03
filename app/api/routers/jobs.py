@@ -59,8 +59,7 @@ async def _load_owned_job(session: SessionDep, user_id: str, job_id: str) -> Gen
         "(`CREATED`, `INTERVIEWING`, `AWAITING_CLARIFICATION`, `SPECCING`, `EDITING`, "
         "`BUILDING`, `DEPLOYING`, `LIVE`, `FIXING`, `FAILED`). `EDITING` — применение правки "
         "агентом-редактором. По завершении (`LIVE`) заполняется "
-        "`live_url`; при неудаче (`FAILED`) — `failure_reason`. Поле `cost_usd` — фактическая "
-        "стоимость задачи в USD, накопленная к моменту запроса. Чужая или несуществующая "
+        "`live_url`; при неудаче (`FAILED`) — `failure_reason`. Чужая или несуществующая "
         "задача → `404`. Требуется заголовок `Authorization: Bearer <api-key>`."
     ),
     responses=problem_responses(401, 404, 429),
@@ -77,7 +76,6 @@ async def get_job(job_id: str, user: CurrentUser, session: SessionDep) -> JobSta
         retry_count=job.retry_count,
         failure_reason=job.failure_reason,
         live_url=live_url,
-        cost_usd=float(job.spend_usd),
         updated_at=job.updated_at,
     )
 
