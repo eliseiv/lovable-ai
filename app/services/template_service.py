@@ -155,22 +155,8 @@ def preview_url(template_id: str, settings: Settings) -> str | None:
     return f"https://{settings.apps_domain}/v1/templates/{template_id}/preview"
 
 
-def build_prompt(template: SiteTemplate, user_prompt: str | None) -> str:
-    """Итоговый промпт генерации: текст шаблона + необязательное уточнение пользователя.
-
-    Уточнение идёт ПОСЛЕ шаблона отдельным абзацем: для модели это дополнение к заданию, а
-    не замена — пользователь, выбравший «Online Shop» и дописавший «магазин кофе», должен
-    получить магазин кофе, а не абстрактный сайт про кофе.
-    """
-    extra = (user_prompt or "").strip()
-    if not extra:
-        return template.prompt
-    return f"{template.prompt}\n\nAdditional requirements from the user: {extra}"
-
-
 __all__ = [
     "SiteTemplate",
-    "build_prompt",
     "get_template",
     "list_templates",
     "preview_path",

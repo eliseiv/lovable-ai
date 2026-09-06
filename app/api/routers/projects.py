@@ -28,8 +28,10 @@ from app.services import (
     attachments_service,
     edit_service,
     project_service,
+    style_service,
     template_service,
 )
+from app.services.prompt_composer import compose_prompt
 
 router = APIRouter(prefix="/projects")
 
@@ -59,7 +61,8 @@ async def _read_uploads(images: list[UploadFile]) -> list[tuple[str | None, byte
     description=(
         "Создаёт новый проект и запускает асинхронную генерацию сайта по текстовому промту "
         "или по выбранному шаблону (`template_id` из `GET /templates`; тогда `prompt` "
-        "необязателен и служит уточнением). Лимиты и списание в обоих случаях одинаковы. "
+        "необязателен и служит уточнением). Визуальный стиль задаётся `style_id` из "
+        "`GET /styles` и сочетается с любым из этих способов. Лимиты и списание одинаковы. "
         "Обязателен заголовок `Idempotency-Key` (защищает от повторного создания при "
         "повторной отправке запроса). В ответ возвращаются идентификаторы проекта "
         "(`project_id`) и задачи генерации (`job_id`); статус отслеживается через "
@@ -95,6 +98,16 @@ async def create_project(
             )
         ),
     ] = None,
+    style_id: Annotated[
+        str | None,
+        Form(
+            description=(
+                "Идентификатор визуального стиля из `GET /styles` — как должен выглядеть "
+                "сайт (типографика, цвет, тени, иконки). Комбинируется с `template_id` и "
+                "`prompt` в любом сочетании; влияет только на оформление, не на состав секций."
+            )
+        ),
+    ] = None,
     title: Annotated[str | None, Form(description="Необязательное название проекта.")] = None,
     locale: Annotated[
         str | None,
@@ -118,13 +131,21 @@ async def create_project(
     # Шаблон (ADR-048) — предзаполненный промпт, а не отдельный режим генерации: подставляем
     # текст шаблона и дальше идём тем же путём, что свободный ввод (те же квоты, гейт,
     # идемпотентность). Неизвестный id — ошибка клиента, а не молчаливый старт «пустышки».
+    template = None
     if template_id is not None:
         template = template_service.get_template(template_id)
         if template is None:
             raise unprocessable("Unknown template_id.")
-        prompt = template_service.build_prompt(template, prompt)
-    elif not (prompt or "").strip():
+    style = None
+    if style_id is not None:
+        style = style_service.get_style(style_id)
+        if style is None:
+            raise unprocessable("Unknown style_id.")
+    # Стиль — только оформление, поэтому сам по себе он не описывает сайт: нужен либо
+    # шаблон, либо текст пользователя (ADR-050 §A).
+    if template is None and not (prompt or "").strip():
         raise unprocessable("Either prompt or template_id is required.")
+    prompt = compose_prompt(template=template, style=style, user_prompt=prompt)
     # ADR-034 §D2: валидация (sniff magic bytes + лимиты) ДО создания джобы. Нарушение → 422.
     validated = attachments_service.validate_images(get_settings(), await _read_uploads(images))
     # ADR-036 §4: нормализация явного locale в ОДНОМ месте (роутер) → в сервис попадает уже

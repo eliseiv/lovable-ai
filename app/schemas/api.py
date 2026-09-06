@@ -119,6 +119,26 @@ class TemplateListResponse(BaseModel):
     items: list[TemplateOut] = Field(description="Шаблоны в порядке показа карточек.")
 
 
+# --- GET /styles ---
+
+
+class StyleOut(BaseModel):
+    """Визуальный стиль: карточка каталога."""
+
+    id: str = Field(description="Идентификатор стиля — передаётся в `POST /projects`.")
+    title: str = Field(description="Название стиля для карточки.")
+    preview_url: str | None = Field(
+        description="Абсолютный URL превью-картинки; `null` — картинки пока нет, клиент "
+        "показывает собственную заглушку."
+    )
+
+
+class StyleListResponse(BaseModel):
+    """Каталог визуальных стилей в порядке показа."""
+
+    items: list[StyleOut] = Field(description="Стили в порядке показа карточек.")
+
+
 # --- GET /jobs/{jid}/plan ---
 
 

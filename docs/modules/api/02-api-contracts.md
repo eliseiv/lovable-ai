@@ -14,6 +14,8 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 | POST | `/projects` | создать проект + старт генерации (**multipart**: `prompt`+опц.`images`, [ADR-034](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) | Bearer | `202` |
 | GET | `/templates` | каталог шаблонов сайтов ([ADR-048](../../adr/ADR-048-site-templates-catalog.md)) | Bearer | `200` |
 | GET | `/templates/{id}/preview` | превью-картинка шаблона | Bearer | `200` (jpeg) |
+| GET | `/styles` | каталог визуальных стилей ([ADR-050](../../adr/ADR-050-site-visual-styles.md)) | Bearer | `200` |
+| GET | `/styles/{id}/preview` | превью-картинка стиля | Bearer | `200` (jpeg) |
 | GET | `/projects` | список проектов пользователя | Bearer | `200` |
 | GET | `/projects/{pid}` | детали проекта + live URL | Bearer | `200` |
 | DELETE | `/projects/{pid}` | удалить проект + полный GC ресурсов (S4) | Bearer | `202` |
@@ -48,6 +50,17 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
   - Ни `prompt`, ни `template_id` → **`422`**; неизвестный `template_id` → **`422`**.
   - ⚠️ Вместе с `template_id` клиент обязан передавать **`locale`**: промпты шаблонов англоязычные, и без явного locale авто-детект ([ADR-025](../../adr/ADR-025-content-language-detection.md)) сделает сайт на английском.
   - Квоты, гейт `402`, идемпотентность и списание — те же, что у свободного промпта: шаблон не отдельный тариф.
+- **`style_id`** (Form, опц., [ADR-050](../../adr/ADR-050-site-visual-styles.md)) — визуальный стиль из `GET /styles`. Дописывается к заданию отдельным абзацем (`Visual style to follow: …`) и влияет только на оформление.
+  - Порядок частей итогового промпта нормативен: **задание** (промпт шаблона, а без шаблона — текст пользователя) → **стиль** → **уточнение пользователя** (`Additional requirements from the user: …`, только когда задан `template_id`).
+  - Стиль сам по себе сайт не описывает: `style_id` без `prompt` и без `template_id` → **`422`**; неизвестный `style_id` → **`422`**.
+  - Списание и лимиты не зависят от стиля.
+
+## GET /styles · GET /styles/{id}/preview ([ADR-050](../../adr/ADR-050-site-visual-styles.md))
+Каталог визуальных стилей — «как выглядит сайт» (типографика, цвет, тени, иконки). Стиль **не** меняет состав секций.
+- `GET /styles` → `{ "items": [ { "id", "title", "preview_url" } ] }`; порядок = порядок карточек. Сейчас два стиля: `mui` (Material-inspired) и `human-interface` (Apple-inspired).
+- `preview_url` — абсолютный URL (`https://{APPS_DOMAIN}/v1/styles/{id}/preview`) либо `null`, если картинки в образе ещё нет.
+- `GET /styles/{id}/preview` → `image/jpeg` (`Cache-Control: public, max-age=86400`); неизвестный стиль или отсутствующая картинка → `404`.
+- Выбранный стиль передаётся в `POST /projects` полем `style_id` и сочетается с `template_id` и свободным `prompt` в любой комбинации.
 
 ## GET /templates · GET /templates/{id}/preview ([ADR-048](../../adr/ADR-048-site-templates-catalog.md))
 Каталог шаблонов для экрана выбора. Шаблон — **предзаполненный промпт**, отдельного режима генерации нет.
