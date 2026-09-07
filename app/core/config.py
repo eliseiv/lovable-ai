@@ -338,6 +338,23 @@ class Settings(BaseSettings):
     # env GENERATION_COST_TOKENS.
     generation_cost_tokens: int = Field(default=1, ge=1)
 
+    # --- RU-оплата через CloudPayments/агрегатор (ADR-052, docs/modules/billing) ---
+    # База API платёжного агрегатора, который держит интеграцию с CloudPayments/YooKassa и
+    # выдаёт платёжные ссылки. Пусто/неполный набор ключей → RU-оплата на инстансе выключена
+    # (checkout → 503, вебхук → 500 «не сконфигурировано», агрегатор повторит).
+    cloudpayments_api_base: str = Field(default="")
+    # Идентификатор приложения у агрегатора: адресует каталог продуктов и платежи инстанса.
+    cloudpayments_app_id: str = Field(default="")
+    # Bearer агрегатора: server-side секрет, НИКОГДА не попадает клиенту и в логи.
+    cloudpayments_api_token: str = Field(default="")
+    # Статусы платежа агрегатора, которые считаются оплаченными. CSV, регистронезависимо.
+    # Нормативный дефолт — `succeeded`; список вынесен в env, чтобы подстроить под фактические
+    # значения провайдера без релиза.
+    cloudpayments_paid_statuses: str = Field(default="succeeded")
+    # Окно свежести платежа при сверке: старые оплаты не начисляются повторно, даже если
+    # агрегатор отдаёт их в списке. ge=1 — нулевое окно отвергло бы вообще всё.
+    cloudpayments_payment_freshness_hours: int = Field(default=72, ge=1)
+
     # --- Consumable token-паки (ADR-038 §B, docs §11.3, 07-deployment env-контракт) ---
     # Маппинг consumable-паков токенов: CSV пар <vendor_product_id>:<amount>, парсится
     # приложением в dict[str,int] (parse_token_pack_products, стиль NPM_REGISTRY_ALLOWLIST).
@@ -677,6 +694,22 @@ class Settings(BaseSettings):
             or self.apns_auth_key_path
         )
         return has_key and bool(self.apns_key_id) and bool(self.apns_team_id)
+
+    def cloudpayments_configured(self) -> bool:
+        """RU-оплата доступна: заданы база API, app_id и токен агрегатора (ADR-052 §A)."""
+        return bool(
+            self.cloudpayments_api_base.strip()
+            and self.cloudpayments_app_id.strip()
+            and self.cloudpayments_api_token.strip()
+        )
+
+    def cloudpayments_paid_status_set(self) -> frozenset[str]:
+        """Статусы «оплачено» из CSV, приведённые к нижнему регистру."""
+        return frozenset(
+            item.strip().lower()
+            for item in self.cloudpayments_paid_statuses.split(",")
+            if item.strip()
+        )
 
 
 @lru_cache(maxsize=1)

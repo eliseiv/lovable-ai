@@ -23,6 +23,7 @@ from app.api.routers import (
     admin,
     auth,
     billing,
+    cloudpayments,
     devices,
     health,
     jobs,
@@ -178,6 +179,7 @@ app.include_router(styles.router, prefix="/v1")
 app.include_router(models.router, prefix="/v1")
 app.include_router(jobs.router, prefix="/v1")
 app.include_router(billing.router, prefix="/v1")
+app.include_router(cloudpayments.router, prefix="/v1")
 # ADR-039: прямой StoreKit-путь покупок (POST /v1/tokens/purchase · /subscription/sync),
 # тег «Биллинг». Пути вне /billing-префикса → отдельный роутер.
 app.include_router(storekit.router, prefix="/v1")

@@ -119,6 +119,40 @@ class TemplateListResponse(BaseModel):
     items: list[TemplateOut] = Field(description="Шаблоны в порядке показа карточек.")
 
 
+# --- POST /billing/cloudpayments/checkout ---
+
+
+class CloudPaymentsCheckoutRequest(BaseModel):
+    """Запрос ссылки на оплату: что покупаем и куда прислать чек."""
+
+    product_id: str = Field(
+        min_length=1,
+        description="Идентификатор продукта: подписка или пакет токенов (те же значения, что "
+        "в App Store).",
+    )
+    customer_email: str = Field(
+        min_length=3,
+        description="Email покупателя для чека (требование платёжного провайдера).",
+    )
+
+
+class CloudPaymentsCheckoutResponse(BaseModel):
+    """Созданная платёжная ссылка — её нужно открыть для оплаты."""
+
+    payment_id: str = Field(description="Идентификатор платежа у провайдера.")
+    payment_url: str = Field(description="Адрес страницы оплаты — открыть в браузере.")
+    status: str = Field(description="Статус платежа на момент создания ссылки.")
+    expires_at: str | None = Field(
+        default=None, description="Когда ссылка перестанет действовать (если провайдер сообщил)."
+    )
+
+
+class CloudPaymentsWebhookResponse(BaseModel):
+    """Ответ платёжному провайдеру: событие принято."""
+
+    code: int = Field(description="Всегда `0` — провайдер считает доставку успешной.")
+
+
 # --- GET /models ---
 
 

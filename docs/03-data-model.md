@@ -334,6 +334,22 @@ APNs device tokens для push-нотификаций ([ADR-013](adr/ADR-013-apn
 | `processed_at` | timestamptz NULL | NULL = принят, не обработан. |
 | `received_at` | timestamptz | |
 
+### cloudpayments_payments (RU-канал, [ADR-052](adr/ADR-052-ru-payments-cloudpayments.md))
+
+Журнал начисленных платежей RU-канала и единственная точка его идемпотентности.
+
+| Поле | Тип | Заметки |
+|---|---|---|
+| `payment_id` | text PK | Идентификатор платежа у агрегатора. PK именно per-payment: один callback сверяет СПИСОК платежей пользователя, поэтому ключ по событию пропустил бы второй платёж. |
+| `user_id` | text FK→users | Индекс `ix_cloudpayments_payments_user_id`. |
+| `product_id` | text | Код продукта у агрегатора (те же значения, что SKU App Store). |
+| `kind` | text | `tokens` \| `subscription` — класс начисления из подтверждённого `payment_type`. |
+| `tokens_granted` | int | Сколько токенов начислено (0 для подписки). |
+| `paid_at` | timestamptz | Время оплаты по данным агрегатора (участвует в окне свежести). |
+| `processed_at` | timestamptz | Когда начислено у нас. |
+
+> Строка пишется и для платежа с неизвестным продуктом (начислено 0): иначе каждый следующий callback снова пытался бы его обработать.
+
 ### store_transactions (прямой StoreKit-путь, ADR-039)
 
 Глобальный реестр обработанных Apple StoreKit-транзакций **прямого** канала ([ADR-039](adr/ADR-039-direct-storekit-jws-purchase-path.md), [modules/billing/03-architecture.md §13](modules/billing/03-architecture.md#13-прямой-storekit-путь-adr-039)). **Единственная точка идемпотентности прямого пути — глобальная по `transaction_id`** (в отличие от per-user `credit_grants(user_id, idempotency_key)`): одна Apple-транзакция редимится **ровно один раз во всей системе, ровно одному `user_id`** — блокирует кросс-аккаунтную переигровку чужого (leaked/shared) валидного JWS. Отдельная таблица (не `billing_events`, чья `adapty_event_id` семантически Adapty-специфична).

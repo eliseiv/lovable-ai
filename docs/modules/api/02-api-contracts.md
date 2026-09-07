@@ -33,6 +33,8 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 | POST | `/jobs/{jid}/answers` | ответы → резюм пайплайна (→ SPECCING) | Bearer | `202` |
 | GET | `/billing/me` | тариф/entitlement + остаток квоты | Bearer | `200` |
 | POST | `/billing/webhook/adapty` | приём вебхуков Adapty (S2S) | **Adapty secret** | `200` |
+| POST | `/billing/cloudpayments/checkout` | ссылка на RU-оплату ([ADR-052](../../adr/ADR-052-ru-payments-cloudpayments.md)) | Bearer | `200` |
+| POST | `/billing/cloudpayments/webhook` | приём RU-платежа (S2S, вне публичной схемы) | — | `200` |
 
 ## POST /projects
 Создаёт проект и стартует генерацию (Agent 1).
@@ -199,6 +201,21 @@ Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING →
 - `200` → `{ "access_level", "status", "period": "YYYY-MM", "quota": { "monthly_generations", "generations_used", "generations_remaining", "monthly_edits", "edits_used", "edits_remaining", "max_concurrent_jobs", "active_jobs", "max_projects", "projects_used" } }` (поля правок — S5, [ADR-014](../../adr/ADR-014-edit-limit-revision-rollback.md)).
 - **`cost_tokens`** ([ADR-049](../../adr/ADR-049-generation-price-in-tokens.md)) — сколько токенов стоит одна генерация сайта (тарифная величина, не расход конкретной задачи; сейчас `1`, настраивается `GENERATION_COST_TOKENS`). Клиент показывает её на кнопке запуска и **не зашивает** значение у себя. USD-полей (`cost_usd` в статусе задачи, `avg_generation_cost_usd`) в клиентском API больше нет — себестоимость видна только в админ-плоскости (`GET /admin/costs/daily`).
 - Полная схема + источники — [modules/billing/02-api-contracts.md §2](../billing/02-api-contracts.md#2-get-v1billingme) (нормативный источник). Источник: кэш `subscriptions` (lazy-ресинк при протухшем `synced_at`) + `usage_counters`/`edit_usage_counters`/`plan_quotas`.
+
+## POST /billing/cloudpayments/checkout · POST /billing/cloudpayments/webhook ([ADR-052](../../adr/ADR-052-ru-payments-cloudpayments.md))
+RU-оплата через платёжный агрегатор (CloudPayments/YooKassa на его стороне). Второй денежный канал рядом с App Store; квоты, токены и подписка — те же сущности.
+
+**`POST /billing/cloudpayments/checkout`** (Bearer пользователя)
+- Тело: `{ "product_id", "customer_email" }`; `200` → `{ "payment_id", "payment_url", "status", "expires_at": "string?" }`. Клиент открывает `payment_url`.
+- **`user_id` у агрегатора = аутентифицированный пользователь**, никогда не значение из тела: иначе платёж уходит на чужой аккаунт и не находится при начислении.
+- `503` — канал не сконфигурирован на инстансе (`CLOUDPAYMENTS_*` пустые); `502` — агрегатор недоступен (детали апстрима наружу не проксируются).
+
+**`POST /billing/cloudpayments/webhook`** (server-to-server, `include_in_schema=False`)
+- Приходит **без подписи и без авторизации**, поэтому тело — только **триггер**: адресат берётся из него, а суммы и факт оплаты — из сверки `GET {base}/users/{user_id}/payments` серверным токеном.
+- Любое разобранное событие → `200 {"code": 0}` (агрегатор не ретраит), в том числе кривое тело, неизвестный пользователь и «нечего начислять».
+- `500 {"code": 13}` — канал не сконфигурирован либо сверка недоступна: повтор доставки уместен и приводит к штатной обработке.
+- **Идемпотентность — по `payment_id` агрегатора** (`cloudpayments_payments`), а не по событию: один callback сверяет список платежей.
+- **Суммы — из серверных настроек** по коду продукта (`TOKEN_PACK_PRODUCTS` → токены, иначе подписка со сроком из имени продукта), никогда из `amount` агрегатора.
 
 ## POST /billing/webhook/adapty
 - Server-to-server, **не** Bearer. Верификация секрета/подписи Adapty.

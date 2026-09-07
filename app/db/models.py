@@ -266,6 +266,31 @@ class JobEvent(Base):
     __table_args__ = (Index("ix_job_events_job_id_id", "job_id", "id"),)
 
 
+class CloudPaymentsPayment(Base):
+    """Начисленный платёж RU-канала (ADR-052, docs/03-data-model.md → cloudpayments_payments).
+
+    Единственная точка идемпотентности RU-канала: PK — `payment_id` агрегатора, а НЕ id
+    callback-события. Один вебхук сверяет СПИСОК платежей пользователя, поэтому ключ обязан
+    быть per-payment: иначе повторная доставка callback'а после начисления второго платежа
+    молча пропустила бы его.
+    """
+
+    __tablename__ = "cloudpayments_payments"
+
+    payment_id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    product_id: Mapped[str] = mapped_column(String, nullable=False)
+    # "tokens" | "subscription" — класс начисления, выведенный из подтверждённых данных
+    # агрегатора (payment_type), а не из тела callback'а.
+    kind: Mapped[str] = mapped_column(String, nullable=False)
+    # Сколько токенов начислено (0 для подписки: подписка даёт access_level, а не пакет).
+    tokens_granted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    paid_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class JobSection(Base):
     """Пункт плана сайта и его прогресс (ADR-046, docs/03-data-model.md → job_sections).
 
