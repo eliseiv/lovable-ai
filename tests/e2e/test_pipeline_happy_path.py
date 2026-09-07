@@ -198,7 +198,15 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
     # детект из исходного промпта). Фейк ассертит, что _interview/_spec передают DetectedLanguage
     # со значением `en` (английский промпт "Landing page for a coffee shop").
     async def _fake_agent1(
-        settings, prompt, language, *, before_call, after_call, on_attempt_failure, images=None
+        settings,
+        prompt,
+        language,
+        *,
+        before_call,
+        after_call,
+        on_attempt_failure,
+        images=None,
+        model=None,
     ):  # noqa: ANN001, ANN202, E501
         assert language.bcp47 == "en", f"ожидался серверный детект en, получено {language.bcp47}"
         await before_call()
@@ -223,6 +231,7 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
         on_attempt_failure,
         images=None,
         assets=None,
+        model=None,  # noqa: ANN001 — ADR-051: модель шага (None = дефолт агента)
     ):  # noqa: ANN001, ANN202, E501
         # Crash-resume (ADR-028): язык на фазе spec читается из job.content_language (en),
         # НЕ передетектится. Маркер несёт значение директивы.
@@ -250,6 +259,7 @@ async def test_full_pipeline_created_to_live(e2e_project, monkeypatch):
         after_call,  # noqa: ANN001
         on_attempt_failure,  # noqa: ANN001
         on_text_delta=None,  # noqa: ANN001 — ADR-046: хук потока
+        model=None,  # noqa: ANN001 — ADR-051: модель шага
     ):
         await before_call()
         call = _call(model="claude-sonnet-4-6")

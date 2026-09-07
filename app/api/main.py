@@ -26,6 +26,7 @@ from app.api.routers import (
     devices,
     health,
     jobs,
+    models,
     projects,
     storekit,
     styles,
@@ -174,6 +175,7 @@ app.include_router(auth.router, prefix="/v1")
 app.include_router(projects.router, prefix="/v1")
 app.include_router(templates.router, prefix="/v1")
 app.include_router(styles.router, prefix="/v1")
+app.include_router(models.router, prefix="/v1")
 app.include_router(jobs.router, prefix="/v1")
 app.include_router(billing.router, prefix="/v1")
 # ADR-039: прямой StoreKit-путь покупок (POST /v1/tokens/purchase · /subscription/sync),

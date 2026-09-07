@@ -170,7 +170,15 @@ def _install_fake_agent1(monkeypatch, captured: dict) -> None:  # noqa: ANN001
     детерминированные вопросы (LLM не вызывается)."""
 
     async def _fake_agent1(  # noqa: ANN202
-        settings, prompt, language, *, before_call, after_call, on_attempt_failure, images=None
+        settings,
+        prompt,
+        language,
+        *,
+        before_call,
+        after_call,
+        on_attempt_failure,
+        images=None,
+        model=None,  # noqa: ANN001 — ADR-051: модель шага (None = дефолт агента)
     ):  # noqa: ANN001
         captured["language_to_agent1"] = language.bcp47
         await before_call()

@@ -130,6 +130,10 @@ class Project(Base):
     # неподдерживаемый → авто-детект из prompt (ADR-028, байт-в-байт как прежде). Без
     # server_default (ADR-036 §5) — существующие проекты остаются NULL.
     requested_locale: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ADR-051: выбранный пользователем пресет модели (`fast`/`quality` из `GET /v1/models`).
+    # NULL = выбора не было → каждый агент идёт со своим `AGENTn_MODEL`. Хранится на ПРОЕКТЕ,
+    # а не на джобе: правки и откаты обязаны идти на той же модели, что первая генерация.
+    model_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

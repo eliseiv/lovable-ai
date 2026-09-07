@@ -44,6 +44,7 @@ async def create_project_with_job(
     title: str | None,
     idempotency_key: str,
     requested_locale: str | None = None,
+    model_id: str | None = None,
     images: list[ValidatedImage] | None = None,
 ) -> CreatedProject:
     """Создаёт project + generation_job (CREATED) и ставит task_interview.
@@ -95,6 +96,9 @@ async def create_project_with_job(
         # ТОЛЬКО на реально новой джобе (created=True); идемпотентный replay вернулся выше
         # (existing_job) и сюда не доходит → не перезаписывает (ADR-036 §7).
         requested_locale=requested_locale,
+        # ADR-051: выбранный пресет модели. Как и requested_locale, пишется ТОЛЬКО на
+        # реально новой джобе — идемпотентный replay сюда не доходит и выбор не меняет.
+        model_id=model_id,
     )
     job = GenerationJob(
         id=new_job_id(),

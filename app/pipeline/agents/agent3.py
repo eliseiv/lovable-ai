@@ -39,6 +39,7 @@ async def run_agent3(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    model: str | None = None,
     on_text_delta: TextDeltaHook | None = None,
 ) -> Agent3Result:
     """Один шаг Agent 3 (текстовый режим + строгий промт + extract_json + bounded retry +
@@ -55,7 +56,7 @@ async def run_agent3(
         settings,
         client,
         agent="agent3",
-        model=settings.agent3_model,
+        model=model or settings.agent3_model,
         system_prompt=_SYSTEM_PROMPT,
         user_content=f"Specification:\n\n{spec_markdown}\n\nProduce the project file tree.",
         validate=lambda raw: validate_agent_output(raw, settings),

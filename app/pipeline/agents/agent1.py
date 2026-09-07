@@ -97,6 +97,7 @@ async def run_agent1(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    model: str | None = None,
     images: list[ImageInput] | None = None,
 ) -> Agent1Result:
     """Один шаг Agent 1 (текстовый режим + строгий промт + extract_json + bounded retry, §I).
@@ -113,7 +114,7 @@ async def run_agent1(
         settings,
         client,
         agent="agent1",
-        model=settings.agent1_model,
+        model=model or settings.agent1_model,
         system_prompt=_SYSTEM_PROMPT,
         user_content=_build_user_content(prompt, language),
         validate=_validate_questions,

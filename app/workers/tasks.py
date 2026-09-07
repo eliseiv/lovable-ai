@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.usage import count_edit_start, count_generation_start
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.ids import (
     new_deployment_id,
     new_question_id,
@@ -82,7 +82,7 @@ from app.pipeline.guards import (
 )
 from app.pipeline.language import detect_language, language_from_bcp47
 from app.schemas.agent_output import AgentOutputError
-from app.services import plan_service
+from app.services import model_service, plan_service
 from app.storage import s3
 from app.storage.s3 import S3Storage, get_storage
 from app.workers.celery_app import celery_app
@@ -227,6 +227,7 @@ async def _interview(job_id: str) -> None:
                 after_call=after_call,
                 on_attempt_failure=on_fail,
                 images=vision_images,
+                model=await _agent_model(session, job, settings, "agent1"),
             )
         except PreCallGuardTripped as exc:
             # Budget/wall-clock §C(b)/(c) исчерпан перед/между retry-вызовами (ADR-020 §I.3).
@@ -329,6 +330,7 @@ async def _spec(job_id: str) -> None:
                 on_attempt_failure=a2_fail,
                 images=vision_images,
                 assets=asset_manifest,
+                model=await _agent_model(session, job, settings, "agent2"),
             )
         except PreCallGuardTripped as exc:
             await fail_job(session, job, failure_reason=exc.reason)
@@ -392,6 +394,7 @@ async def _spec(job_id: str) -> None:
                 after_call=a3_after,
                 on_attempt_failure=a3_fail,
                 on_text_delta=plan_service.make_progress_hook(job.id, spec_result.sections),
+                model=await _agent_model(session, job, settings, "agent3"),
             )
         except PreCallGuardTripped as exc:
             await fail_job(session, job, failure_reason=exc.reason)
@@ -812,6 +815,7 @@ async def _fix(job_id: str) -> None:
                 before_call=a4_before,
                 after_call=a4_after,
                 on_attempt_failure=a4_fail,
+                model=await _agent_model(session, job, settings, "agent4"),
             )
         except PreCallGuardTripped as exc:
             await _finalize_fix_failure(
@@ -970,6 +974,7 @@ async def _edit(job_id: str) -> None:
                 after_call=ed_after,
                 on_attempt_failure=ed_fail,
                 images=edit_vision_images,
+                model=await _agent_model(session, job, settings, "agent4"),
             )
         except PreCallGuardTripped as exc:
             # Budget/wall-clock исчерпан перед/между retry-вызовами editor → авто-rollback.
@@ -1121,6 +1126,20 @@ async def _injected_assets(
             )
         )
     return assets
+
+
+async def _agent_model(
+    session: AsyncSession, job: GenerationJob, settings: Settings, agent: str
+) -> str:
+    """Модель шага: выбор пользователя на проекте, иначе `AGENTn_MODEL` (ADR-051).
+
+    Читается на КАЖДОМ шаге, а не один раз на джобу: правки и починка живут в отдельных
+    тасках, и им нужен тот же выбор, что был у первой генерации проекта. Проект обычно уже
+    в identity-map сессии, поэтому лишнего запроса не возникает.
+    """
+    project = await session.get(Project, job.project_id)
+    model_id = project.model_id if project is not None else None
+    return model_service.resolve_agent_model(settings, model_id, agent)
 
 
 async def _abort_if_project_deleted(session: AsyncSession, job: GenerationJob) -> bool:

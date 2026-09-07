@@ -79,6 +79,9 @@ erDiagram
 | `created_at` | timestamptz | |
 | `deleted_at` | timestamptz NULL | **Sprint 4.** Soft-delete-маркер ([ADR-011](adr/ADR-011-project-delete-gc.md)). `NULL` = активен. `DELETE /projects/{pid}` ставит `now()` → проект исключается из всех `GET`-листингов/деталей (фильтр `deleted_at IS NULL`) и из подсчёта `max_projects` quota-gate (`projects_used` считает только `deleted_at IS NULL`); ставится Celery `project.gc` (полный GC ресурсов → hard-delete строки). Миграция `20260602_0003`. |
 
+
+> **`model_id`** ([ADR-051](adr/ADR-051-user-selectable-generation-model.md)) — выбранный пользователем пресет модели (`fast`/`quality` из `GET /v1/models`), `NULL` = выбора не было. Хранится на проекте, а не на джобе: правки и откаты обязаны идти на той же модели, что первая генерация. Значение — id пресета, а не идентификатор модели провайдера: каталог провайдер-специфичен и меняется вместе с кодом, id пресета стабилен.
+
 ## attachments (ADR-034)
 
 Приложенные пользователем изображения (vision-референс + реальный ассет сайта, [ADR-034](adr/ADR-034-user-image-attachments-vision-site-assets.md)). **Источник истины «какие фото у проекта/джобы».** Один и тот же файл служит двумя путями: (1) image content-блок во вход агентов 1/2/4 (vision, [pipeline §Vision-вход](modules/pipeline/03-architecture.md#vision-вход-приложенные-изображения-adr-034)); (2) детерминированный инжект воркером в дерево `public/uploads/{att_id}.{ext}` в обход LLM. **Инжект на фазе build скоупится `project_id`** (берутся ВСЕ фото проекта `WHERE project_id`, чтобы не терять между ревизиями), `job_id` — лишь аудит «на какой джобе пришёл файл».

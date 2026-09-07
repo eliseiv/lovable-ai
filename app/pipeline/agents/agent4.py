@@ -198,6 +198,7 @@ async def run_agent4(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    model: str | None = None,
 ) -> Agent4Result:
     """Один шаг Fixer (текстовый режим + строгий промт + extract_json + bounded retry +
     доменная валидация, ADR-020 §I).
@@ -221,6 +222,7 @@ async def run_agent4(
         before_call=before_call,
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
+        model=model,
     )
 
 
@@ -245,6 +247,7 @@ async def run_agent4_editor(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    model: str | None = None,
     images: list[ImageInput] | None = None,
 ) -> Agent4Result:
     """Один шаг Agent 4 как editor (Sprint 5, ADR-014): спека + current good-дерево +
@@ -269,6 +272,7 @@ async def run_agent4_editor(
         after_call=after_call,
         on_attempt_failure=on_attempt_failure,
         images=images,
+        model=model,
     )
 
 
@@ -280,6 +284,7 @@ async def _run_agent4(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    model: str | None = None,
     images: list[ImageInput] | None = None,
 ) -> Agent4Result:
     """Общий structured-вызов Agent 4 (fixer/editor): текстовый режим + extract_json + retry +
@@ -289,7 +294,7 @@ async def _run_agent4(
         settings,
         client,
         agent="agent4",
-        model=settings.agent4_model,
+        model=model or settings.agent4_model,
         system_prompt=system_prompt,
         user_content=user_content,
         validate=lambda raw: _validate_agent4_output(raw, settings),

@@ -119,6 +119,26 @@ class TemplateListResponse(BaseModel):
     items: list[TemplateOut] = Field(description="Шаблоны в порядке показа карточек.")
 
 
+# --- GET /models ---
+
+
+class GenerationModelOut(BaseModel):
+    """Модель генерации: карточка каталога."""
+
+    id: str = Field(description="Идентификатор пресета — передаётся в `POST /projects`.")
+    title: str = Field(description="Название для карточки.")
+    description: str = Field(description="Чем этот вариант отличается — текст для пользователя.")
+
+
+class GenerationModelListResponse(BaseModel):
+    """Каталог моделей, доступных на этом инстансе."""
+
+    items: list[GenerationModelOut] = Field(
+        description="Модели в порядке показа. Пустой список — выбор модели на инстансе "
+        "недоступен, генерация идёт на значениях по умолчанию."
+    )
+
+
 # --- GET /styles ---
 
 

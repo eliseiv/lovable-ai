@@ -190,6 +190,7 @@ async def run_agent2(
     before_call: GuardHook,
     after_call: UsageHook,
     on_attempt_failure: DiagnosticsHook,
+    model: str | None = None,
     images: list[ImageInput] | None = None,
     assets: list[AssetManifestEntry] | None = None,
 ) -> Agent2Result:
@@ -209,7 +210,7 @@ async def run_agent2(
         settings,
         client,
         agent="agent2",
-        model=settings.agent2_model,
+        model=model or settings.agent2_model,
         system_prompt=_SYSTEM_PROMPT,
         user_content=_build_user_content(prompt, qa_pairs, language, assets),
         validate=_validate_spec,

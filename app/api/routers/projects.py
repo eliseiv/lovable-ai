@@ -27,6 +27,7 @@ from app.schemas.api import (
 from app.services import (
     attachments_service,
     edit_service,
+    model_service,
     project_service,
     style_service,
     template_service,
@@ -108,6 +109,16 @@ async def create_project(
             )
         ),
     ] = None,
+    model_id: Annotated[
+        str | None,
+        Form(
+            description=(
+                "Идентификатор модели из `GET /models` — чем строить сайт. Применяется ко "
+                "всем шагам генерации и запоминается на проекте: правки и откаты идут на той "
+                "же модели. Без значения используются модели инстанса по умолчанию."
+            )
+        ),
+    ] = None,
     title: Annotated[str | None, Form(description="Необязательное название проекта.")] = None,
     locale: Annotated[
         str | None,
@@ -141,6 +152,10 @@ async def create_project(
         style = style_service.get_style(style_id)
         if style is None:
             raise unprocessable("Unknown style_id.")
+    if model_id is not None and model_service.get_model(get_settings(), model_id) is None:
+        # Идентификаторы моделей провайдер-специфичны (ADR-032): id из чужого каталога
+        # молча подставил бы не ту модель, поэтому проверяем по каталогу этого инстанса.
+        raise unprocessable("Unknown model_id.")
     # Стиль — только оформление, поэтому сам по себе он не описывает сайт: нужен либо
     # шаблон, либо текст пользователя (ADR-050 §A).
     if template is None and not (prompt or "").strip():
@@ -157,6 +172,7 @@ async def create_project(
         title=title,
         idempotency_key=idempotency_key,
         requested_locale=normalize_locale(locale),
+        model_id=model_id,
         images=validated,
     )
     return CreateProjectResponse(project_id=result.project_id, job_id=result.job_id)
