@@ -250,6 +250,26 @@ class SubmitAnswersResponse(BaseModel):
     job_id: str = Field(description="Идентификатор задачи, генерация которой продолжена.")
 
 
+# --- POST /jobs/{jid}/retry ---
+
+
+class JobRetryResponse(BaseModel):
+    """Повторная попытка упавшей генерации в том же проекте."""
+
+    job_id: str = Field(description="Идентификатор новой задачи — за ней и следит клиент.")
+    project_id: str = Field(
+        description="Проект остаётся прежним: промпт, фото и история никуда не переезжают."
+    )
+    retry_of_job_id: str = Field(description="Идентификатор упавшей задачи, которую повторяем.")
+    state: str = Field(
+        description="Стартовый этап повтора: `SPECCING`, если ответы интервью сохранились, "
+        "иначе `CREATED`."
+    )
+    charged: bool = Field(
+        description="Списана ли генерация. Повтор упавшей задачи бесплатный, поэтому `false`."
+    )
+
+
 # --- POST /auth/apple ---
 
 

@@ -338,6 +338,11 @@ class Settings(BaseSettings):
     # env GENERATION_COST_TOKENS.
     generation_cost_tokens: int = Field(default=1, ge=1)
 
+    # Сколько бесплатных повторов упавшей генерации доступно на одну оплаченную (ADR-053).
+    # Ретрай не списывает квоту/токен — платить второй раз за наш сбой неправильно, — поэтому
+    # цепочка ограничена: ge=0 допускает полное выключение ретрая (тогда POST /retry → 409).
+    generation_retry_max_attempts: int = Field(default=2, ge=0)
+
     # --- RU-оплата через CloudPayments/агрегатор (ADR-052, docs/modules/billing) ---
     # База API платёжного агрегатора, который держит интеграцию с CloudPayments/YooKassa и
     # выдаёт платёжные ссылки. Пусто/неполный набор ключей → RU-оплата на инстансе выключена

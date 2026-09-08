@@ -31,6 +31,7 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 | GET | `/jobs/{jid}/plan` | план сайта + прогресс по секциям ([ADR-046](../../adr/ADR-046-site-plan-and-section-progress.md)) | Bearer | `200` |
 | GET | `/jobs/{jid}/questions` | уточняющие вопросы | Bearer | `200` |
 | POST | `/jobs/{jid}/answers` | ответы → резюм пайплайна (→ SPECCING) | Bearer | `202` |
+| POST | `/jobs/{jid}/retry` | повтор упавшей генерации в том же проекте ([ADR-053](../../adr/ADR-053-failed-generation-retry.md)) | Bearer | `202` |
 | GET | `/billing/me` | тариф/entitlement + остаток квоты | Bearer | `200` |
 | POST | `/billing/webhook/adapty` | приём вебхуков Adapty (S2S) | **Adapty secret** | `200` |
 | POST | `/billing/cloudpayments/checkout` | ссылка на RU-оплату ([ADR-052](../../adr/ADR-052-ru-payments-cloudpayments.md)) | Bearer | `200` |
@@ -170,6 +171,26 @@ Base: `https://api.domain/v1` · Auth: `Authorization: Bearer <api-key>` (кро
 - **Идемпотентность определяется** сравнением нормализованного набора `(question_id, text)` с уже сохранёнными `answers` джобы: совпал → `200` (idempotent replay); не совпал и состояние ≠ `AWAITING_CLARIFICATION` → `409`.
 - `409`/`422` — `application/problem+json`; `409.detail` указывает текущий `state`.
 
+## POST /jobs/{jid}/retry ([ADR-053](../../adr/ADR-053-failed-generation-retry.md))
+Новая попытка вместо упавшей генерации — **внутри того же проекта**, без пересоздания и повторного ввода.
+- Auth: Bearer; владение (`generation_jobs.user_id == auth.user_id`) → иначе `404` (как `GET /jobs/{jid}`, существование чужой джобы не раскрываем).
+- **Что сохраняется:** `project_id` остаётся прежним, поэтому промпт, `locale`, выбранные шаблон/стиль/модель, приложенные фото (`attachments` скоупятся `project_id`, [ADR-034 §D4](../../adr/ADR-034-user-image-attachments-vision-site-assets.md)) и история проекта никуда не переезжают. `questions`/`answers` принадлежат джобе и **копируются** в новую — история упавшей попытки при ней и остаётся.
+- **Интервью не повторяется, если отвечать не на что:** все вопросы упавшей джобы имели ответы → повтор стартует сразу со `SPECCING`; иначе — с `CREATED` (интервью с начала). Стартовое состояние возвращается в поле `state`.
+- **Повтор бесплатен** (`charged: false`): упавшая попытка генерацию уже списала. Реализация — предзаписанный маркер `job_events.usage_counted` (`payload.source='retry'`), из-за которого `count_generation_start` в фазе интервью становится no-op ([03-data-model → generation_jobs.retry_of_job_id](../../03-data-model.md#generation_jobs)). Поэтому число бесплатных повторов ограничено `GENERATION_RETRY_MAX_ATTEMPTS` ([07-deployment → канонический список](../../07-deployment.md#канонический-список-ключей)).
+- **Квота-гейт не применяется**, кроме `max_concurrent_jobs`: повтор не новая генерация, но слот параллельных задач занимает как обычная.
+- `202` → `{ "job_id": "j_...", "project_id": "p_...", "retry_of_job_id": "j_...", "state": "CREATED|SPECCING", "charged": false }`. Следить нужно за новым `job_id` (`GET /jobs/{jid}` или SSE).
+- **Идемпотентность:** повторный вызов на той же упавшей джобе не создаёт вторую попытку — возвращается уже созданная, но с `200` вместо `202`.
+
+| Условие | Результат | Код |
+|---|---|---|
+| Джоба `kind='generation'` в `FAILED`, лимит повторов не исчерпан | создан повтор, поставлена задача | `202` |
+| Повторный вызов на той же джобе | тот же повтор, ничего не создаётся | `200` |
+| Джоба не в `FAILED` (`LIVE`/`BUILDING`/`CREATED`/…) | повторять нечего | `409` |
+| Джоба `kind='edit'`/`'rollback'` | у правки и отката свои пути перезапуска | `409` |
+| Исчерпан `GENERATION_RETRY_MAX_ATTEMPTS` для этой генерации | бесплатные повторы кончились | `409` |
+| Занят слот `max_concurrent_jobs` | как у обычного старта | `402` (`reason=concurrency_limit`) |
+| Чужая/несуществующая джоба, удалённый проект | — | `404` |
+
 ## POST /projects/{pid}/edits (Sprint 5)
 Post-delivery правка (Agent 4 как editor, цикл `LIVE → FIXING → LIVE`, новый Revision). Контракт цикла — [modules/pipeline/03-architecture.md → post-delivery edit](../pipeline/03-architecture.md#post-delivery-edit-live--fixing--live--контракт-зафиксирован-реализация-в-sprint-5).
 - Headers: `Idempotency-Key` (обяз.) — дедуп `(user_id, idempotency_key)` (`generation_jobs`).
@@ -270,7 +291,7 @@ RU-оплата через платёжный агрегатор (CloudPayments/
 |---|---|---|
 | **Аутентификация** | Вход через Apple, регистрация/вход по `user_id`+секрет, управление токенами устройств | `POST /auth/apple`, `POST /auth/register`, `POST /auth/login`, `POST /auth/secret`, `GET /auth/tokens`, `DELETE /auth/tokens/{id}` |
 | **Проекты** | Создание сайтов, список, детали, удаление | `POST /projects`, `GET /projects`, `GET /projects/{pid}`, `DELETE /projects/{pid}` |
-| **Джобы генерации** | Статус генерации, уточняющие вопросы, ответы, live-поток событий | `GET /jobs/{jid}`, `GET /jobs/{jid}/events`, `GET /jobs/{jid}/questions`, `POST /jobs/{jid}/answers` |
+| **Джобы генерации** | Статус генерации, уточняющие вопросы, ответы, live-поток событий, повтор упавшей задачи | `GET /jobs/{jid}`, `GET /jobs/{jid}/events`, `GET /jobs/{jid}/questions`, `POST /jobs/{jid}/answers`, `POST /jobs/{jid}/retry` |
 | **Правки и ревизии** | Post-delivery правки сайта, история ревизий, откат | `POST /projects/{pid}/edits`, `GET /projects/{pid}/revisions`, `POST /projects/{pid}/revisions/{revision_no}/rollback` |
 | **Устройства** | Регистрация/отписка устройств для push-уведомлений | `POST /devices`, `DELETE /devices/{apns_token}` |
 | **Биллинг** | Тариф, остаток квоты, приём событий магазина подписок | `GET /billing/me`, `POST /billing/webhook/adapty` |

@@ -28,6 +28,7 @@ from app.db.models import GenerationJob, Question
 from app.schemas.api import (
     JobPlanResponse,
     JobPlanSection,
+    JobRetryResponse,
     JobStatusResponse,
     QuestionOut,
     QuestionsResponse,
@@ -36,6 +37,7 @@ from app.schemas.api import (
 )
 from app.services import plan_service, project_service
 from app.services.answers_service import AnswersOutcome, submit_answers
+from app.services.job_retry_service import retry_failed_job
 
 router = APIRouter(prefix="/jobs", tags=["Джобы генерации"])
 
@@ -135,6 +137,44 @@ async def post_answers(
     if result.outcome == AnswersOutcome.CONFLICT:
         raise conflict(result.detail or "Conflict.", current_state=result.current_state)
     raise unprocessable(result.detail or "Invalid answers payload.")
+
+
+@router.post(
+    "/{job_id}/retry",
+    response_model=JobRetryResponse,
+    summary="Повторить упавшую генерацию",
+    description=(
+        "Запускает новую попытку генерации вместо упавшей, не пересоздавая проект. "
+        "`project_id` сохраняется, поэтому промпт, приложенные фото, выбранные шаблон, стиль "
+        "и модель, а также история проекта остаются на месте; ответы на уточняющие вопросы "
+        "копируются из упавшей задачи, и, если они полные, интервью не повторяется. "
+        "Возвращается новый `job_id` — следить нужно за ним. Повтор не списывает генерацию "
+        "(`charged: false`), поэтому число повторов одной генерации ограничено. Повторный "
+        "вызов на той же задаче возвращает уже созданную попытку. Повторить можно только "
+        "задачу генерации в состоянии `FAILED` — иначе `409`; исчерпан лимит повторов — "
+        "`409`; занят слот одновременных задач — `402`; чужая или несуществующая задача — "
+        "`404`. Требуется заголовок `Authorization: Bearer <api-key>`."
+    ),
+    status_code=status.HTTP_202_ACCEPTED,
+    responses=problem_responses(401, 402, 404, 409, 429),
+)
+async def post_job_retry(
+    job_id: str,
+    user: CurrentUser,
+    session: SessionDep,
+    response: Response,
+) -> JobRetryResponse:
+    result = await retry_failed_job(session, user_id=user.id, job_id=job_id)
+    if not result.created:
+        # Повтор уже был создан прошлым вызовом — отдаём его же, но без «принято в работу».
+        response.status_code = status.HTTP_200_OK
+    return JobRetryResponse(
+        job_id=result.job_id,
+        project_id=result.project_id,
+        retry_of_job_id=result.retry_of_job_id,
+        state=result.state,
+        charged=False,
+    )
 
 
 def _parse_last_event_id(header_value: str | None, query_value: int | None) -> int | None:

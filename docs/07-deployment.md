@@ -89,6 +89,7 @@
 | `JOB_BUDGET_USD` | `job_budget_usd` | str | both | Cost cap джобы (USD, numeric-строкой). | `5.0000` |
 | `USER_MONTHLY_BUDGET_USD` | `user_monthly_budget_usd` | str | both | Технический потолок Claude-затрат юзера/мес. | `50.0000` |
 | `MAX_FIX_ATTEMPTS` | `max_fix_attempts` | int | worker | Hard cap глубины fix-loop (гард a). | `3` |
+| `GENERATION_RETRY_MAX_ATTEMPTS` | `generation_retry_max_attempts` | int ≥0 | api | **[ADR-053](adr/ADR-053-failed-generation-retry.md).** Сколько бесплатных повторов упавшей генерации (`POST /v1/jobs/{jid}/retry`) допускается на один проект. Повтор генерацию не списывает, поэтому лимит — единственное, что мешает крутить одну оплаченную генерацию бесконечно; исчерпание → `409`. `0` выключает ручку (любой вызов → `409`). Дефолт **`2`**. | `2` |
 | `JOB_WALL_CLOCK_BUDGET_S` | `job_wall_clock_budget_s` | int | both | Wall-clock cap джобы (гард c): `wall_clock_deadline = created_at + это`. | `3600` |
 | `FIXER_LOG_TAIL_BYTES` | `fixer_log_tail_bytes` | int | worker | Сколько байт хвоста `failure_log` подаётся Agent 4 (контроль токенов). | `32768` |
 | `CLARIFICATION_TTL_S` | `clarification_ttl_s` | int | worker | TTL джобы в `AWAITING_CLARIFICATION` до `FAILED(clarification_timeout)` (sweeper). | `604800` (7 дней) |

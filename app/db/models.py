@@ -175,6 +175,11 @@ class GenerationJob(Base):
     )
     kind: Mapped[str] = mapped_column(String, nullable=False, default="generation")
     idempotency_key: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ADR-053: ссылка на упавшую джобу, повтором которой является эта. NULL — обычный запуск.
+    # По цепочке считается число уже сделанных бесплатных ретраев одной оплаченной генерации.
+    retry_of_job_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generation_jobs.id"), nullable=True, index=True
+    )
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_fix_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     budget_usd: Mapped[Decimal] = mapped_column(
