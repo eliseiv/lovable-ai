@@ -81,7 +81,7 @@ from app.pipeline.guards import (
     check_pre_call_guards,
 )
 from app.pipeline.language import detect_language, language_from_bcp47
-from app.schemas.agent_output import AgentOutputError
+from app.schemas.agent_output import AgentOutputError, ValidatedTree
 from app.services import model_service, plan_service
 from app.storage import s3
 from app.storage.s3 import S3Storage, get_storage
@@ -422,8 +422,11 @@ async def _spec(job_id: str) -> None:
         # Упаковка source.tgz → S3. ADR-034 §D4: детерминированный инжект ВСЕХ фото проекта в
         # дерево как public/uploads/{att_id}.{ext} — ПОСЛЕ валидации agent_output, ДО pack
         # (поверх дерева Agent 3, в обход LLM). Пусто → pack байт-в-байт как без ассетов.
+        built_tree = await _fix_upload_refs(
+            session, job.id, build_result.tree, attachments, attachments
+        )
         injected = await _injected_assets(storage, attachments)
-        source_tgz = workspace.pack_source_tgz_with_assets(build_result.tree, injected)
+        source_tgz = workspace.pack_source_tgz_with_assets(built_tree, injected)
         source_ref = await storage.put_bytes(s3.source_key(job_id), source_tgz, "application/gzip")
         await record_event(session, job.id, "source_packed", payload={"source_ref": source_ref})
         await transition(
@@ -961,6 +964,7 @@ async def _edit(job_id: str) -> None:
             .all()
         )
         edit_vision_images = await _load_vision_images(storage, list(new_edit_attachments))
+        project_attachments = await list_project_attachments(session, job.project_id)
 
         # usage пишется хуком after_call ПОСЛЕ каждого вызова (включая retry), ADR-020 §I.3.
         ed_before, ed_after, ed_fail = _make_agent_hooks(session, job, "agent4")
@@ -975,6 +979,10 @@ async def _edit(job_id: str) -> None:
                 on_attempt_failure=ed_fail,
                 images=edit_vision_images,
                 model=await _agent_model(session, job, settings, "agent4"),
+                # ADR-054: пути новых и прежних фото — иначе editor видит картинки, но не
+                # знает, как на них сослаться, и выдумывает имя (битое фото на сайте).
+                new_assets=_asset_manifest_entries(list(new_edit_attachments)),
+                project_assets=_asset_manifest_entries(project_attachments),
             )
         except PreCallGuardTripped as exc:
             # Budget/wall-clock исчерпан перед/между retry-вызовами editor → авто-rollback.
@@ -999,11 +1007,13 @@ async def _edit(job_id: str) -> None:
             return
 
         assert result.tree is not None
+        edited_tree = await _fix_upload_refs(
+            session, job.id, result.tree, project_attachments, list(new_edit_attachments)
+        )
         # ADR-034 §D4: инжект ВСЕХ фото проекта (новые правки + прежние генерации) в дерево
         # editor'а — public/uploads/{att_id}.{ext}, поверх дерева, в обход LLM.
-        project_attachments = await list_project_attachments(session, job.project_id)
         injected = await _injected_assets(storage, project_attachments)
-        source_tgz_new = workspace.pack_source_tgz_with_assets(result.tree, injected)
+        source_tgz_new = workspace.pack_source_tgz_with_assets(edited_tree, injected)
         source_ref = await storage.put_bytes(
             s3.source_key(job_id), source_tgz_new, "application/gzip"
         )
@@ -1104,6 +1114,39 @@ def _asset_manifest_entries(attachments: list[Attachment]) -> list[AssetManifest
         )
         for att in attachments
     ]
+
+
+def _upload_name(att: Attachment) -> str:
+    from app.services.attachments_service import ext_for_mime
+
+    return f"{att.id}.{ext_for_mime(att.mime)}"
+
+
+async def _fix_upload_refs(
+    session: AsyncSession,
+    job_id: str,
+    tree: ValidatedTree,
+    project_attachments: list[Attachment],
+    job_attachments: list[Attachment],
+) -> ValidatedTree:
+    """Чинит ссылки агента на загруженные фото (ADR-054) и пишет отчёт в job_events.
+
+    Отчёт пишется, только если было что чинить или что-то осталось неиспользованным: по нему
+    разбираются жалобы «приложил фото, а на сайте его нет / плейсхолдер».
+    """
+    from app.pipeline.upload_refs import normalize_upload_refs
+
+    if not project_attachments:
+        return tree
+    fixed, report = normalize_upload_refs(
+        tree,
+        known=[_upload_name(att) for att in project_attachments],
+        new=[_upload_name(att) for att in job_attachments],
+    )
+    if report.changed or report.unused_new or report.unknown_left:
+        await record_event(session, job_id, "upload_refs_checked", payload=report.as_payload())
+        logger.info("upload_refs_checked", extra={"job_id": job_id, **report.as_payload()})
+    return fixed
 
 
 async def _injected_assets(

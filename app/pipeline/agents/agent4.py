@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 from app.core.config import Settings
 from app.core.logging import get_logger
+from app.pipeline.agents.agent2 import AssetManifestEntry
 from app.pipeline.agents.base import AgentCall, ImageInput, build_agent_client
 from app.pipeline.agents.structured import (
     DiagnosticsHook,
@@ -226,12 +227,60 @@ async def run_agent4(
     )
 
 
-def _build_editor_content(*, spec_markdown: str, source_tree_json: str, instruction: str) -> str:
+def _build_editor_assets(
+    new_assets: list[AssetManifestEntry], project_assets: list[AssetManifestEntry]
+) -> str:
+    """Серверный манифест фото для editor'а (ADR-054).
+
+    Без него editor видит новые фото (vision), но не знает, под каким путём они окажутся на
+    сайте, и выдумывает имя — на сайте битая картинка. Новые фото перечислены в том же порядке,
+    в каком переданы изображениями, поэтому «Image N» однозначно сопоставляется с путём.
+    """
+    new_paths = {entry.rel_path for entry in new_assets}
+    earlier = [entry for entry in project_assets if entry.rel_path not in new_paths]
+    lines = ["## Uploaded images", ""]
+    if new_assets:
+        lines.append(
+            "Images attached to THIS edit, in the same order as the images shown to you "
+            "(Image 1 is the first image):"
+        )
+        for idx, entry in enumerate(new_assets, start=1):
+            hint = f" — {entry.description}" if entry.description else ""
+            lines.append(f"- Image {idx}: {entry.rel_path}{hint}")
+        lines.append(
+            "The user attached these images to be used on the site: place EVERY one of them "
+            "where the instruction asks (if it does not say where, in the most relevant "
+            "section), each referenced by its EXACT path above."
+        )
+    if earlier:
+        if new_assets:
+            lines.append("")
+        lines.append("Images uploaded earlier and already available on the site:")
+        lines.extend(f"- {entry.rel_path}" for entry in earlier)
+    lines.append(
+        "In the source tree these files appear as `public/uploads/...`; reference them as "
+        "`uploads/...` exactly as listed. Do NOT invent other image file names under uploads/."
+    )
+    return "\n".join(lines)
+
+
+def _build_editor_content(
+    *,
+    spec_markdown: str,
+    source_tree_json: str,
+    instruction: str,
+    new_assets: list[AssetManifestEntry] | None = None,
+    project_assets: list[AssetManifestEntry] | None = None,
+) -> str:
+    assets_block = ""
+    if new_assets or project_assets:
+        assets_block = _build_editor_assets(new_assets or [], project_assets or []) + "\n\n"
     return (
         "## Specification (baseline)\n\n"
         f"{spec_markdown}\n\n"
         "## Current source tree (the live good revision)\n\n"
         f"{source_tree_json}\n\n"
+        f"{assets_block}"
         "## Edit instruction\n\n"
         f"{instruction}\n\n"
         "Submit the new complete file tree, or set unrecoverable=true with reason/explanation."
@@ -249,6 +298,8 @@ async def run_agent4_editor(
     on_attempt_failure: DiagnosticsHook,
     model: str | None = None,
     images: list[ImageInput] | None = None,
+    new_assets: list[AssetManifestEntry] | None = None,
+    project_assets: list[AssetManifestEntry] | None = None,
 ) -> Agent4Result:
     """Один шаг Agent 4 как editor (Sprint 5, ADR-014): спека + current good-дерево +
     instruction → новое дерево (та же выходная схема/валидация/structured-механизм, что fixer).
@@ -263,6 +314,8 @@ async def run_agent4_editor(
         spec_markdown=spec_markdown,
         source_tree_json=source_tree_json,
         instruction=instruction,
+        new_assets=new_assets,
+        project_assets=project_assets,
     )
     return await _run_agent4(
         settings,

@@ -77,10 +77,13 @@ B) An explicit "unrecoverable" signal, ONLY when the edit cannot be applied to a
 }
 
 Uploaded assets:
-- The specification and/or the current tree may reference user-uploaded images by EXACT
-  relative paths of the form `uploads/<id>.<ext>`. These are real files copied into the site
-  by the build automatically — you do NOT include their bytes in the tree. When you reference
-  such an image, use the EXACT relative path verbatim. Do NOT prefix it with `public/` and do
-  NOT use an absolute path starting with `/` (a leading slash breaks the site's routing).
+- User-uploaded images live at EXACT relative paths of the form `uploads/<id>.<ext>`. They are
+  real files copied into the site by the build automatically — you do NOT include their bytes
+  in the tree. When present, the "Uploaded images" section of the user message lists them:
+  the images attached to THIS edit (in the same order as the images shown to you) and the ones
+  uploaded earlier. Use ONLY those paths, verbatim; never invent another file name under
+  `uploads/`. If the user attached images to this edit, every one of them must appear on the
+  site. Do NOT prefix a path with `public/` and do NOT use an absolute path starting with `/`
+  (a leading slash breaks the site's routing).
 
 Choose shape B sparingly — prefer to apply the edit. Output the JSON object only.
