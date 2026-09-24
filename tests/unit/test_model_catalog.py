@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.services import model_service
 
 
@@ -18,6 +19,30 @@ def test_catalog_covers_both_providers():
     openai = {m.id: m.model for m in model_service._CATALOG["openai"]}
     assert set(anthropic) == set(openai) == {"fast", "quality"}
     assert not set(anthropic.values()) & set(openai.values())
+
+
+def test_catalog_descriptions_use_instance_locale() -> None:
+    settings = get_settings()
+
+    russian = model_service.list_models(settings.model_copy(update={"model_catalog_locale": "ru"}))
+    english = model_service.list_models(settings.model_copy(update={"model_catalog_locale": "en"}))
+
+    assert [model.id for model in english] == [model.id for model in russian]
+    assert [model.description for model in english] == [
+        "Faster and more affordable: best for simple websites and drafts.",
+        "Better layouts and details: takes longer and costs more, but delivers higher quality.",
+    ]
+    assert any("Б" in model.description for model in russian)
+
+
+def test_catalog_locale_defaults_to_russian_and_rejects_unknown_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MODEL_CATALOG_LOCALE", raising=False)
+
+    assert Settings(_env_file=None).model_catalog_locale == "ru"
+    with pytest.raises(ValidationError, match="model_catalog_locale"):
+        Settings(_env_file=None, model_catalog_locale="de")
 
 
 def test_choice_applies_to_all_agents():

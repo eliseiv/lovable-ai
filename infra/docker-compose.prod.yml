@@ -107,6 +107,9 @@ x-app-env: &app-env
   # фабрика build_agent_client, OpenAIAgentClient) -> ОБЯЗАНЫ быть в x-app-env,
   # иначе extra=ignore молча отдаст дефолт config.py (фичу нельзя сконфигурировать).
   LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+  # Per-instance язык карточек GET /v1/models. Дефолт ru сохраняет
+  # текущий UI существующих инстансов; amirelqo задаёт en в своём .env.
+  MODEL_CATALOG_LOCALE: ${MODEL_CATALOG_LOCALE:-ru}
   # СЕКРЕТ (SecretStr, стиль ANTHROPIC_API_KEY символ-в-символ). Пуст при
   # LLM_PROVIDER=anthropic — норма. Реальное значение из .env (secret-manager),
   # в git НЕ коммитится (.env.prod.example — плейсхолдер).

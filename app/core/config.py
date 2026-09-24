@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -93,6 +94,10 @@ class Settings(BaseSettings):
         default="anthropic",
         description="LLM-провайдер: anthropic (дефолт) / openai. Фабрика клиента агента читает "
         "это поле; иное значение → fail-fast. env LLM_PROVIDER (ADR-032).",
+    )
+    model_catalog_locale: Literal["ru", "en"] = Field(
+        default="ru",
+        description="Язык карточек GET /v1/models: ru | en. env MODEL_CATALOG_LOCALE.",
     )
 
     # --- Anthropic ---

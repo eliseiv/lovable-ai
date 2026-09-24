@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from app.core.config import Settings
 
@@ -69,10 +69,20 @@ _CATALOG: dict[str, tuple[GenerationModel, ...]] = {
     ),
 }
 
+_ENGLISH_DESCRIPTIONS: dict[str, str] = {
+    "fast": "Faster and more affordable: best for simple websites and drafts.",
+    "quality": (
+        "Better layouts and details: takes longer and costs more, but delivers higher quality."
+    ),
+}
+
 
 def list_models(settings: Settings) -> tuple[GenerationModel, ...]:
-    """Каталог для провайдера инстанса; пустой кортеж — провайдер без каталога."""
-    return _CATALOG.get(settings.llm_provider, ())
+    """Каталог для провайдера и языка инстанса."""
+    catalog = _CATALOG.get(settings.llm_provider, ())
+    if settings.model_catalog_locale == "ru":
+        return catalog
+    return tuple(replace(model, description=_ENGLISH_DESCRIPTIONS[model.id]) for model in catalog)
 
 
 def get_model(settings: Settings, model_id: str) -> GenerationModel | None:

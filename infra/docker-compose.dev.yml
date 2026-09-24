@@ -56,6 +56,8 @@ x-app-env: &app-env
   # OPENAI_AGENT_EFFORT — app-env worker (Settings) -> ОБЯЗАНЫ быть в x-app-env,
   # иначе extra=ignore молча отдаст дефолт config.py.
   LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+  # Per-instance язык карточек GET /v1/models (ru | en).
+  MODEL_CATALOG_LOCALE: ${MODEL_CATALOG_LOCALE:-ru}
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
   # ADR-032: ключ OpenAI API (провайдер openai). Пуст при anthropic — норма.
   # СЕКРЕТ (SecretStr), реальное значение НЕ коммитится (.env.example — плейсхолдер).

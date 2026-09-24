@@ -13,7 +13,10 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.routers import models as models_router
 from app.core.config import get_settings
 from app.core.security import hash_api_key
 from app.db.models import Project, User
@@ -55,6 +58,24 @@ async def test_catalog_matches_instance_provider(client, session):
 
 async def test_catalog_requires_auth(client):
     assert (await client.get("/v1/models")).status_code == 401
+
+
+async def test_catalog_uses_instance_locale(
+    client: AsyncClient,
+    session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _user(session)
+    settings = get_settings().model_copy(update={"model_catalog_locale": "en"})
+    monkeypatch.setattr(models_router, "get_settings", lambda: settings)
+
+    response = await client.get("/v1/models", headers=_auth())
+
+    assert response.status_code == 200
+    assert [item["description"] for item in response.json()["items"]] == [
+        "Faster and more affordable: best for simple websites and drafts.",
+        "Better layouts and details: takes longer and costs more, but delivers higher quality.",
+    ]
 
 
 # ============================ выбор при создании ============================
