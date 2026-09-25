@@ -163,7 +163,7 @@ stateDiagram-v2
     superseded --> [*]
 ```
 
-Легальные переходы — только перечисленные. `active`/`superseded`/`failed` — терминальны для данной строки (новый деплой = новая строка). Прямой переход `building → active` без снятия предыдущего деплоя той же ревизии запрещён (см. cleanup-before-run).
+Легальные переходы — только перечисленные. `active`/`superseded`/`failed` — терминальны для данной строки; новый деплой = новая строка, **кроме повторной попытки той же джобы** ([ADR-055 §A](../../adr/ADR-055-deploy-attempt-row-and-infra-failures.md)): в path-режиме `site_id` джобы стабилен ([ADR-017](../../adr/ADR-017-path-based-site-routing.md)), а `subdomain` уникален глобально, поэтому fix-loop и crash-resume **переиспользуют** строку прошлой попытки (`failed → building`: ревизия, dist, лог сборки обновляются, `container_id` сбрасывается). Безусловная вставка ловила `uq_site_deployments_subdomain` — прод-инцидент 2026-09-25. История попыток живёт в `job_events` и per-attempt логах ([ADR-022](../../adr/ADR-022-per-attempt-build-logs.md)), а не в строках деплоя. Прямой переход `building → active` без снятия предыдущего деплоя той же ревизии запрещён (см. cleanup-before-run).
 
 ### Teardown — обязательное действие на каждом фейловом/вытесняющем переходе
 
@@ -172,6 +172,8 @@ stateDiagram-v2
 2. Снятие Traefik-route: т.к. route выражен Docker-лейблами, удаление контейнера автоматически убирает router/service из Traefik (Docker-провайдер). Дополнительных действий не требуется; верификация — route более не резолвится.
 3. Освобождение хоста `{subdomain}.apps.domain`: после (1)+(2) субдомен перестаёт отдавать сайт. Значение `subdomain` остаётся в строке БД для аудита.
 4. Транзакционно: `site_deployments.status = failed|superseded`.
+
+**Отказ уровня хоста — не доменный фейл ([ADR-055 §B](../../adr/ADR-055-deploy-attempt-row-and-infra-failures.md)).** Если `docker run` вернул состояние хоста, а не сайта (`no available IPv4 addresses`, нет непересекающегося пула, демон недоступен, нет места, сеть не найдена), `run_nginx_container` бросает `DockerInfraUnavailable`, и джоба идёт **не** в `FIXING`, а сразу в `FAILED(infra_error)`: teardown → `status=failed` → лог попытки с `failure_class: infra_error` → событие `deploy_infra_unavailable` → терминал. Патч Agent 4 такого не чинит, и виток стоил бы пользователю денег. Всё, что не попало в список маркеров, остаётся доменным `deploy_error` и идёт в fix-loop, как прежде.
 
 **Инвариант фейла (happy-path failure, НЕ удаление проекта):** при ошибке `docker run` или health-check подсистема `deploy` **ОБЯЗАНА** выполнить teardown уже запущенного контейнера текущей попытки **до** перевода джобы в `FIXING`/`FAILED`. Это штатный путь фейла, а не «удаление проекта»: иначе orphan nginx-контейнер с `--restart unless-stopped` + висячий Traefik-route продолжат отдавать на `{subdomain}.apps.domain` сайт, **не прошедший health-gate**. Последовательность фейла:
 

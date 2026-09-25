@@ -21,6 +21,35 @@ from app.deploy.traefik import traefik_labels
 logger = get_logger(__name__)
 
 
+class DockerInfraUnavailable(RuntimeError):
+    """`docker run` не выполнился по причине, которую патч кода сайта не исправит (ADR-055).
+
+    Исчерпан пул адресов сети, недоступен демон, кончилось место, нет сети. Такой фейл
+    отличается от «сайт собрался криво»: гонять на нём Agent 4 бессмысленно и дорого.
+    """
+
+
+# Подстроки stderr `docker run`, однозначно указывающие на состояние хоста/демона, а не на
+# содержимое сайта. Сверка регистронезависимая по подстроке: формулировки Docker меняются между
+# версиями, но эти ядра фраз стабильны.
+_INFRA_STDERR_MARKERS: tuple[str, ...] = (
+    # Пул IP сети исчерпан — прод-инцидент 2026-09-25 (сеть web /24 на 253 контейнерах).
+    "no available ipv4 addresses",
+    "could not find an available, non-overlapping ipv4 address pool",
+    "cannot connect to the docker daemon",
+    "is the docker daemon running",
+    "no space left on device",
+)
+
+
+def _is_infra_failure(stderr: str) -> bool:
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in _INFRA_STDERR_MARKERS):
+        return True
+    # «network <имя> not found» — сеть сайтов не создана на хосте (мисконфиг инстанса).
+    return "network" in lowered and "not found" in lowered
+
+
 @dataclass(frozen=True)
 class DeployResult:
     container_id: str
@@ -113,6 +142,10 @@ def run_nginx_container(
         argv, capture_output=True, text=True, check=False
     )
     if completed.returncode != 0:
-        raise RuntimeError(f"docker run failed: {completed.stderr.strip()}")
+        stderr = completed.stderr.strip()
+        if _is_infra_failure(stderr):
+            # Состояние хоста, а не сайта: наверх пойдёт терминальный infra_error без fix-loop.
+            raise DockerInfraUnavailable(f"docker run failed: {stderr}")
+        raise RuntimeError(f"docker run failed: {stderr}")
     container_id = completed.stdout.strip()
     return DeployResult(container_id=container_id, container_name=container_name)

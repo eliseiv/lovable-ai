@@ -599,18 +599,15 @@ async def _deploy(job_id: str) -> None:
         # Строка деплоя создаётся в статусе building ДО docker run + health-check:
         # lifecycle docs §5 (building → active | failed). Фактический container_id
         # дописываем после успешного run.
-        deployment = SiteDeployment(
-            id=new_deployment_id(),
+        deployment = await _deployment_for_attempt(
+            session,
             project_id=project.id,
             revision_id=revision.id,
             subdomain=subdomain,
-            live_url=url,
-            dist_artifact_ref=s3.dist_key(job_id),
+            live_url_=url,
+            dist_ref=s3.dist_key(job_id),
             build_log_ref=s3.build_log_key(job_id, job.retry_count),
-            container_id=None,
-            status="building",
         )
-        session.add(deployment)
         await session.commit()
 
         try:
@@ -618,6 +615,37 @@ async def _deploy(job_id: str) -> None:
             deploy_result = docker_deploy.run_nginx_container(
                 settings, project_id=project.id, subdomain=subdomain, site_dir=site_dir
             )
+        except docker_deploy.DockerInfraUnavailable as exc:
+            # ADR-055: пул адресов сети исчерпан / демон недоступен / нет места. Патч кода
+            # сайта этого не исправит, поэтому fix-loop пропускаем: терминальный infra_error
+            # с понятным логом вместо витка Agent 4 за деньги пользователя.
+            docker_deploy.teardown_container(container_name)
+            deployment.status = "failed"
+            log_ref = await storage.put_text(
+                s3.deploy_log_key(job.id, job.retry_count),
+                build_failure_log(
+                    failure_class="infra_error",
+                    body=str(exc),
+                    revision_no=revision.revision_no,
+                    extra_header={"job_id": job.id},
+                ),
+                "text/plain",
+            )
+            await record_event(
+                session,
+                job.id,
+                "deploy_infra_unavailable",
+                payload={"detail": str(exc), "failure_log_ref": log_ref},
+            )
+            await fail_job(
+                session,
+                job,
+                failure_reason="infra_error",
+                failure_log_ref=log_ref,
+                last_failure_signature="deploy_infra_unavailable",
+            )
+            logger.error("deploy_infra_unavailable", extra={"job_id": job_id, "error": str(exc)})
+            return
         except (RuntimeError, OSError) as exc:
             # teardown-on-fail (docs §5 «Инвариант фейла»): снести уже/частично
             # запущенный контейнер этой попытки + освободить subdomain, выставить
@@ -1114,6 +1142,50 @@ def _asset_manifest_entries(attachments: list[Attachment]) -> list[AssetManifest
         )
         for att in attachments
     ]
+
+
+async def _deployment_for_attempt(
+    session: AsyncSession,
+    *,
+    project_id: str,
+    revision_id: str,
+    subdomain: str,
+    live_url_: str,
+    dist_ref: str,
+    build_log_ref: str | None,
+) -> SiteDeployment:
+    """Строка `site_deployments` текущей попытки деплоя (ADR-055).
+
+    В path-режиме site_id джобы стабилен (ADR-017), а `subdomain` уникален глобально, поэтому
+    повторный деплой той же джобы (fix-loop, crash-resume) обязан ПЕРЕИСПОЛЬЗОВАТЬ строку
+    прошлой попытки. Безусловная вставка ловила UniqueViolation, Celery выгребал ретраи и
+    джоба падала с `infra_error`, пряча настоящую причину (прод-инцидент 2026-09-25).
+    """
+    existing = (
+        await session.execute(select(SiteDeployment).where(SiteDeployment.subdomain == subdomain))
+    ).scalar_one_or_none()
+    if existing is not None:
+        existing.revision_id = revision_id
+        existing.live_url = live_url_
+        existing.dist_artifact_ref = dist_ref
+        existing.build_log_ref = build_log_ref
+        existing.container_id = None
+        existing.status = "building"
+        return existing
+
+    deployment = SiteDeployment(
+        id=new_deployment_id(),
+        project_id=project_id,
+        revision_id=revision_id,
+        subdomain=subdomain,
+        live_url=live_url_,
+        dist_artifact_ref=dist_ref,
+        build_log_ref=build_log_ref,
+        container_id=None,
+        status="building",
+    )
+    session.add(deployment)
+    return deployment
 
 
 def _upload_name(att: Attachment) -> str:
