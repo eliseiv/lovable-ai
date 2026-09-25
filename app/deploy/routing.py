@@ -80,6 +80,10 @@ def traefik_labels(settings: Settings, site_id: str) -> dict[str, str]:
     labels: dict[str, str] = {
         "traefik.enable": "true",
         f"{service}.loadbalancer.server.port": "80",
+        # По какой сети Traefik резолвит IP контейнера (ADR-055 §C). Общий edge-Traefik
+        # запущен с `--providers.docker.network=web`, поэтому сайт в отдельной сети сайтов
+        # без этого лейбла остался бы без адреса — роутер есть, сервер пустой.
+        "traefik.docker.network": settings.traefik_network,
     }
     if settings.routing_is_path:
         # Path-режим (ADR-017 §2A + §Fix): Host(apps_domain) && PathPrefix + явный priority +

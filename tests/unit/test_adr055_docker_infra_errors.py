@@ -68,3 +68,19 @@ def test_other_failures_stay_ordinary_deploy_errors(monkeypatch, no_teardown, st
 def test_infra_marker_match_is_case_insensitive():
     assert docker_deploy._is_infra_failure("NO AVAILABLE IPv4 ADDRESSES on ...")
     assert not docker_deploy._is_infra_failure("permission denied")
+
+
+def test_site_labels_pin_traefik_network(monkeypatch):
+    """Общий edge-Traefik резолвит IP по сети из --providers.docker.network.
+
+    Сайт живёт в собственной сети (ADR-055 §C), поэтому лейбл обязан её называть — иначе
+    роутер создастся, а сервер окажется пустым (502 вместо сайта).
+    """
+    from app.deploy import routing
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "traefik_network", "lovable_sites", raising=False)
+
+    labels = routing.traefik_labels(settings, "abc123")
+
+    assert labels["traefik.docker.network"] == "lovable_sites"

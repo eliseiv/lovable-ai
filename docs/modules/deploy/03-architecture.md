@@ -173,6 +173,8 @@ stateDiagram-v2
 3. Освобождение хоста `{subdomain}.apps.domain`: после (1)+(2) субдомен перестаёт отдавать сайт. Значение `subdomain` остаётся в строке БД для аудита.
 4. Транзакционно: `site_deployments.status = failed|superseded`.
 
+**Лейбл `traefik.docker.network` ([ADR-055 §C](../../adr/ADR-055-deploy-attempt-row-and-infra-failures.md)).** Контейнер сайта всегда получает лейбл `traefik.docker.network={TRAEFIK_NETWORK}`: общий edge-Traefik запущен с `--providers.docker.network=web` и без лейбла искал бы адрес сайта в `web`, а не в сети сайтов.
+
 **Отказ уровня хоста — не доменный фейл ([ADR-055 §B](../../adr/ADR-055-deploy-attempt-row-and-infra-failures.md)).** Если `docker run` вернул состояние хоста, а не сайта (`no available IPv4 addresses`, нет непересекающегося пула, демон недоступен, нет места, сеть не найдена), `run_nginx_container` бросает `DockerInfraUnavailable`, и джоба идёт **не** в `FIXING`, а сразу в `FAILED(infra_error)`: teardown → `status=failed` → лог попытки с `failure_class: infra_error` → событие `deploy_infra_unavailable` → терминал. Патч Agent 4 такого не чинит, и виток стоил бы пользователю денег. Всё, что не попало в список маркеров, остаётся доменным `deploy_error` и идёт в fix-loop, как прежде.
 
 **Инвариант фейла (happy-path failure, НЕ удаление проекта):** при ошибке `docker run` или health-check подсистема `deploy` **ОБЯЗАНА** выполнить teardown уже запущенного контейнера текущей попытки **до** перевода джобы в `FIXING`/`FAILED`. Это штатный путь фейла, а не «удаление проекта»: иначе orphan nginx-контейнер с `--restart unless-stopped` + висячий Traefik-route продолжат отдавать на `{subdomain}.apps.domain` сайт, **не прошедший health-gate**. Последовательность фейла:
